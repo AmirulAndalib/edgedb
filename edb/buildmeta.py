@@ -18,7 +18,18 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Optional,
+    Tuple,
+    Union,
+    Mapping,
+    Sequence,
+    List,
+    NamedTuple,
+    TypedDict,
+    cast,
+)
 
 # DO NOT put any imports here other than from stdlib
 # or modules from edb.common that themselves have only stdlib imports.
@@ -44,8 +55,13 @@ from edb.common import verutils
 
 
 # Increment this whenever the database layout or stdlib changes.
-EDGEDB_CATALOG_VERSION = 2023_10_11_00_00
-EDGEDB_MAJOR_VERSION = 5
+#
+# WARNING: DO NOT INCREMENT THIS WHEN BACKPORTING CHANGES TO A RELEASE BRANCH.
+# The merge conflict there is a nice reminder that you probably need
+# to write a patch in edb/pgsql/patches.py, and then you should preserve
+# the old value.
+EDGEDB_CATALOG_VERSION = 2025_02_26_00_00
+EDGEDB_MAJOR_VERSION = 7
 
 
 class MetadataError(Exception):
@@ -70,6 +86,9 @@ class VersionMetadata(TypedDict):
 
 
 def get_build_metadata_value(prop: str) -> str:
+    env_val = os.environ.get(f'_GEL_BUILDMETA_{prop}')
+    if env_val:
+        return env_val
     env_val = os.environ.get(f'_EDGEDB_BUILDMETA_{prop}')
     if env_val:
         return env_val
@@ -79,7 +98,7 @@ def get_build_metadata_value(prop: str) -> str:
         return getattr(_buildmeta, prop)
     except (ImportError, AttributeError):
         raise MetadataError(
-            f'could not find {prop} in EdgeDB distribution metadata') from None
+            f'could not find {prop} in Gel distribution metadata') from None
 
 
 def _get_devmode_pg_config_path() -> pathlib.Path:
@@ -195,10 +214,16 @@ def get_shared_data_dir_path() -> pathlib.Path:
         return pathlib.Path(get_build_metadata_value('SHARED_DATA_DIR'))
 
 
+def get_extension_dir_path() -> pathlib.Path:
+    # TODO: Do we want a special metadata value??
+    return get_shared_data_dir_path() / "extensions"
+
+
 def hash_dirs(
     dirs: Sequence[Tuple[str, str]],
     *,
-    extra_files: Optional[Sequence[Union[str, pathlib.Path]]]=None
+    extra_files: Optional[Sequence[Union[str, pathlib.Path]]]=None,
+    extra_data: Optional[bytes] = None,
 ) -> bytes:
     def hash_dir(dirname, ext, paths):
         with os.scandir(dirname) as it:
@@ -223,6 +248,8 @@ def hash_dirs(
         with open(path, 'rb') as f:
             h.update(f.read())
     h.update(str(sys.version_info[:2]).encode())
+    if extra_data is not None:
+        h.update(extra_data)
     return h.digest()
 
 
@@ -427,15 +454,6 @@ def get_version_from_scm(root: pathlib.Path) -> str:
     )
 
     proc = subprocess.run(
-        ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
-        stdout=subprocess.PIPE,
-        universal_newlines=True,
-        check=True,
-        cwd=root,
-    )
-    branch = proc.stdout.strip()
-
-    proc = subprocess.run(
         ['git', 'tag', '--list', 'v*'],
         stdout=subprocess.PIPE,
         universal_newlines=True,
@@ -480,17 +498,9 @@ def get_version_from_scm(root: pathlib.Path) -> str:
         ver = f'{major}.{minor}{microkind}{micro}{prekind}{preval}'
     else:
         # Dev/nightly build.
-        if branch.startswith("releases/"):
-            if prekind and preval:
-                pass
-            elif micro:
-                micro = str(int(micro) + 1)
-            else:
-                minor = str(int(minor) + 1)
-        else:
-            microkind = ''
-            micro = ''
-            minor = '0'
+        microkind = ''
+        micro = ''
+        minor = '0'
 
         incremented_ver = f'{major}.{minor}{microkind}{micro}'
 
@@ -586,8 +596,7 @@ def get_cache_src_dirs():
 
 
 def get_default_tenant_id() -> str:
-    catver = EDGEDB_CATALOG_VERSION
-    return f'V{catver:x}'
+    return 'E'
 
 
 def get_version_line() -> str:

@@ -29,7 +29,7 @@ class NotFound(AuthExtError):
     def __init__(self, description: str):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"
@@ -47,7 +47,7 @@ class MissingConfiguration(AuthExtError):
         self.key = key
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"key={self.key!r} "
@@ -65,7 +65,7 @@ class InvalidData(AuthExtError):
     def __init__(self, description: str):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"
@@ -82,7 +82,7 @@ class MisconfiguredProvider(AuthExtError):
     def __init__(self, description: str):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"
@@ -104,7 +104,7 @@ class NoIdentityFound(AuthExtError):
     ):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"
@@ -124,7 +124,7 @@ class UserAlreadyRegistered(AuthExtError):
     ):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"
@@ -144,7 +144,102 @@ class OAuthProviderFailure(AuthExtError):
     ):
         self.description = description
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description={self.description!r}"
+            ")"
+        )
+
+    def __str__(self) -> str:
+        return self.description
+
+
+class VerificationTokenExpired(AuthExtError):
+    """Email verification token has expired"""
+
+    def __init__(
+        self,
+        description: str = "Email verification token has expired",
+    ):
+        self.description = description
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description={self.description!r}"
+            ")"
+        )
+
+    def __str__(self) -> str:
+        return self.description
+
+
+class VerificationRequired(AuthExtError):
+    """Email verification is required"""
+
+    def __init__(
+        self,
+        description: str = "Email verification is required",
+    ):
+        self.description = description
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description={self.description!r}"
+            ")"
+        )
+
+    def __str__(self) -> str:
+        return self.description
+
+
+class PKCECreationFailed(AuthExtError):
+    """Failed to create a valid PKCEChallenge object"""
+
+    def __init__(
+        self, description: str = "Failed to create a valid PKCEChallenge object"
+    ):
+        self.description = description
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description={self.description!r}"
+            ")"
+        )
+
+    def __str__(self) -> str:
+        return self.description
+
+
+class PKCEVerificationFailed(AuthExtError):
+    """Verifier and challenge do not match"""
+
+    def __init__(
+        self, description: str = "Verifier and challenge do not match"
+    ):
+        self.description = description
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description={self.description!r}"
+            ")"
+        )
+
+    def __str__(self) -> str:
+        return self.description
+
+
+class WebAuthnAuthenticationFailed(AuthExtError):
+    """WebAuthn authentication failed"""
+
+    def __init__(self, description: str = "WebAuthn authentication failed"):
+        self.description = description
+
+    def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"description={self.description!r}"

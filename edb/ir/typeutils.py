@@ -19,8 +19,19 @@
 """Utilities for IR type descriptors."""
 
 from __future__ import annotations
-from typing import *
-from typing import overload
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    TYPE_CHECKING,
+    overload,
+)
 
 import uuid
 
@@ -31,7 +42,6 @@ from edb.schema import links as s_links
 from edb.schema import name as s_name
 from edb.schema import properties as s_props
 from edb.schema import pointers as s_pointers
-from edb.schema import pseudo as s_pseudo
 from edb.schema import scalars as s_scalars
 from edb.schema import types as s_types
 from edb.schema import objtypes as s_objtypes
@@ -46,8 +56,40 @@ if TYPE_CHECKING:
 
 
 TypeRefCacheKey = Tuple[uuid.UUID, bool, bool]
-
 PtrRefCacheKey = s_pointers.PointerLike
+
+PtrRefCache = dict[PtrRefCacheKey, 'irast.BasePointerRef']
+TypeRefCache = dict[TypeRefCacheKey, 'irast.TypeRef']
+
+
+# Modules where all the "types" in them are really just custom views
+# provided by metaschema.
+VIEW_MODULES = ('sys', 'cfg')
+
+
+def is_cfg_view(
+    obj: s_obj.Object,
+    schema: s_schema.Schema,
+) -> bool:
+    return (
+        isinstance(obj, (s_objtypes.ObjectType, s_pointers.Pointer))
+        and (
+            obj.get_name(schema).module in VIEW_MODULES
+            or bool(
+                (cfg_object := schema.get(
+                    'cfg::ConfigObject',
+                    type=s_objtypes.ObjectType, default=None
+                ))
+                and (
+                    nobj := (
+                        obj if isinstance(obj, s_objtypes.ObjectType)
+                        else obj.get_source(schema)
+                    )
+                )
+                and nobj.issubclass(schema, cfg_object)
+            )
+        )
+    )
 
 
 def is_scalar(typeref: irast.TypeRef) -> bool:
@@ -154,6 +196,19 @@ def is_persistent_tuple(typeref: irast.TypeRef) -> bool:
         return False
 
 
+def is_empty_typeref(typeref: irast.TypeRef) -> bool:
+    return typeref.union is not None and len(typeref.union) == 0
+
+
+def needs_custom_serialization(typeref: irast.TypeRef) -> bool:
+    # True if any component needs custom serialization
+    return contains_predicate(
+        typeref,
+        lambda typeref:
+            typeref.real_base_type.custom_sql_serialization is not None
+    )
+
+
 def contains_predicate(
     typeref: irast.TypeRef,
     pred: Callable[[irast.TypeRef], bool],
@@ -161,10 +216,6 @@ def contains_predicate(
     if pred(typeref):
         return True
 
-    elif typeref.intersection:
-        return any(
-            contains_predicate(sub, pred) for sub in typeref.intersection
-        )
     elif typeref.union:
         return any(
             contains_predicate(sub, pred) for sub in typeref.union
@@ -182,7 +233,7 @@ def type_to_typeref(
     schema: s_schema.Schema,
     t: s_types.Type,
     *,
-    cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]] = None,
+    cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]],
     typename: Optional[s_name.QualName] = None,
     include_children: bool = False,
     include_ancestors: bool = False,
@@ -217,8 +268,45 @@ def type_to_typeref(
         A ``TypeRef`` instance corresponding to the given schema type.
     """
 
+    if cache is not None and typename is None:
+        key = (t.id, include_children, include_ancestors)
+
+        cached_result = cache.get(key)
+        if cached_result is not None:
+            # If the schema changed due to an ongoing compilation, the name
+            # hint might be outdated.
+            if cached_result.name_hint == t.get_name(schema):
+                return cached_result
+
+    # We separate the uncached version into another function because
+    # it makes it easy to tell in a profiler when the cache isn't
+    # operating, and because if the cache *is* operating it is no
+    # great loss.
+    return _type_to_typeref(
+        schema,
+        t,
+        cache=cache,
+        typename=typename,
+        include_children=include_children,
+        include_ancestors=include_ancestors,
+        _name=_name,
+    )
+
+
+def _type_to_typeref(
+    schema: s_schema.Schema,
+    t: s_types.Type,
+    *,
+    cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]] = None,
+    typename: Optional[s_name.QualName] = None,
+    include_children: bool = False,
+    include_ancestors: bool = False,
+    _name: Optional[str] = None,
+) -> irast.TypeRef:
+
     def _typeref(
-        t: s_types.Type, *,
+        t: s_types.Type,
+        *,
         include_children: bool = include_children,
         include_ancestors: bool = include_ancestors,
     ) -> irast.TypeRef:
@@ -232,16 +320,6 @@ def type_to_typeref(
 
     result: irast.TypeRef
     material_type: s_types.Type
-
-    key = (t.id, include_children, include_ancestors)
-
-    if cache is not None and typename is None:
-        cached_result = cache.get(key)
-        if cached_result is not None:
-            # If the schema changed due to an ongoing compilation, the name
-            # hint might be outdated.
-            if cached_result.name_hint == t.get_name(schema):
-                return cached_result
 
     name_hint = typename or t.get_name(schema)
     orig_name_hint = None if not typename else t.get_name(schema)
@@ -266,39 +344,34 @@ def type_to_typeref(
         )
     elif not isinstance(t, s_types.Collection):
         assert isinstance(t, s_types.InheritingType)
-        union_of = t.get_union_of(schema)
-        union: Optional[FrozenSet[irast.TypeRef]]
-        if union_of:
-            assert isinstance(t, s_objtypes.ObjectType)
-            union_types = {
-                cast(s_objtypes.ObjectType, c).get_nearest_non_derived_parent(
-                    schema)
-                for c in union_of.objects(schema)
-            }
-            non_overlapping, union_is_concrete = (
-                s_utils.get_non_overlapping_union(schema, union_types)
+
+        union: Optional[FrozenSet[irast.TypeRef]] = None
+        union_is_exhaustive: bool = False
+        expr_intersection: Optional[FrozenSet[irast.TypeRef]] = None
+        expr_union: Optional[FrozenSet[irast.TypeRef]] = None
+        if t.is_union_type(schema) or t.is_intersection_type(schema):
+            union_types, union_is_exhaustive = (
+                s_utils.get_type_expr_non_overlapping_union(t, schema)
             )
-            if union_is_concrete:
-                non_overlapping = frozenset({
-                    t for t in non_overlapping
-                    if t.is_material_object_type(schema)
-                })
 
             union = frozenset(
-                _typeref(c) for c in non_overlapping
+                _typeref(c) for c in union_types
             )
-        else:
-            union_is_concrete = False
-            union = None
 
-        intersection_of = t.get_intersection_of(schema)
-        intersection: Optional[FrozenSet[irast.TypeRef]]
-        if intersection_of:
-            intersection = frozenset(
-                _typeref(c) for c in intersection_of.objects(schema)
-            )
-        else:
-            intersection = None
+            # Keep track of type expression structure.
+            # This is necessary to determine the correct rvar when doing
+            # type intersections or polymorphic queries.
+            if expr_intersection_types := t.get_intersection_of(schema):
+                expr_intersection = frozenset(
+                    _typeref(c)
+                    for c in expr_intersection_types.objects(schema)
+                )
+
+            if expr_union_types := t.get_union_of(schema):
+                expr_union = frozenset(
+                    _typeref(c)
+                    for c in expr_union_types.objects(schema)
+                )
 
         schema, material_type = t.material_type(schema)
 
@@ -319,29 +392,33 @@ def type_to_typeref(
         else:
             base_typeref = None
 
-        children: Optional[FrozenSet[irast.TypeRef]]
-
-        if material_typeref is None and include_children:
+        children: Optional[FrozenSet[irast.TypeRef]] = None
+        if (
+            material_typeref is None
+            and include_children
+            and children is None
+        ):
             children = frozenset(
                 _typeref(child, include_children=True)
                 for child in t.children(schema)
                 if not child.get_is_derived(schema)
                 and not child.is_compound_type(schema)
             )
-        else:
-            children = None
 
-        ancestors: Optional[FrozenSet[irast.TypeRef]]
-        if material_typeref is None and include_ancestors:
+        ancestors: Optional[FrozenSet[irast.TypeRef]] = None
+        if (
+            material_typeref is None
+            and include_ancestors
+            and ancestors is None
+        ):
             ancestors = frozenset(
                 _typeref(ancestor, include_ancestors=False)
                 for ancestor in t.get_ancestors(schema).objects(schema)
             )
-        else:
-            ancestors = None
 
         sql_type = None
         needs_custom_json_cast = False
+        custom_sql_serialization = None
         if isinstance(t, s_scalars.ScalarType):
             sql_type = t.resolve_sql_type(schema)
             if material_typeref is None:
@@ -352,6 +429,8 @@ def type_to_typeref(
                 if jcast:
                     needs_custom_json_cast = bool(jcast.get_code(schema))
 
+            custom_sql_serialization = t.get_custom_sql_serialization(schema)
+
         result = irast.TypeRef(
             id=t.id,
             name_hint=name_hint,
@@ -361,15 +440,18 @@ def type_to_typeref(
             children=children,
             ancestors=ancestors,
             union=union,
-            union_is_concrete=union_is_concrete,
-            intersection=intersection,
+            union_is_exhaustive=union_is_exhaustive,
+            expr_intersection=expr_intersection,
+            expr_union=expr_union,
             element_name=_name,
             is_scalar=t.is_scalar(),
             is_abstract=t.get_abstract(schema),
             is_view=t.is_view(schema),
+            is_cfg_view=is_cfg_view(t, schema),
             is_opaque_union=t.get_is_opaque_union(schema),
             needs_custom_json_cast=needs_custom_json_cast,
             sql_type=sql_type,
+            custom_sql_serialization=custom_sql_serialization,
         )
     elif isinstance(t, s_types.Tuple) and t.is_named(schema):
         schema, material_type = t.material_type(schema)
@@ -388,7 +470,8 @@ def type_to_typeref(
             collection=t.get_schema_name(),
             in_schema=t.get_is_persistent(schema),
             subtypes=tuple(
-                type_to_typeref(schema, st, _name=sn)  # note: no cache
+                # ??? no cache
+                type_to_typeref(schema, st, _name=sn, cache=None)
                 for sn, st in t.iter_subtypes(schema)
             )
         )
@@ -416,6 +499,8 @@ def type_to_typeref(
         )
 
     if cache is not None and typename is None and _name is None:
+        key = (t.id, include_children, include_ancestors)
+
         # Note: there is no cache for `_name` variants since they are only used
         # for Tuple subtypes and thus they will be cached on the outer level
         # anyway.
@@ -446,14 +531,11 @@ def ir_typeref_to_type(
         a :class:`schema.types.Type` instance corresponding to the
         given *typeref*.
     """
-    if is_anytuple(typeref):
-        return schema, s_pseudo.PseudoType.get(schema, 'anytuple')
-
-    if is_anyobject(typeref):
-        return schema, s_pseudo.PseudoType.get(schema, 'anyobject')
-
-    elif is_any(typeref):
-        return schema, s_pseudo.PseudoType.get(schema, 'anytype')
+    # Optimistically try to lookup the type by id. Sometimes for
+    # arrays and tuples this will fail, and we'll need to create it.
+    t = schema.get_by_id(typeref.id, default=None, type=s_types.Type)
+    if t:
+        return schema, t
 
     elif is_tuple(typeref):
         named = False
@@ -480,9 +562,7 @@ def ir_typeref_to_type(
         return s_types.Array.from_subtypes(schema, array_subtypes)
 
     else:
-        t = schema.get_by_id(typeref.id)
-        assert isinstance(t, s_types.Type), 'expected a Type instance'
-        return schema, t
+        raise AssertionError("couldn't find type from typeref")
 
 
 @overload
@@ -490,8 +570,8 @@ def ptrref_from_ptrcls(
     *,
     schema: s_schema.Schema,
     ptrcls: s_pointers.Pointer,
-    cache: Optional[Dict[PtrRefCacheKey, irast.BasePointerRef]] = None,
-    typeref_cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]] = None,
+    cache: Optional[PtrRefCache],
+    typeref_cache: Optional[TypeRefCache],
 ) -> irast.PointerRef:
     ...
 
@@ -501,8 +581,8 @@ def ptrref_from_ptrcls(
     *,
     schema: s_schema.Schema,
     ptrcls: s_pointers.PointerLike,
-    cache: Optional[Dict[PtrRefCacheKey, irast.BasePointerRef]] = None,
-    typeref_cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]] = None,
+    cache: Optional[PtrRefCache],
+    typeref_cache: Optional[TypeRefCache],
 ) -> irast.BasePointerRef:
     ...
 
@@ -511,8 +591,8 @@ def ptrref_from_ptrcls(
     *,
     schema: s_schema.Schema,
     ptrcls: s_pointers.PointerLike,
-    cache: Optional[Dict[PtrRefCacheKey, irast.BasePointerRef]] = None,
-    typeref_cache: Optional[Dict[TypeRefCacheKey, irast.TypeRef]] = None,
+    cache: Optional[PtrRefCache],
+    typeref_cache: Optional[TypeRefCache],
 ) -> irast.BasePointerRef:
     """Return an IR pointer descriptor for a given schema pointer.
 
@@ -558,12 +638,14 @@ def ptrref_from_ptrcls(
         ircls = irast.PointerRef
         kwargs['id'] = ptrcls.id
         kwargs['defined_here'] = ptrcls.get_defined_here(schema)
-        if backlink := ptrcls.get_computed_backlink(schema):
+        if backlink := ptrcls.get_computed_link_alias(schema):
             assert isinstance(backlink, s_pointers.Pointer)
-            kwargs['computed_backlink'] = ptrref_from_ptrcls(
+            kwargs['computed_link_alias'] = ptrref_from_ptrcls(
                 ptrcls=backlink, schema=schema,
                 cache=cache, typeref_cache=typeref_cache,
             )
+            kwargs['computed_link_alias_is_backward'] = (
+                ptrcls.get_computed_link_alias_is_backward(schema))
 
     else:
         raise AssertionError(f'unexpected pointer class: {ptrcls}')
@@ -619,7 +701,7 @@ def ptrref_from_ptrcls(
 
     union_components: Optional[Set[irast.BasePointerRef]] = None
     union_of = ptrcls.get_union_of(schema)
-    union_is_concrete = False
+    union_is_exhaustive = False
     if union_of:
         union_ptrs = set()
 
@@ -628,9 +710,11 @@ def ptrref_from_ptrcls(
             schema, material_comp = component.material_type(schema)
             union_ptrs.add(material_comp)
 
-        non_overlapping, union_is_concrete = s_utils.get_non_overlapping_union(
-            schema,
-            union_ptrs,
+        non_overlapping, union_is_exhaustive = (
+            s_utils.get_non_overlapping_union(
+                schema,
+                union_ptrs,
+            )
         )
 
         union_components = {
@@ -664,7 +748,7 @@ def ptrref_from_ptrcls(
     std_parent_name = None
     for ancestor in ptrcls.get_ancestors(schema).objects(schema):
         ancestor_name = ancestor.get_name(schema)
-        if ancestor_name.module == 'std' and ancestor.generic(schema):
+        if ancestor_name.module == 'std' and ancestor.is_non_concrete(schema):
             std_parent_name = ancestor_name
             break
 
@@ -702,25 +786,27 @@ def ptrref_from_ptrcls(
     else:
         children = frozenset()
 
-    kwargs.update(dict(
-        out_source=out_source,
-        out_target=out_target,
-        name=ptrcls.get_name(schema),
-        shortname=ptrcls.get_shortname(schema),
-        std_parent_name=std_parent_name,
-        source_ptr=source_ptr,
-        base_ptr=base_ptr,
-        material_ptr=material_ptr,
-        children=children,
-        is_derived=ptrcls.get_is_derived(schema),
-        is_computable=ptrcls.get_computable(schema),
-        union_components=union_components,
-        intersection_components=intersection_components,
-        union_is_concrete=union_is_concrete,
-        has_properties=ptrcls.has_user_defined_properties(schema),
-        in_cardinality=in_cardinality,
-        out_cardinality=out_cardinality,
-    ))
+    kwargs.update(
+        dict(
+            out_source=out_source,
+            out_target=out_target,
+            name=ptrcls.get_name(schema),
+            shortname=ptrcls.get_shortname(schema),
+            std_parent_name=std_parent_name,
+            source_ptr=source_ptr,
+            base_ptr=base_ptr,
+            material_ptr=material_ptr,
+            children=children,
+            is_derived=ptrcls.get_is_derived(schema),
+            is_computable=ptrcls.get_computable(schema),
+            union_components=union_components,
+            intersection_components=intersection_components,
+            union_is_exhaustive=union_is_exhaustive,
+            has_properties=ptrcls.has_user_defined_properties(schema),
+            in_cardinality=in_cardinality,
+            out_cardinality=out_cardinality,
+        )
+    )
 
     ptrref = ircls(**kwargs)
 
@@ -737,7 +823,8 @@ def ptrref_from_ptrcls(
 
 @overload
 def ptrcls_from_ptrref(
-    ptrref: irast.PointerRef, *,
+    ptrref: irast.PointerRef,
+    *,
     schema: s_schema.Schema,
 ) -> Tuple[s_schema.Schema, s_pointers.Pointer]:
     ...
@@ -745,14 +832,16 @@ def ptrcls_from_ptrref(
 
 @overload
 def ptrcls_from_ptrref(
-    ptrref: irast.BasePointerRef, *,
+    ptrref: irast.BasePointerRef,
+    *,
     schema: s_schema.Schema,
 ) -> Tuple[s_schema.Schema, s_pointers.PointerLike]:
     ...
 
 
 def ptrcls_from_ptrref(
-    ptrref: irast.BasePointerRef, *,
+    ptrref: irast.BasePointerRef,
+    *,
     schema: s_schema.Schema,
 ) -> Tuple[s_schema.Schema, s_pointers.PointerLike]:
     """Return a schema pointer for a given IR PointerRef.
@@ -820,7 +909,7 @@ def cardinality_from_ptrcls(
             required, out_card)
         # Backward link cannot be required, but exclusivity
         # controls upper bound on cardinality.
-        if not ptrcls.generic(schema) and ptrcls.is_exclusive(schema):
+        if not ptrcls.is_non_concrete(schema) and ptrcls.is_exclusive(schema):
             in_cardinality = qltypes.Cardinality.AT_MOST_ONE
         else:
             in_cardinality = qltypes.Cardinality.MANY
@@ -854,52 +943,94 @@ def get_tuple_element_index(ptrref: irast.TupleIndirectionPointerRef) -> int:
 
 def type_contains(
     parent: irast.TypeRef,
-    typeref: irast.TypeRef,
+    child: irast.TypeRef,
 ) -> bool:
-    """Check if *parent* typeref contains the given *typeref*.
+    """Check if *parent* typeref contains the given *child* typeref.
 
-    *Containment* here means that either *parent* == *typeref* or, if
-    *parent* is a compound type, *typeref* is properly contained within
-    a compound type.
+    Both *parent* and *child* can be type expressions.
     """
-
-    if typeref == parent:
+    if parent == child:
         return True
 
-    elif typeref.union:
-        # A union is considered a subtype of a type, if
-        # ALL its components are subtypes of that type.
-        return all(
-            type_contains(parent, component)
-            for component in typeref.union
+    # Calculate the minterms of both *parent* and *child*.
+    parent_minterms = _disjunctive_normal_form(parent)
+    child_minterms = _disjunctive_normal_form(child)
+
+    # The *parent* contains *child* if each child minterm is contained
+    # by a parent minterm.
+    #
+    # Examples
+    # - [A] contains [AB]
+    # - [A,B] contains [A]
+    # - [AB] does not contain [A]
+    # - [A] does not contain [A,B]
+    # - [AB,CD] does not contain [BD]
+    return all(
+        any(
+            c.issuperset(p)
+            for p in parent_minterms
+        )
+        for c in child_minterms
+    )
+
+
+def _disjunctive_normal_form(
+    typeref: irast.TypeRef
+) -> list[set[uuid.UUID]]:
+    """Convert any typeref into a minimal disjunctive normal form.
+
+    In the result:
+    - The outer list represents unions.
+    - The inner sets represent intersections of simple types (ie. minterms).
+
+    Duplicate and superset minterms are removed as redundant.
+    """
+
+    def simplify(
+        expr: Iterable[set[uuid.UUID]]
+    ) -> list[set[uuid.UUID]]:
+        # Remove any minterms which imply others
+        # eg. [A, AB, BC] -> [A, BC]
+        minterms_by_length = sorted(
+            expr,
+            key=lambda i: len(i)
         )
 
-    elif typeref.intersection:
-        # An intersection is considered a subtype of a type, if
-        # ANY of its components are subtypes of that type.
-        return any(
-            type_contains(parent, component)
-            for component in typeref.intersection
+        result: list[set[uuid.UUID]] = []
+        for minterm in minterms_by_length:
+            if not any(
+                minterm.issuperset(r)
+                for r in result
+            ):
+                result.append(minterm)
+
+        return result
+
+    if typeref.expr_union:
+        return simplify(
+            minterm
+            for t in typeref.expr_union
+            for minterm in _disjunctive_normal_form(t)
         )
 
-    elif parent.union:
-        # A type is considered a subtype of a union type,
-        # if it is a subtype of ANY of the union components.
-        return any(
-            type_contains(component, typeref)
-            for component in parent.union
-        )
+    elif typeref.expr_intersection:
+        components = [
+            _disjunctive_normal_form(t)
+            for t in typeref.expr_intersection
+        ]
 
-    elif parent.intersection:
-        # A type is considered a subtype of an intersection type,
-        # if it is a subtype of ALL of the intersection components.
-        return any(
-            type_contains(component, typeref)
-            for component in parent.intersection
-        )
+        result = components[0]
+        for other in components[1:]:
+            result = [
+                set.union(r, o)
+                for r in result
+                for o in other
+            ]
+
+        return simplify(result)
 
     else:
-        return False
+        return [{typeref.id}]
 
 
 def find_actual_ptrref(

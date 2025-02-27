@@ -68,55 +68,59 @@ impl Error {
     }
 }
 
-#[cfg_attr(feature="wasm-bindgen",
-    wasm_bindgen::prelude::wasm_bindgen(js_name=TokenKind))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum Kind {
-    Assign,          // :=
-    SubAssign,       // -=
-    AddAssign,       // +=
-    Arrow,           // ->
-    Coalesce,        // ??
-    Namespace,       // ::
-    BackwardLink,    // .<
-    FloorDiv,        // //
-    Concat,          // ++
-    GreaterEq,       // >=
-    LessEq,          // <=
-    NotEq,           // !=
-    NotDistinctFrom, // ?=
-    DistinctFrom,    // ?!=
-    Comma,           // ,
-    OpenParen,       // (
-    CloseParen,      // )
-    OpenBracket,     // [
-    CloseBracket,    // ]
-    OpenBrace,       // {
-    CloseBrace,      // }
-    Dot,             // .
-    Semicolon,       // ;
-    Colon,           // :
-    Add,             // +
-    Sub,             // -
-    DoubleSplat,     // **
-    Mul,             // *
-    Div,             // /
-    Modulo,          // %
-    Pow,             // ^
-    Less,            // <
-    Greater,         // >
-    Eq,              // =
-    Ampersand,       // &
-    Pipe,            // |
-    At,              // @
-    Argument,        // $something, $`something`
+    Assign,           // :=
+    SubAssign,        // -=
+    AddAssign,        // +=
+    Arrow,            // ->
+    Coalesce,         // ??
+    Namespace,        // ::
+    BackwardLink,     // .<
+    FloorDiv,         // //
+    Concat,           // ++
+    GreaterEq,        // >=
+    LessEq,           // <=
+    NotEq,            // !=
+    NotDistinctFrom,  // ?=
+    DistinctFrom,     // ?!=
+    Comma,            // ,
+    OpenParen,        // (
+    CloseParen,       // )
+    OpenBracket,      // [
+    CloseBracket,     // ]
+    OpenBrace,        // {
+    CloseBrace,       // }
+    Dot,              // .
+    Semicolon,        // ;
+    Colon,            // :
+    Add,              // +
+    Sub,              // -
+    DoubleSplat,      // **
+    Mul,              // *
+    Div,              // /
+    Modulo,           // %
+    Pow,              // ^
+    Less,             // <
+    Greater,          // >
+    Eq,               // =
+    Ampersand,        // &
+    Pipe,             // |
+    At,               // @
+    Parameter,        // $something, $`something`
+    ParameterAndType, // <lit int>$something
     DecimalConst,
     FloatConst,
     IntConst,
     BigIntConst,
-    BinStr,       // b"xx", b'xx'
-    Str,          // "xx", 'xx', r"xx", r'xx', $$xx$$
+    BinStr, // b"xx", b'xx'
+    Str,    // "xx", 'xx', r"xx", r'xx', $$xx$$
+
+    StrInterpStart, // "xx\(, 'xx\(
+    StrInterpCont,  // )xx\(
+    StrInterpEnd,   // )xx", )xx'
+
     BacktickName, // `xx`
     Substitution, // \(name)
 
@@ -124,8 +128,7 @@ pub enum Kind {
     Keyword(Keyword),
 
     Ident,
-    EOF,
-    EOI,     // <$> (needed for LR parser)
+    EOI,     // end of input
     Epsilon, // <e> (needed for LR parser)
 
     StartBlock,
@@ -149,6 +152,15 @@ pub struct Tokenizer<'a> {
     dot: bool,
     next_state: Option<(usize, TokenStub<'a>, usize, Pos, Pos)>,
     keyword_buf: String,
+    // We maintain a stack of the starting string characters and
+    // parentheses nesting level for all our open string
+    // interpolations, since we need to match the correct one when
+    // closing them.
+    str_interp_stack: Vec<(String, usize)>,
+    // The number of currently open parentheses. If we see a close
+    // paren when there are no open parens *and* we are inside a
+    // string inerpolation, we close it.
+    open_parens: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -198,6 +210,8 @@ impl<'a> Tokenizer<'a> {
             // Current max keyword length is 10, but we're reserving some
             // space
             keyword_buf: String::with_capacity(MAX_KEYWORD_LENGTH),
+            str_interp_stack: Vec::new(),
+            open_parens: 0,
         };
         me.skip_whitespace();
         me
@@ -214,6 +228,9 @@ impl<'a> Tokenizer<'a> {
             dot: false,
             next_state: None,
             keyword_buf: String::with_capacity(MAX_KEYWORD_LENGTH),
+            // XXX: If we are in the middle of an interpolated string we will have trouble
+            str_interp_stack: Vec::new(),
+            open_parens: 0,
         };
         me.skip_whitespace();
         me
@@ -242,6 +259,8 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn read_token(&mut self) -> Option<Result<(TokenStub<'a>, Pos), Error>> {
+        use self::Kind::*;
+
         // This quickly resets the stream one token back
         // (the most common reset that used quite often)
         if let Some((at, tok, off, end, next)) = self.next_state {
@@ -257,6 +276,25 @@ impl<'a> Tokenizer<'a> {
             Ok(x) => x,
             Err(e) => return Some(Err(e)),
         };
+
+        match kind {
+            StrInterpStart => {
+                let start = self.buf[self.off..].chars().next()?;
+                self.str_interp_stack.push((start.into(), self.open_parens));
+            }
+            StrInterpEnd => {
+                self.str_interp_stack.pop();
+            }
+            OpenParen => {
+                self.open_parens += 1;
+            }
+            CloseParen => {
+                if self.open_parens > 0 {
+                    self.open_parens -= 1;
+                }
+            }
+            _ => {}
+        }
 
         // note we may want to get rid of "update_position" here as it's
         // faster to update 'as you go', but this is easier to get right first
@@ -290,64 +328,60 @@ impl<'a> Tokenizer<'a> {
 
         match cur_char {
             ':' => match iter.next() {
-                Some((_, '=')) => return Ok((Assign, 2)),
-                Some((_, ':')) => return Ok((Namespace, 2)),
-                _ => return Ok((Colon, 1)),
+                Some((_, '=')) => Ok((Assign, 2)),
+                Some((_, ':')) => Ok((Namespace, 2)),
+                _ => Ok((Colon, 1)),
             },
             '-' => match iter.next() {
-                Some((_, '>')) => return Ok((Arrow, 2)),
-                Some((_, '=')) => return Ok((SubAssign, 2)),
-                _ => return Ok((Sub, 1)),
+                Some((_, '>')) => Ok((Arrow, 2)),
+                Some((_, '=')) => Ok((SubAssign, 2)),
+                _ => Ok((Sub, 1)),
             },
             '>' => match iter.next() {
-                Some((_, '=')) => return Ok((GreaterEq, 2)),
-                _ => return Ok((Greater, 1)),
+                Some((_, '=')) => Ok((GreaterEq, 2)),
+                _ => Ok((Greater, 1)),
             },
             '<' => match iter.next() {
-                Some((_, '=')) => return Ok((LessEq, 2)),
-                _ => return Ok((Less, 1)),
+                Some((_, '=')) => Ok((LessEq, 2)),
+                _ => Ok((Less, 1)),
             },
             '+' => match iter.next() {
-                Some((_, '=')) => return Ok((AddAssign, 2)),
-                Some((_, '+')) => return Ok((Concat, 2)),
-                _ => return Ok((Add, 1)),
+                Some((_, '=')) => Ok((AddAssign, 2)),
+                Some((_, '+')) => Ok((Concat, 2)),
+                _ => Ok((Add, 1)),
             },
             '/' => match iter.next() {
-                Some((_, '/')) => return Ok((FloorDiv, 2)),
-                _ => return Ok((Div, 1)),
+                Some((_, '/')) => Ok((FloorDiv, 2)),
+                _ => Ok((Div, 1)),
             },
             '.' => match iter.next() {
-                Some((_, '<')) => return Ok((BackwardLink, 2)),
-                _ => return Ok((Dot, 1)),
+                Some((_, '<')) => Ok((BackwardLink, 2)),
+                _ => Ok((Dot, 1)),
             },
             '?' => match iter.next() {
-                Some((_, '?')) => return Ok((Coalesce, 2)),
-                Some((_, '=')) => return Ok((NotDistinctFrom, 2)),
+                Some((_, '?')) => Ok((Coalesce, 2)),
+                Some((_, '=')) => Ok((NotDistinctFrom, 2)),
                 Some((_, '!')) => {
                     if let Some((_, '=')) = iter.next() {
-                        return Ok((DistinctFrom, 3));
+                        Ok((DistinctFrom, 3))
                     } else {
-                        return Err(Error::new(
+                        Err(Error::new(
                             "`?!` is not an operator, \
                                 did you mean `?!=` ?",
-                        ));
+                        ))
                     }
                 }
-                _ => {
-                    return Err(Error::new(
-                        "Bare `?` is not an operator, \
+                _ => Err(Error::new(
+                    "Bare `?` is not an operator, \
                             did you mean `?=` or `??` ?",
-                    ))
-                }
+                )),
             },
             '!' => match iter.next() {
-                Some((_, '=')) => return Ok((NotEq, 2)),
-                _ => {
-                    return Err(Error::new(
-                        "Bare `!` is not an operator, \
+                Some((_, '=')) => Ok((NotEq, 2)),
+                _ => Err(Error::new(
+                    "Bare `!` is not an operator, \
                             did you mean `!=`?",
-                    ));
-                }
+                )),
             },
             '"' | '\'' => self.parse_string(0, false, false),
             '`' => {
@@ -388,26 +422,31 @@ impl<'a> Tokenizer<'a> {
                     }
                     check_prohibited(c, false)?;
                 }
-                return Err(Error::new("unterminated backtick name"));
+                Err(Error::new("unterminated backtick name"))
             }
-            '=' => return Ok((Eq, 1)),
-            ',' => return Ok((Comma, 1)),
-            '(' => return Ok((OpenParen, 1)),
-            ')' => return Ok((CloseParen, 1)),
-            '[' => return Ok((OpenBracket, 1)),
-            ']' => return Ok((CloseBracket, 1)),
-            '{' => return Ok((OpenBrace, 1)),
-            '}' => return Ok((CloseBrace, 1)),
-            ';' => return Ok((Semicolon, 1)),
-            '*' => match iter.next() {
-                Some((_, '*')) => return Ok((DoubleSplat, 2)),
-                _ => return Ok((Mul, 1)),
+            '=' => Ok((Eq, 1)),
+            ',' => Ok((Comma, 1)),
+            '(' => Ok((OpenParen, 1)),
+            ')' => match self.str_interp_stack.last() {
+                Some((delim, paren_count)) if *paren_count == self.open_parens => {
+                    self.parse_string_interp_cont(delim)
+                }
+                _ => Ok((CloseParen, 1)),
             },
-            '%' => return Ok((Modulo, 1)),
-            '^' => return Ok((Pow, 1)),
-            '&' => return Ok((Ampersand, 1)),
-            '|' => return Ok((Pipe, 1)),
-            '@' => return Ok((At, 1)),
+            '[' => Ok((OpenBracket, 1)),
+            ']' => Ok((CloseBracket, 1)),
+            '{' => Ok((OpenBrace, 1)),
+            '}' => Ok((CloseBrace, 1)),
+            ';' => Ok((Semicolon, 1)),
+            '*' => match iter.next() {
+                Some((_, '*')) => Ok((DoubleSplat, 2)),
+                _ => Ok((Mul, 1)),
+            },
+            '%' => Ok((Modulo, 1)),
+            '^' => Ok((Pow, 1)),
+            '&' => Ok((Ampersand, 1)),
+            '|' => Ok((Pipe, 1)),
+            '@' => Ok((At, 1)),
             c if c == '_' || c.is_alphabetic() => {
                 let end_idx = loop {
                     match iter.next() {
@@ -445,7 +484,7 @@ impl<'a> Tokenizer<'a> {
                 };
                 let val = &tail[..end_idx];
                 if let Some(keyword) = self.as_keyword(val) {
-                    return Ok((Keyword(keyword), end_idx));
+                    Ok((Keyword(keyword), end_idx))
                 } else if val.starts_with("__") && val.ends_with("__") {
                     return Err(Error::new(
                         "identifiers surrounded by double \
@@ -527,7 +566,7 @@ impl<'a> Tokenizer<'a> {
                                             "backtick-quoted argument cannot be empty",
                                         ));
                                     }
-                                    return Ok((Argument, idx + 1));
+                                    return Ok((Parameter, idx + 1));
                                 }
                                 check_prohibited(c, false)?;
                             }
@@ -588,7 +627,7 @@ impl<'a> Tokenizer<'a> {
                         )));
                     }
                 }
-                return Ok((Argument, end_idx));
+                Ok((Parameter, end_idx))
             }
             '\\' => match iter.next() {
                 Some((_, '(')) => {
@@ -627,7 +666,7 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn parse_string(
-        &mut self,
+        &self,
         quote_off: usize,
         raw: bool,
         binary: bool,
@@ -658,6 +697,7 @@ impl<'a> Tokenizer<'a> {
             while let Some((idx, c)) = iter.next() {
                 match c {
                     '\\' if !raw => match iter.next() {
+                        Some((idx, '(')) => return Ok((Kind::StrInterpStart, quote_off + idx + 1)),
                         // skip any next char, even quote
                         Some((_, _)) => continue,
                         None => break,
@@ -670,6 +710,30 @@ impl<'a> Tokenizer<'a> {
         return Err(Error::new(format_args!(
             "unterminated string, quoted by `{}`",
             open_quote
+        )));
+    }
+
+    fn parse_string_interp_cont(&self, end: &str) -> Result<(Kind, usize), Error> {
+        let quote_off = 1;
+        let mut iter = self.buf[self.off + quote_off..].char_indices();
+
+        while let Some((idx, c)) = iter.next() {
+            match c {
+                '\\' => match iter.next() {
+                    Some((idx, '(')) => return Ok((Kind::StrInterpCont, quote_off + idx + 1)),
+                    // skip any next char, even quote
+                    Some((_, _)) => continue,
+                    None => break,
+                },
+                _ if self.buf[self.off + quote_off + idx..].starts_with(end) => {
+                    return Ok((Kind::StrInterpEnd, quote_off + idx + end.len()))
+                }
+                _ => check_prohibited(c, true)?,
+            }
+        }
+        return Err(Error::new(format_args!(
+            "unterminated string with interpolations, quoted by `{}`",
+            end,
         )));
     }
 
@@ -814,9 +878,9 @@ impl<'a> Tokenizer<'a> {
         let suffix = &self.buf[self.off + soff..self.off + end];
         if suffix == "n" {
             if decimal {
-                return Ok((DecimalConst, end));
+                Ok((DecimalConst, end))
             } else {
-                return Ok((BigIntConst, end));
+                Ok((BigIntConst, end))
             }
         } else {
             let suffix = if suffix.len() > 8 {
@@ -873,7 +937,7 @@ impl<'a> Tokenizer<'a> {
                 }
                 //comment
                 '#' => {
-                    while let Some((idx, cur_char)) = iter.next() {
+                    for (idx, cur_char) in iter.by_ref() {
                         if check_prohibited(cur_char, false).is_err() {
                             // can't return error from skip_whitespace
                             // but we return up to this char, so the tokenizer
@@ -918,7 +982,7 @@ impl<'a> Tokenizer<'a> {
         self.keyword_buf.clear();
         self.keyword_buf.push_str(s);
         self.keyword_buf.make_ascii_lowercase();
-        return keywords::lookup_all(&self.keyword_buf);
+        keywords::lookup_all(&self.keyword_buf)
     }
 }
 
@@ -1061,7 +1125,6 @@ impl Kind {
         use Kind::*;
         Some(match self {
             Ident => "identifier",
-            EOF => "end of file",
             EOI => "end of input",
 
             BinStr => "binary constant",

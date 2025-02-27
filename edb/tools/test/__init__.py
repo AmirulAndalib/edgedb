@@ -20,13 +20,13 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import os
 import pathlib
 import shutil
 import sys
 import tempfile
 import unittest
+import typing
 
 import click
 import psutil
@@ -36,7 +36,9 @@ from edb.common import devmode
 from edb.testbase.server import get_test_cases
 from edb.tools.edb import edbcommands
 
+from .decorators import async_timeout
 from .decorators import not_implemented
+from .decorators import _xfail
 from .decorators import xfail
 from .decorators import xerror
 from .decorators import skip
@@ -45,9 +47,11 @@ from . import loader
 from . import mproc_fixes
 from . import runner
 from . import styles
+from . import results
 
 
-__all__ = ('not_implemented', 'xerror', 'xfail', 'skip')
+__all__ = ('async_timeout', 'not_implemented', 'xerror', 'xfail', '_xfail',
+           'skip')
 
 
 @edbcommands.command()
@@ -59,9 +63,9 @@ __all__ = ('not_implemented', 'xerror', 'xfail', 'skip')
 @click.option('--debug', is_flag=True,
               help='output internal debug logs')
 @click.option('--output-format',
-              type=click.Choice(runner.OutputFormat.__members__),
+              type=click.Choice(runner.OutputFormat),  # type: ignore
               help='test progress output style',
-              default=runner.OutputFormat.auto.value)
+              default=runner.OutputFormat.auto)
 @click.option('--warnings/--no-warnings',
               help='enable or disable warnings (enabled by default)',
               default=True)
@@ -89,21 +93,52 @@ __all__ = ('not_implemented', 'xerror', 'xfail', 'skip')
                    '(e.g --cov edb.common --cov edb.server)')
 @click.option('--running-times-log', 'running_times_log_file',
               type=click.File('a+'), metavar='FILEPATH',
-              help='Maintain a running time log file at FILEPATH')
+              help='maintain a running time log file at FILEPATH')
+@click.option('--result-log', type=str, metavar='FILEPATH',
+              help='write the test result to a log file. '
+                'If the path contains %TIMESTAMP%, it will be replaced by '
+                'ISO8601 date and time. '
+                'Empty string means not to write the log at all.',
+              default='build/test-results/%TIMESTAMP%.json')
+@click.option('--include-unsuccessful', is_flag=True,
+              help='include the tests that were not successful in the last run')
 @click.option('--list', 'list_tests', is_flag=True,
               help='list all the tests and exit')
 @click.option('--backend-dsn', type=str,
-              help='Use the specified backend cluster instead of starting a '
+              help='use the specified backend cluster instead of starting a '
                    'temporary local one.')
 @click.option('--use-db-cache', is_flag=True,
-              help='Attempt to use a cache of the test databases (unsound!)')
+              help='attempt to use a cache of the test databases (unsound!)')
 @click.option('--data-dir', type=str,
-              help='Use a specified data dir')
-def test(*, files, jobs, shard, include, exclude, verbose, quiet, debug,
-         output_format, warnings, failfast, shuffle, cov, repeat,
-         running_times_log_file, list_tests, backend_dsn, use_db_cache,
-         data_dir):
-    """Run EdgeDB test suite.
+              help='use a specified data dir')
+@click.option('--use-data-dir-dbs', is_flag=True,
+              help='attempt to use setup databases in the data-dir')
+def test(
+    *,
+    files: typing.Sequence[str],
+    jobs: int,
+    shard: str,
+    include: typing.Sequence[str],
+    exclude: typing.Sequence[str],
+    verbose: bool,
+    quiet: bool,
+    debug: bool,
+    output_format: runner.OutputFormat,
+    warnings: bool,
+    failfast: bool,
+    shuffle: bool,
+    cov: typing.Sequence[str],
+    repeat: int,
+    running_times_log_file: typing.Optional[typing.TextIO],
+    list_tests: bool,
+    backend_dsn: typing.Optional[str],
+    use_db_cache: bool,
+    data_dir: typing.Optional[str],
+    use_data_dir_dbs: bool,
+    result_log: str,
+    include_unsuccessful: bool,
+):
+    """Run Gel test suite.
 
     Discovers and runs tests in the specified files or directories.
     If no files or directories are specified, current directory is assumed.
@@ -124,7 +159,6 @@ def test(*, files, jobs, shard, include, exclude, verbose, quiet, debug,
 
     mproc_fixes.patch_multiprocessing(debug=debug)
 
-    output_format = runner.OutputFormat(output_format)
     if verbosity > 1 and output_format is runner.OutputFormat.stacked:
         click.secho(
             'Error: cannot use stacked output format in verbose mode.',
@@ -162,8 +196,7 @@ def test(*, files, jobs, shard, include, exclude, verbose, quiet, debug,
         click.secho(f'Error: --shard {shard} is out of bound')
         sys.exit(1)
 
-    run = functools.partial(
-        _run,
+    run = lambda: _run(
         include=include,
         exclude=exclude,
         verbosity=verbosity,
@@ -181,6 +214,9 @@ def test(*, files, jobs, shard, include, exclude, verbose, quiet, debug,
         backend_dsn=backend_dsn,
         try_cached_db=use_db_cache,
         data_dir=data_dir,
+        use_data_dir_dbs=use_data_dir_dbs,
+        result_log=result_log,
+        include_unsuccessful=include_unsuccessful,
     )
 
     if cov:
@@ -254,17 +290,38 @@ def _coverage_wrapper(paths):
             shutil.copy(covfile, '.')
 
 
-def _run(*, include, exclude, verbosity, files, jobs, output_format,
-         warnings, failfast, shuffle, repeat, selected_shard, total_shards,
-         running_times_log_file, list_tests, backend_dsn, try_cached_db,
-         data_dir):
+def _run(
+    *,
+    include: typing.Sequence[str],
+    exclude: typing.Sequence[str],
+    verbosity: int,
+    files: typing.Sequence[str],
+    jobs: int,
+    output_format: str,
+    warnings: bool,
+    failfast: bool,
+    shuffle: bool,
+    repeat: int,
+    selected_shard: int,
+    total_shards: int,
+    running_times_log_file: typing.Optional[typing.TextIO],
+    list_tests: bool,
+    backend_dsn: typing.Optional[str],
+    try_cached_db: bool,
+    data_dir: typing.Optional[str],
+    use_data_dir_dbs: bool,
+    result_log: str,
+    include_unsuccessful: bool,
+):
     suite = unittest.TestSuite()
 
     total = 0
     total_unfiltered = 0
 
+    _update_progress: typing.Callable[[int, int], None] | None
     if verbosity > 0:
-        def _update_progress(n, unfiltered_n):
+
+        def _update_progress(n: int, unfiltered_n: int):
             nonlocal total, total_unfiltered
             total += n
             total_unfiltered += unfiltered_n
@@ -274,9 +331,16 @@ def _run(*, include, exclude, verbosity, files, jobs, output_format,
     else:
         _update_progress = None
 
+    if include_unsuccessful and result_log:
+        unsuccessful = results.read_unsuccessful(result_log)
+        include = list(include) + unsuccessful + ['a_non_existing_test']
+
     test_loader = loader.TestLoader(
-        verbosity=verbosity, exclude=exclude, include=include,
-        progress_cb=_update_progress)
+        verbosity=verbosity,
+        exclude=exclude,
+        include=include,
+        progress_cb=_update_progress,
+    )
 
     for file in files:
         if not os.path.exists(file) and verbosity > 0:
@@ -317,13 +381,22 @@ def _run(*, include, exclude, verbosity, files, jobs, output_format,
             verbosity=verbosity, output_format=output_format,
             warnings=warnings, num_workers=jobs,
             failfast=failfast, shuffle=shuffle, backend_dsn=backend_dsn,
-            try_cached_db=try_cached_db, data_dir=data_dir)
+            try_cached_db=try_cached_db,
+            data_dir=data_dir,
+            use_data_dir_dbs=use_data_dir_dbs,
+        )
 
         result = test_runner.run(
             suite, selected_shard, total_shards, running_times_log_file,
         )
 
-        if not result.wasSuccessful():
-            return 1
+        if verbosity > 0:
+            results.render_result(test_runner.stream, result)
 
-    return 0
+        if not result.was_successful:
+            break
+
+    if result_log:
+        results.write_result(result_log, result)
+
+    return 0 if result.was_successful else 1

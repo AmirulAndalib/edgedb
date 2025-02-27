@@ -26,6 +26,8 @@ from edb.testbase import server as tb
 
 class TestRewrites(tb.QueryTestCase):
 
+    NO_FACTOR = True
+
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas', 'movies.esdl')
     # Setting up some rewrites makes the tests run a bit faster
     # because we don't need to recompile the delta scripts for it.
@@ -49,6 +51,23 @@ class TestRewrites(tb.QueryTestCase):
         };
 
         create type Project extending Resource;
+
+        create type Document extending Resource {
+          create property text: str;
+          create required property textUpdatedAt: std::datetime {
+            set default := (std::datetime_of_statement());
+            create rewrite update using ((
+              IF __specified__.text
+              THEN std::datetime_of_statement()
+              ELSE __old__.textUpdatedAt
+            ));
+          };
+        };
+
+        alter type Content {
+          drop access policy filter_title;
+          drop access policy dml;
+        };
     """
     ]
 
@@ -952,4 +971,142 @@ class TestRewrites(tb.QueryTestCase):
         await self.assert_query_result(
             'select Person { first_name }',
             [{'first_name': 'updated'}],
+        )
+
+    async def test_edgeql_rewrites_24(self):
+        await self.con.execute(
+            '''
+            create type X {
+                create property tup -> tuple<int64, str> {
+                    create rewrite insert, update using ((1, '2'));
+                };
+            };
+            insert X;
+            '''
+        )
+        await self.assert_query_result(
+            'select X { tup }',
+            [{'tup': (1, '2')}],
+        )
+        await self.con.execute(
+            '''
+            update X set {};
+            '''
+        )
+        await self.assert_query_result(
+            'select X { tup }',
+            [{'tup': (1, '2')}],
+        )
+
+    async def test_edgeql_rewrites_25(self):
+        async with self.assertRaisesRegexTx(
+            edgedb.SchemaDefinitionError,
+            r"rewrite expression is of invalid type",
+        ):
+            await self.con.execute(
+                '''
+                create type X {
+                    create property foo -> str {
+                        create rewrite insert using (10);
+                    };
+                };
+                '''
+            )
+
+        async with self.assertRaisesRegexTx(
+            edgedb.SchemaDefinitionError,
+            r"rewrite expression may not include a shape",
+        ):
+            await self.con.execute(
+                '''
+                create type X {
+                    create link foo -> std::Object {
+                        create rewrite insert using (
+                            (select std::Object { __type__: {name} })
+                        );
+                    };
+                };
+                '''
+            )
+
+    async def test_edgeql_rewrites_26(self):
+        async with self.assertRaisesRegexTx(
+            edgedb.SchemaDefinitionError,
+            r"rewrites on link properties are not supported",
+        ):
+            await self.con.execute(
+                '''
+                create type X {
+                    create link foo -> std::Object {
+                        create property bar: int32 {
+                            create rewrite insert using ('hello');
+                        };
+                    };
+                };
+                '''
+            )
+
+    async def test_edgeql_rewrites_27(self):
+        await self.con.execute(
+            '''
+            create type Foo {
+                create property will_be_true: bool {
+                    create rewrite update using (__subject__ = __old__);
+                };
+            };
+            insert Foo { will_be_true := false };
+            '''
+        )
+        await self.assert_query_result(
+            'select Foo { will_be_true }',
+            [{'will_be_true': False}]
+        )
+        await self.con.execute('update Foo set { };')
+        await self.assert_query_result(
+            'select Foo { will_be_true }',
+            [{'will_be_true': True}]
+        )
+
+    async def test_edgeql_rewrites_28(self):
+        await self.con.execute(
+            '''
+            create type Address {
+                create property coordinates: tuple<lat: float32, lng: float32>;
+                create property updated_at: str {
+                    create rewrite insert using ('now')
+                };
+            };
+            insert Address {
+                coordinates := (
+                    lat := <std::float32>40.07987,
+                    lng := <std::float32>20.56509
+                )
+            };
+            '''
+        )
+        await self.assert_query_result(
+            'select Address { coordinates, updated_at }',
+            [
+                {
+                    'coordinates': {'lat': 40.07987, 'lng': 20.56509},
+                    'updated_at': 'now'
+                }
+            ]
+        )
+
+    async def test_edgeql_rewrites_29(self):
+        # see https://github.com/edgedb/edgedb/issues/7048
+
+        # these tests check that subject of an update rewrite is the child
+        # object and not parent that is being updated
+        await self.con.execute(
+            '''
+            update std::Object set { };
+            '''
+        )
+
+        await self.con.execute(
+            '''
+            update Project set { name := '## redacted ##' }
+            '''
         )

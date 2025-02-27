@@ -17,6 +17,7 @@
 #
 
 
+import contextlib
 import os.path
 import uuid
 
@@ -28,9 +29,20 @@ from edb.tools import test
 
 class TestInsert(tb.QueryTestCase):
     '''The scope of the tests is testing various modes of Object creation.'''
+    # NO_FACTOR = True
+    WARN_FACTOR = True
+    INTERNAL_TESTMODE = False
 
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas',
                           'insert.esdl')
+
+    def assertRaisesRegex(self, exc, r, **kwargs):
+        if (
+            (self.NO_FACTOR or self.WARN_FACTOR)
+            and "cannot reference correlated set" in r
+        ):
+            r = ""
+        return super().assertRaisesRegex(exc, r, **kwargs)
 
     async def test_edgeql_insert_fail_01(self):
         with self.assertRaisesRegex(
@@ -91,6 +103,7 @@ class TestInsert(tb.QueryTestCase):
         with self.assertRaisesRegex(
             edgedb.QueryError,
             r"could not resolve partial path",
+            _hint=None
         ):
             await self.con.execute('''
                 INSERT Person { name := .name };
@@ -246,6 +259,35 @@ class TestInsert(tb.QueryTestCase):
                 {
                     'l2': 0,
                 },
+            ]
+        )
+
+        await self.con.execute(r"""
+            with _ := (
+                INSERT InsertTest {
+                    name := 'insert simple 01',
+                    l2 := (select 1 filter true),
+                }
+            ),
+            INSERT InsertTest {
+                name := 'insert simple 01',
+                l2 := 2,
+            }
+        """)
+        await self.assert_query_result(
+            r"""
+                SELECT
+                    InsertTest {
+                        l2
+                    }
+                FILTER
+                    InsertTest.name = 'insert simple 01'
+                ORDER BY .l2
+            """,
+            [
+                {'l2': 0},
+                {'l2': 1},
+                {'l2': 2},
             ]
         )
 
@@ -1189,21 +1231,72 @@ class TestInsert(tb.QueryTestCase):
                 "violates exclusivity constraint"):
             await self.con.execute(Q)
 
+    async def test_edgeql_insert_policy_cast(self):
+        # Test for #6305, where a cast in a global used in an access policy
+        # was causing a stray volatility ref to show up in the wrong CTE
+        await self.con.execute('''
+            create global sub_id -> uuid;
+            create global sub := <Subordinate>(global sub_id);
+            alter type Note {
+                create access policy asdf allow all using (
+                    (.subject in global sub) ?? false
+                )
+            };
+        ''')
+
+        sub = await self.con.query_single('''
+            insert Subordinate { name := "asdf" };
+        ''')
+
+        async with self.assertRaisesRegexTx(
+                edgedb.AccessPolicyError,
+                "violation on insert of default::Note"):
+            await self.con.execute('''
+                insert Person { notes := (insert Note { name := "" }) };
+            ''')
+
+        async with self.assertRaisesRegexTx(
+                edgedb.AccessPolicyError,
+                "violation on insert of default::Note"):
+            await self.con.execute('''
+                insert Person {
+                    notes := (insert Note {
+                        name := "",
+                        subject := assert_single(
+                          (select Subordinate filter .name = 'asdf'))
+                    })
+                };
+            ''')
+
+        await self.con.execute('''
+            set global sub_id := <uuid>$0
+        ''', sub.id)
+
+        await self.con.execute('''
+            insert Person {
+                notes := (insert Note {
+                    name := "",
+                    subject := assert_single(
+                      (select Subordinate filter .name = 'asdf'))
+                })
+            };
+        ''')
+
     async def test_edgeql_insert_for_01(self):
         await self.con.execute(r'''
             FOR x IN {3, 5, 7, 2}
-            UNION (INSERT InsertTest {
+            INSERT InsertTest {
                 name := 'insert for 1',
                 l2 := x,
-            });
+            };
 
             FOR Q IN (SELECT InsertTest{foo := 'foo' ++ <str> InsertTest.l2}
                       FILTER .name = 'insert for 1')
-            UNION (INSERT InsertTest {
+            INSERT InsertTest {
                 name := 'insert for 1',
                 l2 := 35 % Q.l2,
                 l3 := Q.foo,
-            });
+            };
         ''')
 
         await self.assert_query_result(
@@ -1258,6 +1351,7 @@ class TestInsert(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_insert_for_02(self):
         await self.con.execute(r'''
             # create 10 DefaultTest3 objects, each object is defined
@@ -1303,12 +1397,10 @@ class TestInsert(tb.QueryTestCase):
                 l2 := 999,
                 subordinates := (
                     FOR x IN {('sub1', 'first'), ('sub2', 'second')}
-                    UNION (
-                        INSERT Subordinate {
-                            name := x.0,
-                            @comment := x.1,
-                        }
-                    )
+                    INSERT Subordinate {
+                        name := x.0,
+                        @comment := x.1,
+                    }
                 )
             };
         ''')
@@ -1336,9 +1428,9 @@ class TestInsert(tb.QueryTestCase):
 
     async def test_edgeql_insert_for_06(self):
         res = await self.con.query(r'''
-            FOR a in {"a", "b"} UNION (
-                FOR b in {"c", "d"} UNION (
-                    INSERT Note {name := b}));
+            FOR a IN {"a", "b"}
+            FOR b IN {"c", "d"}
+            INSERT Note {name := b};
         ''')
         self.assertEqual(len(res), 4)
 
@@ -1352,9 +1444,9 @@ class TestInsert(tb.QueryTestCase):
 
     async def test_edgeql_insert_for_07(self):
         res = await self.con.query(r'''
-            FOR a in {"a", "b"} UNION (
-                FOR b in {a++"c", a++"d"} UNION (
-                    INSERT Note {name := b}));
+            FOR a IN {"a", "b"}
+            FOR b IN {a++"c", a++"d"}
+            INSERT Note {name := b};
         ''')
         self.assertEqual(len(res), 4)
 
@@ -1368,10 +1460,10 @@ class TestInsert(tb.QueryTestCase):
 
     async def test_edgeql_insert_for_08(self):
         res = await self.con.query(r'''
-            FOR a in {"a", "b"} UNION (
-                FOR b in {"a", "b"} UNION (
-                    FOR c in {a++b++"a", a++b++"b"} UNION (
-                        INSERT Note {name := c})));
+            FOR a IN {"a", "b"}
+            FOR b IN {"a", "b"}
+            FOR c IN {a++b++"a", a++b++"b"}
+            INSERT Note {name := c};
         ''')
         self.assertEqual(len(res), 8)
 
@@ -1656,6 +1748,35 @@ class TestInsert(tb.QueryTestCase):
             ],
         )
 
+    async def test_edgeql_insert_for_23(self):
+        await self.con.execute(r"""
+            INSERT Subordinate { name := "a" }
+        """)
+
+        await self.assert_query_result(
+            """
+            for x in {Subordinate, Subordinate} union (
+              (x { name }, (insert Note { name := '', subject := x }))
+            );
+            """,
+            [
+                [{'name': "a"}, {}],
+                [{'name': "a"}, {}],
+            ],
+        )
+
+        await self.assert_query_result(
+            """
+            for x in {Subordinate, Subordinate} union (
+              (x { name }, (insert InsertTest { l2 := 0, sub := x }))
+            );
+            """,
+            [
+                [{'name': "a"}, {}],
+                [{'name': "a"}, {}],
+            ],
+        )
+
     async def test_edgeql_insert_for_bad_01(self):
         with self.assertRaisesRegex(
             edgedb.errors.QueryError,
@@ -1703,6 +1824,7 @@ class TestInsert(tb.QueryTestCase):
                                   INSERT Note {name := y ++ x.name}))))));
             """)
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_insert_default_01(self):
         await self.con.execute(r'''
             # create 10 DefaultTest3 objects, each object is defined
@@ -1839,12 +1961,23 @@ class TestInsert(tb.QueryTestCase):
             INSERT DefaultTest8;
         ''')
 
-        await self.assert_query_result(
-            r'''
-                SELECT DefaultTest8.number;
-            ''',
-            {1, 2, 3}
-        )
+        try:
+            await self.assert_query_result(
+                r'''
+                    SELECT DefaultTest8.number;
+                ''',
+                {1, 2, 3},
+            )
+        except AssertionError:
+            if self.is_repeat:
+                await self.assert_query_result(
+                    r'''
+                        SELECT DefaultTest8.number;
+                    ''',
+                    {4, 5, 6},
+                )
+            else:
+                raise
 
     async def test_edgeql_insert_default_06(self):
         res = await self.con.query(r'''
@@ -1954,6 +2087,113 @@ class TestInsert(tb.QueryTestCase):
                 }
             """
             )
+
+    @tb.needs_factoring_weakly  # XXX(factor): maybe it shouldn't?
+    async def test_edgeql_insert_dunder_default_01(self):
+        await self.con.execute(r'''
+            INSERT DunderDefaultTest01 { a := 1, c := __default__ };
+            INSERT DunderDefaultTest01 { a := 1, c := __default__ + 3 };
+            INSERT DunderDefaultTest01 {
+                a := 1,
+                c := __default__ + __default__,
+            };
+        ''')
+
+        await self.assert_query_result(
+            r'''
+                SELECT DunderDefaultTest01 { a, b, c };
+            ''',
+            [
+                {'a': 1, 'b': 2, 'c': 1},
+                {'a': 1, 'b': 2, 'c': 4},
+                {'a': 1, 'b': 2, 'c': 2},
+            ]
+        )
+
+        async with self.assertRaisesRegexTx(
+            edgedb.InvalidReferenceError,
+            r"__default__ cannot be used in this expression",
+            _hint='No default expression exists',
+        ):
+            await self.con.execute(r'''
+                INSERT DunderDefaultTest01 { a := __default__ };
+            ''')
+
+        async with self.assertRaisesRegexTx(
+            edgedb.InvalidReferenceError,
+            r"__default__ cannot be used in this expression",
+            _hint='Default expression uses __source__',
+        ):
+            await self.con.execute(r'''
+                INSERT DunderDefaultTest01 { a := 1, b := __default__ };
+            ''')
+
+    async def test_edgeql_insert_dunder_default_02(self):
+        async with self.assertRaisesRegexTx(
+            edgedb.InvalidReferenceError,
+            r"__default__ cannot be used in this expression",
+            _hint='Default expression uses DML',
+        ):
+            await self.con.execute(r'''
+                INSERT DunderDefaultTest02_B {
+                    default_with_insert := __default__
+                };
+            ''')
+
+        async with self.assertRaisesRegexTx(
+            edgedb.InvalidReferenceError,
+            r"__default__ cannot be used in this expression",
+            _hint='Default expression uses DML',
+        ):
+            await self.con.execute(r'''
+                INSERT DunderDefaultTest02_B {
+                    default_with_update := __default__
+                };
+            ''')
+
+        async with self.assertRaisesRegexTx(
+            edgedb.InvalidReferenceError,
+            r"__default__ cannot be used in this expression",
+            _hint='Default expression uses DML',
+        ):
+            await self.con.execute(r'''
+                INSERT DunderDefaultTest02_B {
+                    default_with_delete := __default__
+                };
+            ''')
+
+        await self.con.execute(r'''
+            INSERT DunderDefaultTest02_A { a := 1 };
+            INSERT DunderDefaultTest02_A { a := 2 };
+            INSERT DunderDefaultTest02_A { a := 3 };
+            INSERT DunderDefaultTest02_A { a := 4 };
+            INSERT DunderDefaultTest02_B {
+                default_with_insert := (
+                    select DunderDefaultTest02_A
+                    filter DunderDefaultTest02_A.a = 1
+                ),
+                default_with_update := (
+                    select DunderDefaultTest02_A
+                    filter DunderDefaultTest02_A.a = 2
+                ),
+                default_with_delete := (
+                    select DunderDefaultTest02_A
+                    filter DunderDefaultTest02_A.a = 3
+                ),
+                default_with_select := __default__
+            };
+        ''')
+
+        await self.assert_query_result(
+            r'''
+                SELECT DunderDefaultTest02_B {
+                    a := .default_with_select.a
+                };
+            ''',
+            [
+                {'a': [4]},
+            ]
+        )
 
     async def test_edgeql_insert_as_expr_01(self):
         await self.con.execute(r'''
@@ -2078,6 +2318,7 @@ class TestInsert(tb.QueryTestCase):
             }],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_insert_linkprops_with_for_01(self):
         await self.con.execute(r"""
             FOR i IN {'1', '2', '3'} UNION (
@@ -3636,6 +3877,22 @@ class TestInsert(tb.QueryTestCase):
             [{'name': {'foo', 'bar'}}],
         )
 
+    async def test_edgeql_insert_unless_conflict_29(self):
+        await self.con.execute('''
+            with
+                sub := <Subordinate>{},
+                upsert := (
+                    insert InsertTest {
+                        l2 := 0,
+                        sub_ex := sub
+                    }
+                    unless conflict
+                ),
+            insert Note {
+                name := '', subject := upsert,
+            };
+        ''')
+
     async def test_edgeql_insert_dependent_01(self):
         query = r'''
             SELECT (
@@ -3971,7 +4228,7 @@ class TestInsert(tb.QueryTestCase):
 
         await self.assert_query_result(
             "SELECT Note.name",
-            ["foo!", "bar"]
+            {"foo!", "bar"}
         )
 
     async def test_edgeql_insert_dependent_11(self):
@@ -5568,33 +5825,1023 @@ class TestInsert(tb.QueryTestCase):
             ''')
 
     async def test_edgeql_insert_volatile_01(self):
-        # Ideally we'll support these versions eventually
-        async with self.assertRaisesRegexTx(
-                edgedb.QueryError,
-                "cannot refer to volatile WITH bindings from DML"):
-            await self.con.execute('''
-                WITH name := <str>random(),
-                INSERT Person { name := name, tag := name };
-            ''')
-
-        async with self.assertRaisesRegexTx(
-                edgedb.QueryError,
-                "cannot refer to volatile WITH bindings from DML"):
-            await self.con.execute('''
-                WITH name := <str>random(),
-                SELECT (INSERT Person { name := name, tag := name });
-            ''')
-
         await self.con.execute('''
-            FOR name in {<str>random()}
+            WITH name := <str>random(),
+            INSERT Person { name := name, tag := name };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_02(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                name := x ++ "!",
+            INSERT Person { name := name, tag := name };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_03(self):
+        await self.con.execute('''
+            WITH
+                x := "!",
+                name := x ++ <str>random(),
+            INSERT Person { name := name, tag := name };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_04(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                name := x ++ <str>random(),
+            INSERT Person { name := name, tag := name };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_05(self):
+        await self.con.execute('''
+            WITH name := <str>random(),
+            SELECT (INSERT Person { name := name, tag := name });
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_06(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                name := x ++ "!",
+            SELECT (INSERT Person { name := name, tag := name });
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_07(self):
+        await self.con.execute('''
+            WITH
+                x := "!",
+                name := x ++ <str>random(),
+            SELECT (INSERT Person { name := name, tag := name });
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_08(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                name := x ++ <str>random(),
+            SELECT (INSERT Person { name := name, tag := name });
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_09(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            SELECT (
+                WITH name := x ++ "!"
+                INSERT Person { name := name, tag := name }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_10(self):
+        await self.con.execute('''
+            WITH x := "!"
+            SELECT (
+                WITH name := x ++ <str>random()
+                INSERT Person { name := name, tag := name }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_11(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            SELECT (
+                WITH name := x ++ <str>random()
+                INSERT Person { name := name, tag := name }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_12(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                y := x ++ <str>random(),
+            SELECT (
+                WITH name := y ++ <str>random()
+                INSERT Person { name := name, tag := name }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_13(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                )
+            SELECT (
+                INSERT Person {
+                    name := x.name ++ "!",
+                    tag := x.tag ++ "!",
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_14(self):
+        await self.con.execute('''
+            WITH
+                x := "!",
+                y := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := x ++ y.name,
+                    tag := x ++ y.tag,
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_15(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                y := (
+                    WITH name := "!",
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := x ++ y.name,
+                    tag := x ++ y.tag,
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_16(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                y := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := x ++ y.name,
+                    tag := x ++ y.tag,
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_17(self):
+        await self.con.execute('''
+            WITH
+                x := "!",
+                y := (
+                    WITH name := x ++ <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := x }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := y.name ++ "!",
+                    tag := y.tag ++ "!",
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_18(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                y := (
+                    WITH name := x ++ "!",
+                    INSERT Person { name := name, tag := name, tag2 := x }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := y.name ++ "!",
+                    tag := y.tag ++ "!",
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_19(self):
+        await self.con.execute('''
+            WITH
+                x := <str>random(),
+                y := (
+                    WITH name := x ++ <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := x }
+                ),
+            SELECT (
+                INSERT Person {
+                    name := y.name ++ "!",
+                    tag := y.tag ++ "!",
+                    tag2 := y.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_20(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := "!",
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := <str>random(),
+            SELECT (
+                INSERT Person {
+                    name := x.name ++ y,
+                    tag := x.tag ++ y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_21(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := "!",
+            SELECT (
+                INSERT Person {
+                    name := x.name ++ y,
+                    tag := x.tag ++ y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_22(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := <str>random(),
+            SELECT (
+                INSERT Person {
+                    name := x.name ++ y,
+                    tag := x.tag ++ y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_23(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := "!",
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := x.name ++ <str>random(),
+            SELECT (
+                INSERT Person {
+                    name := y,
+                    tag := y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_24(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := x.name ++ "!",
+            SELECT (
+                INSERT Person {
+                    name := y,
+                    tag := y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_25(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person { name := name, tag := name, tag2 := name }
+                ),
+                y := x.name ++ <str>random(),
+            SELECT (
+                INSERT Person {
+                    name := y,
+                    tag := y,
+                    tag2 := x.tag2,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_26(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person {
+                        name := name,
+                        tag := name,
+                        tag2 := name,
+                    }
+                ),
+                y := (
+                    WITH r := <str>random(),
+                    INSERT Person {
+                        name := x.name ++ r,
+                        tag := x.tag ++ r,
+                        tag2 := x.tag,
+                    }
+                ),
+            SELECT (
+                WITH r := <str>random(),
+                INSERT Person {
+                    name := y.name ++ r,
+                    tag := y.name ++ r,
+                    tag2 := y.tag ++ r,
+                }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [3],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [2],
+        )
+
+    async def test_edgeql_insert_volatile_27(self):
+        await self.con.execute('''
+            WITH x := "!"
+            INSERT Person {
+                name := x,
+                tag := x,
+                note := (
+                    WITH y := <str>random()
+                    insert Note { name := y, note := y }
+                )
+            };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'WITH N := (Note {ok := .name = .note}) SELECT all(N.ok)',
+            [True],
+        )
+
+    async def test_edgeql_insert_volatile_28(self):
+        await self.con.execute('''
+            WITH x := <str>random(),
+            INSERT Person {
+                name := x,
+                tag := x,
+                note := (
+                    WITH y := <str>random()
+                    insert Note { name := y, note := y }
+                )
+            };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'WITH N := (Note {ok := .name = .note}) SELECT all(N.ok)',
+            [True],
+        )
+
+    async def test_edgeql_insert_volatile_29(self):
+        await self.con.execute('''
+            WITH x := "!",
+            INSERT Person {
+                name := x,
+                tag := x,
+                note := (
+                    WITH y := x ++ <str>random()
+                    insert Note { name := y, note := y }
+                )
+            };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'WITH N := (Note {ok := .name = .note}) SELECT all(N.ok)',
+            [True],
+        )
+
+    async def test_edgeql_insert_volatile_30(self):
+        await self.con.execute('''
+            WITH x := <str>random(),
+            INSERT Person {
+                name := x,
+                tag := x,
+                note := (
+                    WITH y := x ++ "!"
+                    insert Note { name := y, note := y }
+                )
+            };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'WITH N := (Note {ok := .name = .note}) SELECT all(N.ok)',
+            [True],
+        )
+
+    async def test_edgeql_insert_volatile_31(self):
+        await self.con.execute('''
+            WITH x := <str>random(),
+            INSERT Person {
+                name := x,
+                tag := x,
+                note := (
+                    WITH y := x ++ <str>random()
+                    insert Note { name := y, note := y }
+                )
+            };
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'WITH N := (Note {ok := .name = .note}) SELECT all(N.ok)',
+            [True],
+        )
+
+    async def test_edgeql_insert_volatile_32(self):
+        await self.con.execute('''
+            FOR name in {<str>random(), <str>random()}
             UNION (INSERT Person { name := name, tag := name });
         ''')
 
         await self.assert_query_result(
-            r'''
-                SELECT all(Person.name = Person.tag)
-            ''',
-            [True]
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+
+    async def test_edgeql_insert_volatile_33(self):
+        await self.con.execute('''
+            WITH x := "!"
+            FOR y in {<str>random(), <str>random()}
+            UNION (
+                WITH name := x ++ y
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_34(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            FOR y in {"A", "B"}
+            UNION (
+                WITH name := x ++ y
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_35(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            FOR y in {<str>random(), <str>random()}
+            UNION (
+                WITH name := x ++ y
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_36(self):
+        await self.con.execute('''
+            WITH x := "!"
+            FOR name in {x ++ <str>random(), x ++ <str>random()}
+            UNION (
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_37(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            FOR name in {x ++ "A", x ++ "B"}
+            UNION (
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_38(self):
+        await self.con.execute('''
+            WITH x := <str>random()
+            FOR name in {x ++ <str>random(), x ++ <str>random()}
+            UNION (
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_volatile_39(self):
+        await self.con.execute('''
+            FOR x in {"A", "B"}
+            UNION (
+                WITH name := x ++ <str>random()
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [2],
+        )
+
+    async def test_edgeql_insert_volatile_40(self):
+        await self.con.execute('''
+            FOR x in {<str>random(), <str>random()}
+            UNION (
+                WITH name := x ++ "!"
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [2],
+        )
+
+    async def test_edgeql_insert_volatile_41(self):
+        await self.con.execute('''
+            FOR x in {<str>random(), <str>random()}
+            UNION (
+                WITH name := x ++ <str>random()
+                INSERT Person { name := name, tag := name, tag2 := x }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [2],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [2],
+        )
+
+    async def test_edgeql_insert_volatile_42(self):
+        await self.con.execute('''
+            WITH
+                x := (
+                    WITH name := <str>random(),
+                    INSERT Person {
+                        name := name,
+                        tag := name,
+                        tag2 := name,
+                    }
+                )
+            FOR y in {<str>random(), <str>random()}
+            UNION (
+                WITH name := x.name ++ y
+                INSERT Person { name := name, tag := name, tag2 := x.tag2 }
+            );
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [3],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.tag2))',
+            [1],
+        )
+
+    async def test_edgeql_insert_with_freeobject_01(self):
+        await self.con.execute('''
+            WITH free := { name := "asdf" },
+            SELECT (INSERT Person { name := free.name });
+        ''')
+
+        await self.assert_query_result(
+            'SELECT Person.name = "asdf"',
+            [True],
+        )
+
+    async def test_edgeql_insert_with_freeobject_02(self):
+        await self.con.execute('''
+            WITH free := { name := <str>random() },
+            SELECT (INSERT Person { name := free.name, tag := free.name });
+        ''')
+
+        await self.assert_query_result(
+            'WITH P := (Person {ok := .name = .tag}) SELECT all(P.ok)',
+            [True],
+        )
+        await self.assert_query_result(
+            'SELECT count(distinct(Person.name))',
+            [1],
         )
 
     async def test_edgeql_insert_multi_exclusive_01(self):
@@ -5610,6 +6857,7 @@ class TestInsert(tb.QueryTestCase):
             INSERT Person { name := "asdf", multi_prop := "a" };
         ''')
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_insert_enumerate_01(self):
         await self.assert_query_result(
             r"""
@@ -5843,6 +7091,16 @@ class TestInsert(tb.QueryTestCase):
                     name := "test",
                 }
             ''')
+
+    async def test_edgeql_insert_optional_cast_01(self):
+        await self.assert_query_result(
+            r'''
+                insert CollectionTest {
+                    str_array := <array<str>>to_json('null')
+                };
+            ''',
+            [{}],
+        )
 
     async def test_edgeql_insert_except_constraint_01(self):
         # Test basic behavior of a constraint using except
@@ -6247,10 +7505,14 @@ class TestInsert(tb.QueryTestCase):
         )
 
     async def test_edgeql_insert_conditional_02(self):
-        async with self.assertRaisesRegexTx(
-            edgedb.errors.QueryError,
-            "cannot reference correlated set",
-        ):
+        ctxmgr = (
+            contextlib.nullcontext() if self.NO_FACTOR
+            else self.assertRaisesRegexTx(
+                edgedb.errors.QueryError,
+                "cannot reference correlated set",
+            )
+        )
+        async with ctxmgr:
             await self.con.execute('''
                 select ((if ExceptTest.deleted then (
                     insert InsertTest { l2 := 2 }
@@ -6380,4 +7642,299 @@ class TestInsert(tb.QueryTestCase):
                 {'l2': 3, 'name': "?", 'new': True},
             ],
             variables=([0, 1, 2, 3],)
+        )
+
+    async def test_edgeql_insert_coalesce_05(self):
+        await self.con.execute('''
+            insert Subordinate { name := "foo" };
+        ''')
+
+        Q = '''
+        for sub in Subordinate union (
+          (select Note filter .subject = sub) ??
+          (insert Note { name := "", subject := sub })
+        );
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{}],
+        )
+        await self.assert_query_result(
+            Q,
+            [{}],
+        )
+        await self.assert_query_result(
+            'select count(Note)',
+            [1],
+        )
+
+        await self.con.execute('''
+            insert Subordinate { name := "bar" };
+            insert Subordinate { name := "baz" };
+        ''')
+
+        await self.assert_query_result(
+            Q,
+            [{}] * 3,
+        )
+        await self.assert_query_result(
+            Q,
+            [{}] * 3,
+        )
+        await self.assert_query_result(
+            'select count(Note)',
+            [3],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_01(self):
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Person filter .name = name) ??
+               (insert Person { name := name})
+             ),
+        select { new := new }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'new': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'new': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_02(self):
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Person filter .name = name) ??
+               (insert Person { name := name})
+             ),
+        select (
+          insert Note { name := '??', subject := new }
+        ) { subject }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_03(self):
+        await self.con.execute('''
+            insert Note { name := 'x' }
+        ''')
+
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Person filter .name = name) ??
+               (insert Person { name := name})
+             ),
+        select (update Note filter .name = 'x' set { subject := new })
+               { subject }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_04(self):
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Note filter .name = name) ??
+               (insert Note { name := name })
+             ),
+        select { new := assert_single(new) }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'new': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'new': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_05(self):
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Note filter .name = name) ??
+               (insert Note { name := name})
+             ),
+        select (
+          insert Note { name := '??', subject := assert_single(new) }
+        ) { subject }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_06(self):
+        await self.con.execute('''
+            insert Note { name := 'x' }
+        ''')
+
+        Q = '''
+        with name := 'name',
+             new := (
+               (select Note filter .name = name) ??
+               (insert Note { name := name })
+             ),
+        select (update Note filter .name = 'x' set {
+                  subject := assert_single(new) })
+               { subject }
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{'subject': {}}],
+        )
+
+    async def test_edgeql_insert_coalesce_nulls_08(self):
+        Q = '''
+        with l2 := 420,
+        select (
+          if <bool>$0 then (
+            (delete DerivedTest filter .l2 = l2)
+            ??
+            (insert DerivedTest {l2 := l2})
+          ) else (
+            (update Note filter .name = <str>l2 set { note := "note" })
+            ??
+            (insert Note {name := <str>l2})
+          )
+        );
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [{}],
+            variables=(True,),
+        )
+        await self.assert_query_result(
+            Q,
+            [{}],
+            variables=(True,),
+        )
+        await self.assert_query_result(
+            'select DerivedTest',
+            [],
+        )
+
+        await self.assert_query_result(
+            Q,
+            [{}],
+            variables=(False,),
+        )
+        await self.assert_query_result(
+            Q,
+            [{}],
+            variables=(False,),
+        )
+        await self.assert_query_result(
+            'select Note { note }',
+            [{'note': "note"}],
+        )
+
+    async def test_edgeql_insert_empty_array_01(self):
+        with self.assertRaisesRegex(
+            edgedb.QueryError,
+            "expression returns value of indeterminate type"
+        ):
+            await self.con.execute("""
+                insert InsertTest {
+                    name := [],
+                    l2 := 0,
+                };
+            """)
+
+    async def test_edgeql_insert_empty_array_02(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidPropertyTargetError,
+            r"invalid target for property 'name' "
+            r"of object type 'default::InsertTest': 'array<std::str>' "
+            r"\(expecting 'std::str'\)"
+        ):
+            await self.con.execute("""
+                insert InsertTest {
+                    name := ['a'] ++ [],
+                    l2 := 0,
+                };
+            """)
+
+    async def test_edgeql_insert_empty_array_03(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidPropertyTargetError,
+            r"invalid target for property 'name' "
+            r"of object type 'default::InsertTest': 'std::int64' "
+            r"\(expecting 'std::str'\)"
+        ):
+            await self.con.execute("""
+                insert InsertTest {
+                    name := array_unpack([1] ++ []),
+                    l2 := 0,
+                };
+            """)
+
+    async def test_edgeql_insert_empty_array_04(self):
+        with self.assertRaisesRegex(
+            edgedb.QueryError,
+            "expression returns value of indeterminate type"
+        ):
+            await self.con.execute("""
+                insert InsertTest {
+                    l2 := 0,
+                    subordinates := (
+                        select Subordinate {
+                            @comment := []
+                        }
+                    )
+                };
+            """)
+
+    async def test_edgeql_insert_empty_array_05(self):
+        await self.assert_query_result("""
+            insert Subordinate { name := 'hi' };
+            select ( insert InsertTest {
+                l2 := 0,
+                subordinates := (
+                    select Subordinate {
+                        @comment := array_join(['a'] ++ [], '')
+                    }
+                )
+            }) { l2, subordinates: { name, @comment } };
+            """,
+            [{'l2': 0, 'subordinates': [{'name': 'hi', '@comment': 'a'}]}],
         )

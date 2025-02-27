@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Mapping, Dict, TYPE_CHECKING
 
 import asyncio
 import json
@@ -30,14 +30,14 @@ import sys
 import tempfile
 import time
 
-from jwcrypto import jwk
-
 from edb import buildmeta
 from edb.common import devmode
 from edb.edgeql import quote
 
 from edb.server import args as edgedb_args
 from edb.server import defines as edgedb_defines
+from edb.server import pgconnparams
+from edb.server import auth
 
 from . import pgcluster
 
@@ -67,6 +67,9 @@ class BaseCluster:
         ] = None,
         compiler_pool_mode: Optional[
             edgedb_args.CompilerPoolMode
+        ] = None,
+        net_worker_mode: Optional[
+            edgedb_args.NetWorkerMode
         ] = None,
     ):
         self._edgedb_cmd = [sys.executable, '-m', 'edb.server.main']
@@ -114,11 +117,17 @@ class BaseCluster:
                 str(compiler_pool_mode),
             ))
 
+        if net_worker_mode is not None:
+            self._edgedb_cmd.extend((
+                '--net-worker-mode',
+                str(net_worker_mode),
+            ))
+
         self._log_level = log_level
         self._runstate_dir = runstate_dir
         self._edgedb_cmd.extend(['--runstate-dir', str(runstate_dir)])
         self._pg_cluster: Optional[pgcluster.BaseCluster] = None
-        self._pg_connect_args: Dict[str, Any] = {}
+        self._pg_connect_args: pgconnparams.CreateParamsKwargs = {}
         self._daemon_process: Optional[subprocess.Popen[str]] = None
         self._port = port
         self._effective_port = None
@@ -146,7 +155,7 @@ class BaseCluster:
         conn = None
         try:
             conn = await pg_cluster.connect(
-                timeout=5,
+                source_description=f"{self.__class__.__name__}.get_status",
                 **self._pg_connect_args,
             )
 
@@ -277,7 +286,7 @@ class BaseCluster:
             while True:
                 line = await stream.readline()
                 if not line:
-                    raise ClusterError("EdgeDB server terminated")
+                    raise ClusterError("Gel server terminated")
                 if line.startswith(b'READY='):
                     break
 
@@ -286,7 +295,7 @@ class BaseCluster:
                 return json.loads(dataline)  # type: ignore
             except Exception as e:
                 raise ClusterError(
-                    f"EdgeDB server returned invalid status line: "
+                    f"Gel server returned invalid status line: "
                     f"{dataline!r} ({e})"
                 )
 
@@ -301,7 +310,7 @@ class BaseCluster:
                 )
             except asyncio.TimeoutError:
                 raise ClusterError(
-                    f'EdgeDB server did not initialize '
+                    f'Gel server did not initialize '
                     f'within {timeout} seconds'
                 ) from None
 
@@ -314,37 +323,44 @@ class BaseCluster:
             started = time.monotonic()
             await test()
             left -= (time.monotonic() - started)
-
-        if self._admin_query("SELECT ();", f"{max(1, int(left))}s"):
+        if res := self._admin_query(
+            "SELECT ();",
+            f"{max(1, int(left))}s",
+            check=False,
+        ):
             raise ClusterError(
                 f'could not connect to edgedb-server '
-                f'within {timeout} seconds') from None
+                f'within {timeout} seconds (exit code = {res})') from None
 
     def _admin_query(
         self,
         query: str,
         wait_until_available: str = "0s",
+        check: bool=True,
     ) -> int:
-        return subprocess.call(
-            [
-                "edgedb",
-                "--host",
-                str(os.path.abspath(self._runstate_dir)),
-                "--port",
-                str(self._effective_port),
-                "--admin",
-                "--user",
-                edgedb_defines.EDGEDB_SUPERUSER,
-                "--database",
-                edgedb_defines.EDGEDB_SUPERUSER_DB,
-                "--wait-until-available",
-                wait_until_available,
-                "-c",
-                query,
-            ],
-            stdout=subprocess.DEVNULL,
+        args = [
+            "edgedb",
+            "query",
+            "--unix-path",
+            str(os.path.abspath(self._runstate_dir)),
+            "--port",
+            str(self._effective_port),
+            "--admin",
+            "--user",
+            edgedb_defines.EDGEDB_SUPERUSER,
+            "--branch",
+            edgedb_defines.EDGEDB_SUPERUSER_DB,
+            "--wait-until-available",
+            wait_until_available,
+            query,
+        ]
+        res = subprocess.run(
+            args=args,
+            check=check,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        return res.returncode
 
     async def set_test_config(self) -> None:
         self._admin_query(f'''
@@ -411,7 +427,7 @@ class Cluster(BaseCluster):
         self._edgedb_cmd.extend(['-D', str(self._data_dir)])
         self._pg_connect_args['user'] = pg_superuser
         self._pg_connect_args['database'] = 'template1'
-        self._jws_key: Optional[jwk.JWK] = None
+        self._jws_key: Optional[auth.JWKSet] = None
 
     async def _new_pg_cluster(self) -> pgcluster.Cluster:
         return await pgcluster.get_local_pg_cluster(

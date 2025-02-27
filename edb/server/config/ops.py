@@ -21,7 +21,20 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    TypeVar,
+    Union,
+    Iterable,
+    Mapping,
+    Collection,
+    NamedTuple,
+    TYPE_CHECKING,
+    TypeGuard,
+)
 
 import immutables
 
@@ -39,6 +52,9 @@ from edb.schema import utils as s_utils
 
 from . import spec
 from . import types
+
+
+MAX_CONFIG_SET_SIZE = 128
 
 
 class OpCode(enum.StrEnum):
@@ -82,14 +98,16 @@ def coerce_single_value(setting: spec.Setting, value: Any) -> Any:
     elif (isinstance(value, (str, int)) and
           _issubclass(setting.type, statypes.ConfigMemory)):
         return statypes.ConfigMemory(value)
+    elif (isinstance(value, str) and
+          _issubclass(setting.type, statypes.EnumScalarType)):
+        return setting.type(value)
     else:
         raise errors.ConfigurationError(
             f'invalid value type for the {setting.name!r} setting')
 
 
 def _check_object_set_uniqueness(
-    setting: spec.Setting,
-    objs: Iterable[types.CompositeConfigType]
+    setting: spec.Setting, objs: Iterable[types.CompositeConfigType]
 ) -> frozenset[types.CompositeConfigType]:
     """Check the unique constraints for an object set"""
 
@@ -115,6 +133,11 @@ def _check_object_set_uniqueness(
                 f'{setting.type.__name__} has no unique values'
             )
         new_values.add(new_value)
+
+    if len(new_values) > MAX_CONFIG_SET_SIZE:
+        raise errors.ConfigurationError(
+            f'invalid value for the '
+            f'{setting.name!r} setting: set is too large')
 
     return frozenset(new_values)
 
@@ -152,8 +175,13 @@ class Operation(NamedTuple):
             raise errors.ConfigurationError(
                 f'unknown setting {self.setting_name!r}') from None
 
-    def coerce_value(self, spec: spec.Spec, setting: spec.Setting, *,
-                     allow_missing: bool = False):
+    def coerce_value(
+        self,
+        spec: spec.Spec,
+        setting: spec.Setting,
+        *,
+        allow_missing: bool = False,
+    ):
         if isinstance(setting.type, types.ConfigTypeSpec):
             try:
                 if self.opcode is OpCode.CONFIG_SET:
@@ -174,9 +202,15 @@ class Operation(NamedTuple):
                     f'invalid value type for the '
                     f'{setting.name!r} setting')
             else:
-                return frozenset(
+                val = frozenset(
                     coerce_single_value(setting, v)
                     for v in self.value)  # type: ignore
+                if len(val) > MAX_CONFIG_SET_SIZE:
+                    raise errors.ConfigurationError(
+                        f'invalid value for the '
+                        f'{setting.name!r} setting: set is too large')
+                return val
+
         else:
             try:
                 return coerce_single_value(setting, self.value)
@@ -187,7 +221,8 @@ class Operation(NamedTuple):
                     raise
 
     def coerce_global_value(
-            self, *, allow_missing: bool = False) -> Optional[bytes]:
+        self, *, allow_missing: bool = False
+    ) -> Optional[bytes]:
         if allow_missing and self.value is None:
             return None
         else:
@@ -197,7 +232,13 @@ class Operation(NamedTuple):
             # the value has explicitly been set to {}.
             return b[4:] if b[:4] != b'\xff\xff\xff\xff' else None
 
-    def apply(self, spec: spec.Spec, storage: SettingsMap) -> SettingsMap:
+    def apply(
+        self,
+        spec: spec.Spec,
+        storage: SettingsMap,
+        *,
+        source: str | None = None,
+    ) -> SettingsMap:
 
         allow_missing = (
             self.opcode is OpCode.CONFIG_REM
@@ -213,7 +254,7 @@ class Operation(NamedTuple):
             value = self.coerce_global_value(allow_missing=allow_missing)
 
         if self.opcode is OpCode.CONFIG_SET:
-            storage = self._set_value(storage, value)
+            storage = self._set_value(storage, value, source=source)
 
         elif self.opcode is OpCode.CONFIG_RESET:
             try:
@@ -237,7 +278,7 @@ class Operation(NamedTuple):
 
             new_value = _check_object_set_uniqueness(
                 setting, list(exist_value) + [value])
-            storage = self._set_value(storage, new_value)
+            storage = self._set_value(storage, new_value, source=source)
 
         elif self.opcode is OpCode.CONFIG_REM:
             assert setting
@@ -253,7 +294,7 @@ class Operation(NamedTuple):
             else:
                 exist_value = setting.default
             new_value = exist_value - {value}
-            storage = self._set_value(storage, new_value)
+            storage = self._set_value(storage, new_value, source=source)
 
         return storage
 
@@ -261,18 +302,21 @@ class Operation(NamedTuple):
         self,
         storage: SettingsMap,
         value: Any,
+        *,
+        source: str | None = None,
     ) -> SettingsMap:
 
-        if self.scope is qltypes.ConfigScope.INSTANCE:
-            source = 'system override'
-        elif self.scope is qltypes.ConfigScope.DATABASE:
-            source = 'database'
-        elif self.scope is qltypes.ConfigScope.SESSION:
-            source = 'session'
-        elif self.scope is qltypes.ConfigScope.GLOBAL:
-            source = 'global'
-        else:
-            raise AssertionError(f'unexpected config scope: {self.scope}')
+        if source is None:
+            if self.scope is qltypes.ConfigScope.INSTANCE:
+                source = 'system override'
+            elif self.scope is qltypes.ConfigScope.DATABASE:
+                source = 'database'
+            elif self.scope is qltypes.ConfigScope.SESSION:
+                source = 'session'
+            elif self.scope is qltypes.ConfigScope.GLOBAL:
+                source = 'global'
+            else:
+                raise AssertionError(f'unexpected config scope: {self.scope}')
 
         return set_value(
             storage,
@@ -303,12 +347,16 @@ def spec_to_json(spec: spec.Spec):
             typeid = s_obj.get_known_type_id('std::bool')
         elif _issubclass(setting.type, int):
             typeid = s_obj.get_known_type_id('std::int64')
+        elif _issubclass(setting.type, float):
+            typeid = s_obj.get_known_type_id('std::float32')
         elif _issubclass(setting.type, types.ConfigType):
             typeid = setting.type.get_edgeql_typeid()
         elif _issubclass(setting.type, statypes.Duration):
             typeid = s_obj.get_known_type_id('std::duration')
         elif _issubclass(setting.type, statypes.ConfigMemory):
             typeid = s_obj.get_known_type_id('cfg::memory')
+        elif _issubclass(setting.type, statypes.EnumScalarType):
+            typeid = setting.type.get_edgeql_typeid()
         elif isinstance(setting.type, types.ConfigTypeSpec):
             typeid = types.CompositeConfigType.get_edgeql_typeid()
         else:
@@ -344,11 +392,9 @@ def value_to_json_value(setting: spec.Setting, value: Any):
             # if they are single, because it simplifies things in the
             # config handling SQL.
             return [value.to_json_value()] if value is not None else []
-        elif _issubclass(setting.type, statypes.Duration) and value is not None:
-            return value.to_iso8601()
-        elif (_issubclass(setting.type, statypes.ConfigMemory) and
+        elif (_issubclass(setting.type, statypes.ScalarType) and
                 value is not None):
-            return value.to_str()
+            return value.to_json()
         else:
             return value
 
@@ -379,6 +425,8 @@ def value_from_json_value(spec: spec.Spec, setting: spec.Setting, value: Any):
             return statypes.Duration.from_iso8601(value)
         elif _issubclass(setting.type, statypes.ConfigMemory):
             return statypes.ConfigMemory(value)
+        elif _issubclass(setting.type, statypes.EnumScalarType):
+            return setting.type(value)
         else:
             return value
 
@@ -388,23 +436,25 @@ def value_from_json(spec, setting, value: str):
 
 
 def value_to_edgeql_const(
-    type: type | types.ConfigTypeSpec, value: Any
+    type: type | types.ConfigTypeSpec,
+    value: Any,
+    with_secrets: bool,
 ) -> str:
-    ql = s_utils.const_ast_from_python(value)
+    ql = s_utils.const_ast_from_python(value, with_secrets=with_secrets)
     return qlcodegen.generate_source(ql)
 
 
-def to_json(
+def to_json_obj(
     spec: spec.Spec,
     storage: Mapping[str, SettingValue],
     *,
     setting_filter: Optional[Callable[[SettingValue], bool]] = None,
     include_source: bool = True,
-) -> str:
+) -> Dict[str, Any]:
     dct = {}
     for name, value in storage.items():
-        setting = spec[name]
         if setting_filter is None or setting_filter(value):
+            setting = spec[name]
             val = value_to_json_value(setting, value.value)
             if include_source:
                 dct[name] = {
@@ -415,6 +465,22 @@ def to_json(
                 }
             else:
                 dct[name] = val
+    return dct
+
+
+def to_json(
+    spec: spec.Spec,
+    storage: Mapping[str, SettingValue],
+    *,
+    setting_filter: Optional[Callable[[SettingValue], bool]] = None,
+    include_source: bool = True,
+) -> str:
+    dct = to_json_obj(
+        spec,
+        storage,
+        setting_filter=setting_filter,
+        include_source=include_source,
+    )
     return json.dumps(dct)
 
 
@@ -458,17 +524,24 @@ def to_edgeql(
         setting = spec[name]
         if setting.secret and not with_secrets:
             continue
+        if setting.protected:
+            continue
         if isinstance(setting.type, types.ConfigTypeSpec):
-            for x in value.value:
+            values = value.value if setting.set_of else [value.value]
+            for x in values:
                 # We look at the specific type of the object because
                 # a subtype could have a secret that the parent doesn't.
                 if x._tspec.has_secret and not with_secrets:
                     continue
-                val = value_to_edgeql_const(setting.type, x)
+                val = value_to_edgeql_const(
+                    setting.type, x, with_secrets=with_secrets
+                )
                 stmt = f'CONFIGURE {value.scope.to_edgeql()}\n{val};'
                 stmts.append(stmt)
         else:
-            val = value_to_edgeql_const(setting.type, value.value)
+            val = value_to_edgeql_const(
+                setting.type, value.value, with_secrets=with_secrets
+            )
             stmt = f'CONFIGURE {value.scope.to_edgeql()} SET {name} := {val};'
             stmts.append(stmt)
 

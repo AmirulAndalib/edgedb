@@ -19,11 +19,11 @@
 
 CREATE EXTENSION PACKAGE auth VERSION '1.0' {
     set ext_module := "ext::auth";
-    set dependencies := ["pgcrypto==1.3"];
+    set dependencies := ["pgcrypto>=1.3"];
 
     create module ext::auth;
 
-    create abstract type ext::auth::Auditable {
+    create abstract type ext::auth::Auditable extending std::BaseObject {
         create required property created_at: std::datetime {
             set default := std::datetime_current();
             set readonly := true;
@@ -51,19 +51,71 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
     create abstract type ext::auth::Factor extending ext::auth::Auditable {
         create required link identity: ext::auth::LocalIdentity {
             create constraint exclusive;
+            on target delete delete source;
         };
     };
 
     create type ext::auth::EmailFactor extending ext::auth::Factor {
-        create required property email: str {
-            create delegated constraint exclusive;
-        };
+        create required property email: str;
         create property verified_at: std::datetime;
     };
 
     create type ext::auth::EmailPasswordFactor
         extending ext::auth::EmailFactor {
+        alter property email {
+            create constraint exclusive;
+        };
         create required property password_hash: std::str;
+    };
+
+    create type ext::auth::MagicLinkFactor extending ext::auth::EmailFactor {
+        alter property email {
+            create constraint exclusive;
+        };
+    };
+
+    create type ext::auth::WebAuthnFactor extending ext::auth::EmailFactor {
+        create required property user_handle: std::bytes;
+        create required property credential_id: std::bytes {
+            create constraint exclusive;
+        };
+        create required property public_key: std::bytes {
+            create constraint exclusive;
+        };
+
+        create trigger email_shares_user_handle after insert for each do (
+            std::assert(
+                __new__.user_handle = (
+                    select detached ext::auth::WebAuthnFactor
+                    filter .email = __new__.email
+                    and not .id = __new__.id
+                ).user_handle,
+                message := "user_handle must be the same for a given email"
+            )
+        );
+        create constraint exclusive on ((.email, .credential_id));
+    };
+
+    create type ext::auth::WebAuthnRegistrationChallenge
+        extending ext::auth::Auditable {
+        create required property challenge: std::bytes {
+            create constraint exclusive;
+        };
+        create required property email: std::str;
+        create required property user_handle: std::bytes;
+
+        create constraint exclusive on ((.user_handle, .email, .challenge));
+    };
+
+    create type ext::auth::WebAuthnAuthenticationChallenge
+        extending ext::auth::Auditable {
+        create required property challenge: std::bytes {
+            create constraint exclusive;
+        };
+        create required multi link factors: ext::auth::WebAuthnFactor {
+            create constraint exclusive;
+            on target delete delete source;
+        };
     };
 
     create type ext::auth::PKCEChallenge extending ext::auth::Auditable {
@@ -78,7 +130,13 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
             create annotation std::description :=
                 "Identity provider's refresh token.";
         };
-        create link identity: ext::auth::Identity;
+        create property id_token: std::str {
+            create annotation std::description :=
+                "Identity provider's OpenID Connect id_token.";
+        };
+        create link identity: ext::auth::Identity {
+            on target delete delete source;
+        };
     };
 
     create abstract type ext::auth::ProviderConfig
@@ -123,6 +181,29 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
         };
     };
 
+    create type ext::auth::OpenIDConnectProvider
+        extending ext::auth::OAuthProviderConfig {
+        alter property name {
+            set protected := false;
+        };
+
+        alter property display_name {
+            set protected := false;
+        };
+
+        create required property issuer_url: std::str {
+            create annotation std::description :=
+                "The issuer URL of the provider.";
+        };
+
+        create property logo_url: std::str {
+            create annotation std::description :=
+                "A url to an image of the provider's logo.";
+        };
+
+        create constraint exclusive on ((.issuer_url, .client_id));
+    };
+
     create type ext::auth::AppleOAuthProvider
         extending ext::auth::OAuthProviderConfig {
         alter property name {
@@ -142,6 +223,28 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
 
         alter property display_name {
             set default := 'Azure';
+        };
+    };
+
+    create type ext::auth::DiscordOAuthProvider
+        extending ext::auth::OAuthProviderConfig {
+        alter property name {
+            set default := 'builtin::oauth_discord';
+        };
+
+        alter property display_name {
+            set default := 'Discord';
+        };
+    };
+
+    create type ext::auth::SlackOAuthProvider
+        extending ext::auth::OAuthProviderConfig {
+        alter property name {
+            set default := 'builtin::oauth_slack';
+        };
+
+        alter property display_name {
+            set default := 'Slack';
         };
     };
 
@@ -179,6 +282,39 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
         };
     };
 
+    create type ext::auth::WebAuthnProviderConfig
+        extending ext::auth::ProviderConfig {
+        alter property name {
+            set default := 'builtin::local_webauthn';
+            set protected := true;
+        };
+
+        create required property relying_party_origin: std::str {
+            create annotation std::description :=
+                "The full origin of the sign-in page including protocol and \
+                port of the application. If using the built-in UI, this \
+                should be the origin of the EdgeDB server.";
+        };
+
+        create required property require_verification: std::bool {
+            set default := true;
+        };
+    };
+
+    create type ext::auth::MagicLinkProviderConfig
+        extending ext::auth::ProviderConfig {
+        alter property name {
+            set default := 'builtin::local_magic_link';
+            set protected := true;
+        };
+
+        create required property token_time_to_live: std::duration {
+            set default := <std::duration>'10 minutes';
+            create annotation std::description :=
+                "The time after which a magic link token expires.";
+        };
+    };
+
     create scalar type ext::auth::FlowType extending std::enum<PKCE, Implicit>;
 
     create type ext::auth::UIConfig extending cfg::ConfigObject {
@@ -203,6 +339,94 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
             create annotation std::description :=
                 "The name of your application to be shown on the login \
                 screen.";
+            create annotation std::deprecated :=
+                "Use the app_name property in ext::auth::AuthConfig instead.";
+        };
+
+        create property logo_url: std::str {
+            create annotation std::description :=
+                "A url to an image of your application's logo.";
+            create annotation std::deprecated :=
+                "Use the logo_url property in ext::auth::AuthConfig instead.";
+        };
+
+        create property dark_logo_url: std::str {
+            create annotation std::description :=
+                "A url to an image of your application's logo to be used \
+                with the dark theme.";
+            create annotation std::deprecated :=
+                "Use the dark_logo_url property in ext::auth::AuthConfig \
+                instead.";
+        };
+
+        create property brand_color: std::str {
+            create annotation std::description :=
+                "The brand color of your application as a hex string.";
+            create annotation std::deprecated :=
+                "Use the brand_color property in ext::auth::AuthConfig \
+                instead.";
+        };
+    };
+
+    create scalar type ext::auth::WebhookEvent extending std::enum<
+        IdentityCreated,
+        IdentityAuthenticated,
+        EmailFactorCreated,
+        EmailVerified,
+        EmailVerificationRequested,
+        PasswordResetRequested,
+        MagicLinkRequested,
+    >;
+
+    create type ext::auth::WebhookConfig extending cfg::ConfigObject {
+        create required property url: std::str {
+            create annotation std::description :=
+                "The url to send webhooks to.";
+
+            create constraint exclusive;
+        };
+
+        create required multi property events: ext::auth::WebhookEvent {
+            create annotation std::description :=
+                "The events to send webhooks for.";
+        };
+
+        create property signing_secret_key: std::str {
+            set secret := true;
+
+            create annotation std::description :=
+                "The secret key used to sign webhook requests.";
+        };
+    };
+
+    create function ext::auth::webhook_signing_key_exists(
+        webhook_config: ext::auth::WebhookConfig
+    ) -> std::bool {
+        using (
+            select exists webhook_config.signing_secret_key
+        );
+    };
+
+    create type ext::auth::AuthConfig extending cfg::ExtensionConfig {
+        create multi link providers: ext::auth::ProviderConfig {
+            create annotation std::description :=
+                "Configuration for auth provider clients.";
+        };
+
+        create link ui: ext::auth::UIConfig {
+            create annotation std::description :=
+                "Configuration for builtin auth UI. If not set the builtin \
+                UI is disabled.";
+        };
+
+        create multi link webhooks: ext::auth::WebhookConfig {
+            create annotation std::description :=
+                "Configuration for webhooks.";
+        };
+
+        create property app_name: std::str {
+            create annotation std::description :=
+                "The name of your application.";
         };
 
         create property logo_url: std::str {
@@ -220,84 +444,28 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
             create annotation std::description :=
                 "The brand color of your application as a hex string.";
         };
-    };
 
-    create type ext::auth::AuthConfig extending cfg::ExtensionConfig {
-        create multi link providers -> ext::auth::ProviderConfig {
-            create annotation std::description :=
-                "Configuration for auth provider clients.";
-        };
-
-        create link ui -> ext::auth::UIConfig {
-            create annotation std::description :=
-                "Configuration for builtin auth UI. If not set the builtin \
-                UI is disabled.";
-        };
-
-        create property auth_signing_key -> std::str {
+        create property auth_signing_key: std::str {
             set secret := true;
             create annotation std::description :=
                 "The signing key used for auth extension. Must be at \
                 least 32 characters long.";
         };
 
-        create property token_time_to_live -> std::duration {
+        create property token_time_to_live: std::duration {
             create annotation std::description :=
                 "The time after which an auth token expires. A value of 0 \
                 indicates that the token should never expire.";
             set default := <std::duration>'336 hours';
         };
-    };
 
-    create scalar type ext::auth::SMTPSecurity extending enum<PlainText, TLS, STARTTLS, STARTTLSOrPlainText>;
-
-    create type ext::auth::SMTPConfig extending cfg::ExtensionConfig {
-        create property sender -> std::str {
+        create multi property allowed_redirect_urls: std::str {
             create annotation std::description :=
-                "\"From\" address of system emails sent for e.g. \
-                password reset, etc.";
-        };
-        create property host -> std::str {
-            create annotation std::description :=
-                "Host of SMTP server to use for sending emails. \
-                If not set, \"localhost\" will be used.";
-        };
-        create property port -> std::int32 {
-            create annotation std::description :=
-                "Port of SMTP server to use for sending emails. \
-                If not set, common defaults will be used depending on security: \
-                465 for TLS, 587 for STARTTLS, 25 otherwise.";
-        };
-        create property username -> std::str {
-            create annotation std::description :=
-                "Username to login as after connected to SMTP server.";
-        };
-        create property password -> std::str {
-            set secret := true;
-            create annotation std::description :=
-                "Password for login after connected to SMTP server.";
-        };
-        create required property security -> ext::auth::SMTPSecurity {
-            set default := ext::auth::SMTPSecurity.STARTTLSOrPlainText;
-            create annotation std::description :=
-                "Security mode of the connection to SMTP server. \
-                By default, initiate a STARTTLS upgrade if supported by the \
-                server, or fallback to PlainText.";
-        };
-        create required property validate_certs -> std::bool {
-            set default := true;
-            create annotation std::description :=
-                "Determines if SMTP server certificates are validated.";
-        };
-        create required property timeout_per_email -> std::duration {
-            set default := <std::duration>'60 seconds';
-            create annotation std::description :=
-                "Maximum time to send an email, including retry attempts.";
-        };
-        create required property timeout_per_attempt -> std::duration {
-            set default := <std::duration>'15 seconds';
-            create annotation std::description :=
-                "Maximum time for each SMTP request.";
+                "When redirecting the user in various flows, the URL will be \
+                checked against this list to ensure they are going \
+                to a trusted domain controlled by the application. URLs are \
+                matched based on checking if the candidate redirect URL is \
+                a match or a subdirectory of any of these allowed URLs";
         };
     };
 
@@ -401,14 +569,14 @@ CREATE EXTENSION PACKAGE auth VERSION '1.0' {
         );
     };
 
-    create global ext::auth::client_token -> std::str;
-    create global ext::auth::ClientTokenIdentity := (
+    create global ext::auth::client_token: std::str;
+    create single global ext::auth::ClientTokenIdentity := (
         with
             conf := {
                 key := (
-                    cfg::Config.extensions[is ext::auth::AuthConfig]
-                    .auth_signing_key
-                ),
+                    select cfg::Config.extensions[is ext::auth::AuthConfig]
+                    limit 1
+                ).auth_signing_key,
             },
             jwt := {
                 claims := ext::auth::_jwt_verify(

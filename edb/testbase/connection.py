@@ -16,9 +16,9 @@
 # limitations under the License.
 #
 
-"""A specialized client API for EdgeDB tests.
+"""A specialized client API for Gel tests.
 
-Historically EdgeDB tests relied on a very specific client API that
+Historically Gel tests relied on a very specific client API that
 is no longer supported by edgedb-python. Here we implement that API
 (for example, transactions can be nested and are non-retrying).
 """
@@ -35,12 +35,12 @@ import socket
 import ssl
 import time
 
-from edgedb import abstract
-from edgedb import errors
-from edgedb import con_utils
-from edgedb import enums as edgedb_enums
-from edgedb import options
-from edgedb.protocol import protocol  # type: ignore
+from gel import abstract
+from gel import errors
+from gel import con_utils
+from gel import enums as edgedb_enums
+from gel import options
+from gel.protocol import protocol  # type: ignore
 
 from edb.protocol import protocol as edb_protocol  # type: ignore
 
@@ -51,6 +51,9 @@ class TransactionState(enum.Enum):
     COMMITTED = 2
     ROLLEDBACK = 3
     FAILED = 4
+
+
+InputLanguage = protocol.InputLanguage
 
 
 class BaseTransaction(abc.ABC):
@@ -92,7 +95,10 @@ class BaseTransaction(abc.ABC):
         if self._state is TransactionState.STARTED:
             raise errors.InterfaceError(
                 'cannot start; the transaction is already started')
-        return self._make_start_query_inner()
+        qry = self._make_start_query_inner()
+        if self._connection._top_xact is None:
+            self._connection._top_xact = self
+        return qry
 
     @abc.abstractmethod
     def _make_start_query_inner(self):
@@ -100,6 +106,9 @@ class BaseTransaction(abc.ABC):
 
     def _make_commit_query(self):
         self.__check_state('commit')
+
+        if self._connection._top_xact is self:
+            self._connection._top_xact = None
 
         return 'COMMIT;'
 
@@ -135,7 +144,12 @@ class BaseTransaction(abc.ABC):
     async def _commit(self) -> None:
         query = self._make_commit_query()
         try:
-            await self._connection.execute(query)
+            # Use _fetchall to ensure there is no retry performed.
+            # The protocol level apparently thinks the transaction is
+            # over if COMMIT fails, and since we use that to decide
+            # whether to retry in query/execute, it would want to
+            # retry a COMMIT.
+            await self._connection._fetchall(query)
         except BaseException:
             self._state = TransactionState.FAILED
             raise
@@ -163,9 +177,7 @@ class RawTransaction(BaseTransaction):
     def _make_start_query_inner(self):
         con = self._connection
 
-        if con._top_xact is None:
-            con._top_xact = self
-        else:
+        if con._top_xact is not None:
             # Nested transaction block
             self._nested = True
 
@@ -179,9 +191,6 @@ class RawTransaction(BaseTransaction):
     def _make_commit_query(self):
         query = super()._make_commit_query()
 
-        if self._connection._top_xact is self:
-            self._connection._top_xact = None
-
         if self._nested:
             query = f'RELEASE SAVEPOINT {self._id};'
 
@@ -189,9 +198,6 @@ class RawTransaction(BaseTransaction):
 
     def _make_rollback_query(self):
         query = super()._make_rollback_query()
-
-        if self._connection._top_xact is self:
-            self._connection._top_xact = None
 
         if self._nested:
             query = f'ROLLBACK TO SAVEPOINT {self._id};'
@@ -291,9 +297,15 @@ class Iteration(BaseTransaction, abstract.AsyncIOExecutor):
                 )
             await self.start()
 
+    def _get_state(self) -> options.State:
+        return self._connection._get_state()
+
+    def _get_warning_handler(self) -> options.WarningHandler:
+        return self._connection._get_warning_handler()
+
 
 class Retry:
-    def __init__(self, connection):
+    def __init__(self, connection, raw=False):
         self._connection = connection
         self._iteration = 0
         self._done = False
@@ -338,12 +350,13 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
         self._transport = None
         self._query_cache = abstract.QueryCache(
             codecs_registry=protocol.CodecsRegistry(),
-            query_cache=protocol.QueryCodecsCache(),
+            query_cache=protocol.LRUMapping(maxsize=1000),
         )
         self._test_no_tls = test_no_tls
         self._params = None
         self._server_hostname = server_hostname
         self._log_listeners = set()
+        self._capture_warnings = None
 
     def add_log_listener(self, callback):
         self._log_listeners.add(callback)
@@ -353,6 +366,19 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
 
     def _get_state(self):
         return self._options.state
+
+    def _get_annotations(self) -> typing.Dict[str, str]:
+        return self._options.annotations
+
+    def _warning_handler(self, warnings, res):
+        if self._capture_warnings is not None:
+            self._capture_warnings.extend(warnings)
+            return res
+        else:
+            raise warnings[0]
+
+    def _get_warning_handler(self) -> options.WarningHandler:
+        return self._warning_handler
 
     def _on_log_message(self, msg):
         if self._log_listeners:
@@ -373,46 +399,68 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
     def _get_query_cache(self) -> abstract.QueryCache:
         return self._query_cache
 
-    async def _query(self, query_context: abstract.QueryContext):
-        await self.ensure_connected()
-        return await self.raw_query(query_context)
-
-    async def _execute(self, script: abstract.ExecuteContext) -> None:
-        await self.ensure_connected()
-        await self._protocol.execute(
-            query=script.query.query,
-            args=script.query.args,
-            kwargs=script.query.kwargs,
-            reg=script.cache.codecs_registry,
-            qc=script.cache.query_cache,
-            output_format=protocol.OutputFormat.NONE,
-            allow_capabilities=edgedb_enums.Capability.ALL,  # type: ignore
-            state=script.state and script.state.as_dict(),
-        )
-
     async def ensure_connected(self):
         if self.is_closed():
             await self.connect()
         return self
 
+    async def _query(self, query_context: abstract.QueryContext):
+        await self.ensure_connected()
+        return await self.raw_query(query_context)
+
+    async def _retry_operation(self, func):
+        i = 0
+        while True:
+            i += 1
+            try:
+                return await func()
+            # Retry transaction conflict errors, up to a maximum of 5
+            # times.  We don't do this if we are in a transaction,
+            # since that *ought* to be done at the transaction level.
+            # Though in reality in the test suite it is usually done at the
+            # test runner level.
+            except errors.TransactionConflictError:
+                if i >= 10 or self.is_in_transaction():
+                    raise
+                await asyncio.sleep(
+                    min((2 ** i) * 0.1, 10)
+                    + random.randrange(100) * 0.001
+                )
+
+    async def _execute(self, script: abstract.ExecuteContext) -> None:
+        await self.ensure_connected()
+
+        async def _inner():
+            ctx = script.lower(allow_capabilities=edgedb_enums.Capability.ALL)
+            res = await self._protocol.execute(ctx)
+            if ctx.warnings:
+                script.warning_handler(ctx.warnings, res)
+
+        await self._retry_operation(_inner)
+
     async def raw_query(self, query_context: abstract.QueryContext):
-        return await self._protocol.query(
-            query=query_context.query.query,
-            args=query_context.query.args,
-            kwargs=query_context.query.kwargs,
-            reg=query_context.cache.codecs_registry,
-            qc=query_context.cache.query_cache,
-            output_format=query_context.query_options.output_format,
-            expect_one=query_context.query_options.expect_one,
-            required_one=query_context.query_options.required_one,
-            allow_capabilities=edgedb_enums.Capability.ALL,  # type: ignore
-            state=query_context.state and query_context.state.as_dict(),
-        )
+        async def _inner():
+            ctx = query_context.lower(
+                allow_capabilities=edgedb_enums.Capability.ALL)
+            res = await self._protocol.query(ctx)
+            if ctx.warnings:
+                res = query_context.warning_handler(ctx.warnings, res)
+            return res
+
+        return await self._retry_operation(_inner)
+
+    async def _fetchall_generic(self, ctx):
+        await self.ensure_connected()
+        res = await self._protocol.query(ctx)
+        if ctx.warnings:
+            res = self._get_warning_handler()(ctx.warnings, res)
+        return res
 
     async def _fetchall(
         self,
         query: str,
         *args,
+        __language__: protocol.InputLanguage = protocol.InputLanguage.EDGEQL,
         __limit__: int = 0,
         __typeids__: bool = False,
         __typenames__: bool = False,
@@ -420,18 +468,20 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
             edgedb_enums.Capability.ALL),
         **kwargs,
     ):
-        await self.ensure_connected()
-        return await self._protocol.query(
-            query=query,
-            args=args,
-            kwargs=kwargs,
-            reg=self._query_cache.codecs_registry,
-            qc=self._query_cache.query_cache,
-            implicit_limit=__limit__,
-            inline_typeids=__typeids__,
-            inline_typenames=__typenames__,
-            output_format=protocol.OutputFormat.BINARY,
-            allow_capabilities=__allow_capabilities__,
+        return await self._fetchall_generic(
+            protocol.ExecuteContext(
+                query=query,
+                args=args,
+                kwargs=kwargs,
+                reg=self._query_cache.codecs_registry,
+                qc=self._query_cache.query_cache,
+                implicit_limit=__limit__,
+                inline_typeids=__typeids__,
+                inline_typenames=__typenames__,
+                input_language=__language__,
+                output_format=protocol.OutputFormat.BINARY,
+                allow_capabilities=__allow_capabilities__,
+            )
         )
 
     async def _fetchall_json(
@@ -441,28 +491,32 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
         __limit__: int = 0,
         **kwargs,
     ):
-        await self.ensure_connected()
-        return await self._protocol.query(
-            query=query,
-            args=args,
-            kwargs=kwargs,
-            reg=self._query_cache.codecs_registry,
-            qc=self._query_cache.query_cache,
-            implicit_limit=__limit__,
-            inline_typenames=False,
-            output_format=protocol.OutputFormat.JSON,
+        return await self._fetchall_generic(
+            protocol.ExecuteContext(
+                query=query,
+                args=args,
+                kwargs=kwargs,
+                reg=self._query_cache.codecs_registry,
+                qc=self._query_cache.query_cache,
+                implicit_limit=__limit__,
+                inline_typenames=False,
+                input_language=protocol.InputLanguage.EDGEQL,
+                output_format=protocol.OutputFormat.JSON,
+            )
         )
 
     async def _fetchall_json_elements(self, query: str, *args, **kwargs):
-        await self.ensure_connected()
-        return await self._protocol.query(
-            query=query,
-            args=args,
-            kwargs=kwargs,
-            reg=self._query_cache.codecs_registry,
-            qc=self._query_cache.query_cache,
-            output_format=protocol.OutputFormat.JSON_ELEMENTS,
-            allow_capabilities=edgedb_enums.Capability.EXECUTE,  # type: ignore
+        return await self._fetchall_generic(
+            protocol.ExecuteContext(
+                query=query,
+                args=args,
+                kwargs=kwargs,
+                reg=self._query_cache.codecs_registry,
+                qc=self._query_cache.query_cache,
+                input_language=protocol.InputLanguage.EDGEQL,
+                output_format=protocol.OutputFormat.JSON_ELEMENTS,
+                allow_capabilities=edgedb_enums.Capability.EXECUTE,  # type: ignore
+            )
         )
 
     def _clear_codecs_cache(self):
@@ -490,6 +544,7 @@ class Connection(options._OptionsMixin, abstract.AsyncIOExecutor):
     async def connect(self, single_attempt=False):
         self._params, client_config = con_utils.parse_connect_arguments(
             **self._connect_args,
+            tls_server_name=None,
             command_timeout=None,
             server_settings=None,
         )
@@ -640,6 +695,7 @@ async def async_connect_test_client(
     user: typing.Optional[str] = None,
     password: typing.Optional[str] = None,
     secret_key: typing.Optional[str] = None,
+    branch: typing.Optional[str] = None,
     database: typing.Optional[str] = None,
     tls_ca: typing.Optional[str] = None,
     tls_ca_file: typing.Optional[str] = None,
@@ -659,6 +715,7 @@ async def async_connect_test_client(
             "user": user,
             "password": password,
             "secret_key": secret_key,
+            "branch": branch,
             "database": database,
             "timeout": timeout,
             "tls_ca": tls_ca,

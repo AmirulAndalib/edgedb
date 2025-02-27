@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import copy
 import itertools
-from typing import *
+from typing import Any, Optional, Mapping, Dict, List, Set
 
 from edb import errors
 from edb.common import ast
@@ -34,6 +34,7 @@ from . import ast as qlast
 FREE_SHAPE_EXPR = qlast.DetachedExpr(
     expr=qlast.Path(
         steps=[qlast.ObjectRef(module='std', name='FreeObject')],
+        allow_factoring=True,
     ),
 )
 
@@ -45,8 +46,9 @@ class ParameterInliner(ast.NodeTransformer):
         self.args_map = args_map
 
     def visit_Path(self, node: qlast.Path) -> qlast.Base:
-        if (len(node.steps) != 1 or
-                not isinstance(node.steps[0], qlast.ObjectRef)):
+        if len(node.steps) != 1 or not isinstance(
+            node.steps[0], qlast.ObjectRef
+        ):
             self.visit(node.steps[0])
             return node
 
@@ -61,8 +63,7 @@ class ParameterInliner(ast.NodeTransformer):
 
 
 def inline_parameters(
-    ql_expr: qlast.Base,
-    args: Mapping[str, qlast.Base]
+    ql_expr: qlast.Base, args: Mapping[str, qlast.Base]
 ) -> None:
 
     inliner = ParameterInliner(args)
@@ -88,7 +89,7 @@ def index_parameters(
         raise errors.SchemaDefinitionError(
             f'Expected {len(params) - 1} arguments, but found '
             f'{len(ql_args) - 1}',
-            context=ql_args[-1].context,
+            span=ql_args[-1].span,
             details='Did you mean to use ON (...) for specifying the subject?',
         )
 
@@ -137,8 +138,7 @@ class AnchorInliner(ast.NodeTransformer):
 
 
 def inline_anchors(
-    ql_expr: qlast.Base,
-    anchors: Mapping[Any, qlast.Base]
+    ql_expr: qlast.Base, anchors: Mapping[Any, qlast.Base]
 ) -> None:
 
     inliner = AnchorInliner(anchors)
@@ -154,14 +154,18 @@ def find_subject_ptrs(ast: qlast.Base) -> Set[str]:
     for path in find_paths(ast):
         if path.partial:
             p = path.steps[0]
-        elif isinstance(path.steps[0], qlast.Subject) and len(path.steps) > 1:
+        elif is_anchor(path.steps[0], '__subject__') and len(path.steps) > 1:
             p = path.steps[1]
         else:
             continue
 
         if isinstance(p, qlast.Ptr):
-            ptrs.add(p.ptr.name)
+            ptrs.add(p.name)
     return ptrs
+
+
+def is_anchor(expr: qlast.PathElement, name: str) -> bool:
+    return isinstance(expr, qlast.Anchor) and expr.name == name
 
 
 def subject_paths_substitute(
@@ -172,45 +176,50 @@ def subject_paths_substitute(
     for path in find_paths(ast):
         if path.partial and isinstance(path.steps[0], qlast.Ptr):
             path.steps[0] = subject_paths_substitute(
-                subject_ptrs[path.steps[0].ptr.name],
+                subject_ptrs[path.steps[0].name],
                 subject_ptrs,
             )
         elif (
-            isinstance(path.steps[0], qlast.Subject)
+            is_anchor(path.steps[0], '__subject__')
             and len(path.steps)
             and isinstance(path.steps[1], qlast.Ptr)
         ):
             path.steps[0:2] = [subject_paths_substitute(
-                subject_ptrs[path.steps[1].ptr.name],
+                subject_ptrs[path.steps[1].name],
                 subject_ptrs,
             )]
     return ast
 
 
 def subject_substitute(
-        ast: qlast.Base_T, new_subject: qlast.Expr) -> qlast.Base_T:
+    ast: qlast.Base_T, new_subject: qlast.Expr
+) -> qlast.Base_T:
     ast = copy.deepcopy(ast)
+    # If the subject is a path (usually will be), graft the path
+    # elements directly to avoid an extra SelectStmt/Set in the IR,
+    # which can result in worse codegen (unnecessary semijoins, for
+    # example).
+    # TODO: Unify other substitution functions.
+    if isinstance(new_subject, qlast.Path):
+        new_partial = new_subject.partial
+        new_head = new_subject.steps
+    else:
+        new_partial = False
+        new_head = [new_subject]
+
     for path in find_paths(ast):
-        if isinstance(path.steps[0], qlast.Subject):
-            path.steps[0] = new_subject
+        if is_anchor(path.steps[0], '__subject__'):
+            path.steps[0:1] = new_head
+            path.partial = new_partial
+        elif path.partial:
+            path.steps[0:0] = new_head
+            path.partial = new_partial
     return ast
 
 
-def contains_dml(ql_expr: qlast.Base) -> bool:
-    """Check whether a expression contains any DML in a subtree."""
-    # If this ends up being a perf problem, we can use a visitor
-    # directly and cache.
-    dml_types = (qlast.InsertQuery, qlast.UpdateQuery, qlast.DeleteQuery)
-    if isinstance(ql_expr, dml_types):
-        return True
-
-    res = ast.find_children(
-        ql_expr, qlast.Base,
-        lambda x: (
-            isinstance(x, dml_types)
-            or (isinstance(x, qlast.IRAnchor) and x.has_dml)
-        ),
-        terminate_early=True,
+def is_enum(type_name: qlast.TypeName):
+    return (
+        isinstance(type_name.maintype, (qlast.TypeName, qlast.ObjectRef))
+        and type_name.maintype.name == "enum"
+        and type_name.subtypes
     )
-
-    return bool(res)

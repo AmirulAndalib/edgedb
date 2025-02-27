@@ -22,28 +22,37 @@ from typing import (
 
 import asyncio
 import base64
+import copy
 import json
+import logging
 import os.path
 import pickle
 import struct
 import time
 import typing
+import uuid
 import weakref
 
 import immutables
 
 from edb import errors
-from edb.common import lru, uuidgen
+from edb.common import debug, lru, uuidgen, asyncutil
 from edb import edgeql
 from edb.edgeql import qltypes
 from edb.schema import schema as s_schema
-from edb.server import compiler, defines, config, metrics
+from edb.schema import name as s_name
+from edb.server import compiler, defines, config, metrics, pgcon
 from edb.server.compiler import dbstate, enums, sertypes
+from edb.server.protocol import execute
 from edb.pgsql import dbops
 from edb.server.compiler_pool import state as compiler_state_mod
+from edb.server.pgcon import errors as pgerror
+
+from edb.server.protocol import ai_ext
 
 cimport cython
 
+from edb.server.compiler cimport rpc
 from edb.server.protocol.args_ser cimport (
     recode_global,
 )
@@ -64,7 +73,19 @@ cdef INT32_PACKER = struct.Struct('!l').pack
 
 cdef int VER_COUNTER = 0
 cdef DICTDEFAULT = (None, None)
+cdef object logger = logging.getLogger('edb.server')
 
+# Mapping from oids of PostgreSQL types into corresponding EdgeQL type.
+# Needed only for pg types that do not exist in EdgeQL, such as pg_catalog.name
+cdef TYPES_SQL_ONLY = immutables.Map({
+    18: "00000000-0000-0000-0000-000000000101", # char -> str
+    19: "00000000-0000-0000-0000-000000000101", # pgcatalog.name -> str
+    24: "00000000-0000-0000-0000-000000000101", # regproc -> str
+    26: "00000000-0000-0000-0000-000000000104", # oid -> int32
+    28: "00000000-0000-0000-0000-000000000104", # xid -> int32
+    29: "00000000-0000-0000-0000-000000000104", # cid -> int32
+    194: "00000000-0000-0000-0000-000000000101", # pg_node_tree -> str
+ })
 
 cdef next_dbver():
     global VER_COUNTER
@@ -72,61 +93,11 @@ cdef next_dbver():
     return VER_COUNTER
 
 
-@cython.final
-cdef class QueryRequestInfo:
 
-    def __cinit__(
-        self,
-        source: edgeql.Source,
-        protocol_version: tuple,
-        *,
-        output_format: compiler.OutputFormat = compiler.OutputFormat.BINARY,
-        input_format: compiler.InputFormat = compiler.InputFormat.BINARY,
-        expect_one: bint = False,
-        implicit_limit: int = 0,
-        inline_typeids: bint = False,
-        inline_typenames: bint = False,
-        inline_objectids: bint = True,
-        allow_capabilities: uint64_t = <uint64_t>compiler.Capability.ALL,
-    ):
-        self.source = source
-        self.protocol_version = protocol_version
-        self.output_format = output_format
-        self.input_format = input_format
-        self.expect_one = expect_one
-        self.implicit_limit = implicit_limit
-        self.inline_typeids = inline_typeids
-        self.inline_typenames = inline_typenames
-        self.inline_objectids = inline_objectids
-        self.allow_capabilities = allow_capabilities
-
-        self.cached_hash = hash((
-            self.source.cache_key(),
-            self.protocol_version,
-            self.output_format,
-            self.input_format,
-            self.expect_one,
-            self.implicit_limit,
-            self.inline_typeids,
-            self.inline_typenames,
-            self.inline_objectids,
-        ))
-
-    def __hash__(self):
-        return self.cached_hash
-
-    def __eq__(self, other: QueryRequestInfo) -> bool:
-        return (
-            self.source.cache_key() == other.source.cache_key() and
-            self.protocol_version == other.protocol_version and
-            self.output_format == other.output_format and
-            self.input_format == other.input_format and
-            self.expect_one == other.expect_one and
-            self.implicit_limit == other.implicit_limit and
-            self.inline_typeids == other.inline_typeids and
-            self.inline_typenames == other.inline_typenames and
-            self.inline_objectids == other.inline_objectids
-        )
+cdef enum CacheState:
+    Pending = 0,
+    Present,
+    Evicted
 
 
 @cython.final
@@ -137,18 +108,39 @@ cdef class CompiledQuery:
         query_unit_group: dbstate.QueryUnitGroup,
         first_extra: Optional[int]=None,
         extra_counts=(),
-        extra_blobs=()
+        extra_blobs=(),
+        extra_formatted_as_text: bool = False,
+        extra_type_oids: Sequence[int] = (),
+        request=None,
+        recompiled_cache=None,
+        use_pending_func_cache=False,
     ):
         self.query_unit_group = query_unit_group
         self.first_extra = first_extra
         self.extra_counts = extra_counts
         self.extra_blobs = extra_blobs
+        self.extra_formatted_as_text = extra_formatted_as_text
+        self.extra_type_oids = tuple(extra_type_oids)
+        self.request = request
+        self.recompiled_cache = recompiled_cache
+        self.use_pending_func_cache = use_pending_func_cache
+
+    cdef bytes make_query_prefix(self):
+        data = {}
+        if self.tag:
+            data['tag'] = self.tag
+        # maintenance reminder: please also update _amend_typedesc_in_sql()
+        if data:
+            data_bytes = json.dumps(data).encode(defines.EDGEDB_ENCODING)
+            return b''.join([b'-- ', data_bytes, b'\n'])
+        else:
+            return b''
 
 
 cdef class Database:
 
-    # Global LRU cache of compiled anonymous queries
-    _eql_to_compiled: typing.Mapping[str, dbstate.QueryUnitGroup]
+    # Global LRU cache of compiled queries
+    _eql_to_compiled: stmt_cache.StatementsCache[uuid.UUID, dbstate.QueryUnitGroup]
 
     def __init__(
         self,
@@ -156,14 +148,17 @@ cdef class Database:
         str name,
         *,
         bytes user_schema_pickle,
+        object schema_version,
         object db_config,
         object reflection_cache,
         object backend_ids,
         object extensions,
         object ext_config_settings,
+        object feature_used_metrics,
     ):
         self.name = name
 
+        self.schema_version = schema_version
         self.dbver = next_dbver()
 
         self._index = index
@@ -172,18 +167,42 @@ cdef class Database:
 
         self._introspection_lock = asyncio.Lock()
 
-        self._eql_to_compiled = lru.LRUMapping(
-            maxsize=defines._MAX_QUERIES_CACHE)
+        self._eql_to_compiled = stmt_cache.StatementsCache(
+            maxsize=defines._MAX_QUERIES_CACHE_DB)
+        self._cache_locks = {}
         self._sql_to_compiled = lru.LRUMapping(
             maxsize=defines._MAX_QUERIES_CACHE)
+
+        # Tracks the active transactions and their creation sequence. The
+        # sequence ID is incremental-only. ID 0 is reserved as a non-exist ID.
+        self._tx_seq = 0  # most-recently used transaction sequence ID
+        self._active_tx_list = {}  # name it "list" to emphasize the order
+
+        # Also an ordered dict of func cache present in DB but still using
+        # inline SQL due to active transactions.
+        self._func_cache_gt_tx_seq = {}
 
         self.db_config = db_config
         self.user_schema_pickle = user_schema_pickle
         if ext_config_settings is not None:
             self.user_config_spec = config.FlatSpec(*ext_config_settings)
         self.reflection_cache = reflection_cache
-        self.backend_ids = backend_ids
-        self.extensions = extensions
+        self._set_backend_ids(backend_ids)
+        self.extensions = set()
+        self._set_extensions(extensions)
+        self._observe_auth_ext_config()
+
+        self._feature_used_metrics = {}
+        self._set_feature_used_metrics(feature_used_metrics)
+
+        self._cache_worker_task = self._cache_queue = None
+        self._cache_notify_task = self._cache_notify_queue = None
+        self._cache_queue = asyncio.Queue()
+        self._cache_worker_task = asyncio.create_task(
+            self.monitor(self.cache_worker, 'cache_worker'))
+        self._cache_notify_queue = asyncio.Queue()
+        self._cache_notify_task = asyncio.create_task(
+            self.monitor(self.cache_notifier, 'cache_notifier'))
 
     @property
     def server(self):
@@ -193,64 +212,274 @@ cdef class Database:
     def tenant(self):
         return self._index._tenant
 
-    cdef schedule_config_update(self):
-        self._index._tenant.on_local_database_config_change(self.name)
+    def stop(self):
+        if self._cache_worker_task:
+            self._cache_worker_task.cancel()
+            self._cache_worker_task = None
+        if self._cache_notify_task:
+            self._cache_notify_task.cancel()
+            self._cache_notify_task = None
+        self._set_extensions(set())
+        self._set_feature_used_metrics({})
+        self.start_stop_extensions()
+
+    async def monitor(self, worker, name):
+        while True:
+            try:
+                await worker()
+            except Exception as ex:
+                debug.dump(ex)
+                metrics.background_errors.inc(
+                    1.0, self.tenant._instance_name, name
+                )
+                # Give things time to recover, since the likely
+                # failure mode here is a failover or some such.
+                await asyncio.sleep(0.1)
+
+    async def cache_worker(self):
+        while True:
+            # First, handle any evictions
+            keys = []
+            while self._eql_to_compiled.needs_cleanup():
+                query_req, unit_group = self._eql_to_compiled.cleanup_one()
+                if len(unit_group) == 1 and unit_group.cache_state == 1:
+                    keys.append(query_req.get_cache_key())
+                    self._func_cache_gt_tx_seq.pop(query_req, None)
+                unit_group.cache_state = CacheState.Evicted
+            if keys:
+                await self.tenant.evict_query_cache(self.name, keys)
+
+            # Now, populate the cache
+            # Empty the queue, for batching reasons.
+            # N.B: This empty/get_nowait loop is safe because this is
+            # an asyncio Queue. If it was threaded, it would be racy.
+            ops = [await self._cache_queue.get()]
+            while not self._cache_queue.empty():
+                ops.append(self._cache_queue.get_nowait())
+            # Filter ops for only what we need
+            ops = [
+                (query_req, units) for query_req, units in ops
+                if len(units) == 1
+                and units[0].cache_sql
+                and units.cache_state == CacheState.Pending
+            ]
+            if not ops:
+                continue
+
+            g = execute.build_cache_persistence_units(ops)
+            async with self.tenant.with_pgcon(self.name) as conn:
+                try:
+                    await g.execute(conn, self)
+                except Exception as e:
+                    logger.warning("Failed to persist function cache",
+                                exc_info=True)
+                    continue
+
+            for query_req, units in ops:
+                units.cache_state = CacheState.Present
+                if self._active_tx_list:
+                    # Any active tx would delay the time we flip to func cache
+                    units.tx_seq_id = self._tx_seq
+                    self._func_cache_gt_tx_seq[query_req] = units
+                else:
+                    units[0].maybe_use_func_cache()
+                self._cache_notify_queue.put_nowait(str(units[0].cache_key))
+
+    cdef inline uint64_t tx_seq_begin_tx(self):
+        self._tx_seq += 1
+        self._active_tx_list[self._tx_seq] = True
+        return self._tx_seq
+
+    cdef inline tx_seq_end_tx(self, uint64_t seq):
+        # Remove the ending transaction from the active list
+        if not self._active_tx_list.pop(seq, False):
+            return
+
+        # Stop early if we don't have func cache to activate
+        if not self._func_cache_gt_tx_seq:
+            return
+
+        if self._active_tx_list:
+            # Grab the seq ID of the oldest active transaction
+            active_tx = next(iter(self._active_tx_list.keys()))
+        else:
+            # If all tx ended, we should just activate all pending func cache
+            for units in self._func_cache_gt_tx_seq.values():
+                units[0].maybe_use_func_cache()
+            self._func_cache_gt_tx_seq.clear()
+            return
+
+        # Or else, keep activating func cache until the oldest active tx
+        drops = []
+        for query_req, units in self._func_cache_gt_tx_seq.items():
+            if units.tx_seq_id < active_tx:
+                units[0].maybe_use_func_cache()
+                drops.append(query_req)
+            else:
+                break
+        for query_req in drops:
+            self._func_cache_gt_tx_seq.pop(query_req)
+
+    async def cache_notifier(self):
+        await asyncutil.debounce(
+            lambda: self._cache_notify_queue.get(),
+            lambda keys: self.tenant.signal_sysevent(
+                'query-cache-changes',
+                dbname=self.name,
+                keys=keys,
+            ),
+            max_wait=1.0,
+            delay_amt=0.2,
+            # 100 keys will take up about 4000 bytes, which
+            # fits in the 8000 allowed in events.
+            max_batch_size=100,
+        )
+
+    cdef _set_extensions(self, extensions):
+        # Update metrics about extension use
+        tname = self.tenant.get_instance_name()
+        for ext in self.extensions:
+            if ext not in extensions:
+                metrics.extension_used.dec(1, tname, ext)
+
+        for ext in extensions:
+            if ext not in self.extensions:
+                metrics.extension_used.inc(1, tname, ext)
+
+        self.extensions = extensions
+
+    cdef _set_feature_used_metrics(self, feature_used_metrics):
+        # Update metrics about feature use
+        #
+        # We store the old feature use metrics so that we can
+        # incrementally update them after DDL without needing to look
+        # at the other database branches
+        if feature_used_metrics is None:
+            return
+
+        tname = self.tenant.get_instance_name()
+        keys = self._feature_used_metrics.keys() | feature_used_metrics.keys()
+        for key in keys:
+            # Update the count of how many times the feature is used
+            metrics.feature_used.inc(
+                feature_used_metrics.get(key, 0.0)
+                - self._feature_used_metrics.get(key, 0.0),
+                tname,
+                key,
+            )
+            # Update the count of branches using the feature at all
+            metrics.feature_used_branches.inc(
+                (feature_used_metrics.get(key, 0.0) > 0)
+                - (self._feature_used_metrics.get(key, 0.0) > 0),
+                tname,
+                key,
+            )
+
+        self._feature_used_metrics = feature_used_metrics
 
     cdef _set_and_signal_new_user_schema(
         self,
         new_schema_pickle,
+        schema_version,
         extensions,
         ext_config_settings,
+        feature_used_metrics,
         reflection_cache=None,
         backend_ids=None,
         db_config=None,
+        start_stop_extensions=True,
     ):
         if new_schema_pickle is None:
             raise AssertionError('new_schema is not supposed to be None')
 
+        self.schema_version = schema_version
         self.dbver = next_dbver()
 
         self.user_schema_pickle = new_schema_pickle
-        self.extensions = extensions
+        self._set_extensions(extensions)
         self.user_config_spec = config.FlatSpec(*ext_config_settings)
 
+        self._set_feature_used_metrics(feature_used_metrics)
+
         if backend_ids is not None:
-            self.backend_ids = backend_ids
+            self._set_backend_ids(backend_ids)
         if reflection_cache is not None:
             self.reflection_cache = reflection_cache
         if db_config is not None:
             self.db_config = db_config
+            self._observe_auth_ext_config()
         self._invalidate_caches()
+        if start_stop_extensions:
+            self.start_stop_extensions()
+
+    cpdef start_stop_extensions(self):
+        if "ai" in self.extensions:
+            ai_ext.start_extension(self.tenant, self.name)
+        else:
+            ai_ext.stop_extension(self.tenant, self.name)
+
+    cdef _observe_auth_ext_config(self):
+        key = "ext::auth::AuthConfig::providers"
+        if (
+            self.db_config is not None and
+            self.user_config_spec is not None and
+            key in self.user_config_spec
+        ):
+            providers = config.lookup(
+                key,
+                self.db_config,
+                spec=self.user_config_spec,
+            )
+            metrics.auth_providers.set(
+                len(providers),
+                self.tenant.get_instance_name(),
+                self.name,
+            )
+
+    cdef _set_backend_ids(self, types):
+        self.backend_ids = {}
+        self.backend_oid_to_id = dict(TYPES_SQL_ONLY)
+        if types != None:
+            self._update_backend_ids(types)
 
     cdef _update_backend_ids(self, new_types):
         self.backend_ids.update(new_types)
+        self.backend_oid_to_id.update({
+            v[0]: k for k, v in new_types.items()
+            if v[0] is not None
+        })
 
     cdef _invalidate_caches(self):
-        self._eql_to_compiled.clear()
         self._sql_to_compiled.clear()
         self._index.invalidate_caches()
 
     cdef _cache_compiled_query(self, key, compiled: dbstate.QueryUnitGroup):
+        # `dbver` must be the schema version `compiled` was compiled upon
         assert compiled.cacheable
 
-        existing, dbver = self._eql_to_compiled.get(key, DICTDEFAULT)
-        if existing is not None and dbver == self.dbver:
-            # We already have a cached query for a more recent DB version.
+        if key in self._eql_to_compiled:
+            # We already have a cached query for the current user schema
             return
 
-        self._eql_to_compiled[key] = compiled, self.dbver
+        self._eql_to_compiled[key] = compiled
 
-    def cache_compiled_sql(self, key, compiled: list[str]):
-        existing, dbver = self._sql_to_compiled.get(key, DICTDEFAULT)
-        if existing is not None and dbver == self.dbver:
+        if self._cache_queue is not None:
+            self._cache_queue.put_nowait((key, compiled))
+
+    def cache_compiled_sql(self, key, compiled: list[str], schema_version):
+        existing, ver = self._sql_to_compiled.get(key, DICTDEFAULT)
+        if existing is not None and ver == self.schema_version:
             # We already have a cached query for a more recent DB version.
             return
+        if not all(unit.cacheable for unit in compiled):
+            return
 
-        self._sql_to_compiled[key] = compiled, self.dbver
+        # Store the matching schema version, see also the comments at origin
+        self._sql_to_compiled[key] = compiled, schema_version
 
     def lookup_compiled_sql(self, key):
-        rv, cached_dbver = self._sql_to_compiled.get(key, DICTDEFAULT)
-        if rv is not None and cached_dbver != self.dbver:
+        rv, cached_ver = self._sql_to_compiled.get(key, DICTDEFAULT)
+        if rv is not None and cached_ver != self.schema_version:
             rv = None
         return rv
 
@@ -279,6 +508,49 @@ cdef class Database:
         else:
             return old_serializer
 
+    def hydrate_cache(self, query_cache):
+        warning_count = 0
+        for _, in_data, out_data in query_cache:
+            try:
+                query_req = rpc.CompilationRequest.deserialize(
+                    in_data,
+                    "",
+                    self.server.compilation_config_serializer,
+                )
+
+                if query_req not in self._eql_to_compiled:
+                    unit = dbstate.QueryUnit.deserialize(out_data)
+                    group = dbstate.QueryUnitGroup()
+                    group.append(unit, serialize=False)
+                    group.cache_state = CacheState.Present
+                    if self._active_tx_list:
+                        # Any active transaction would delay the time we flip
+                        # to function cache
+                        group.tx_seq_id = self._tx_seq
+                        self._func_cache_gt_tx_seq[query_req] = group
+                    else:
+                        group[0].maybe_use_func_cache()
+                    self._eql_to_compiled[query_req] = group
+            except Exception as e:
+                if warning_count < 0:
+                    warning_count -= 1
+                elif warning_count < 10:
+                    logger.warning("skipping incompatible cache item: %s", e)
+                    warning_count += 1
+                else:
+                    logger.warning(
+                        "too many incompatible cache items, "
+                        "skipping the following warnings"
+                    )
+                    warning_count = -warning_count - 1
+        if warning_count < 0:
+            logger.warning(
+                "skipped %d incompatible cache items", -warning_count
+            )
+
+    def clear_query_cache(self):
+        self._eql_to_compiled.clear()
+
     def iter_views(self):
         yield from self._views
 
@@ -291,10 +563,22 @@ cdef class Database:
                 if self.user_schema_pickle is None:
                     await self.tenant.introspect_db(self.name)
 
+    def is_introspected(self):
+        return self.user_schema_pickle is not None
+
+    def lookup_config(self, name: str):
+        spec = self._index._sys_config_spec
+        if self.user_config_spec is not None:
+            spec = config.ChainedSpec(spec, self.user_config_spec)
+        return config.lookup(
+            name,
+            self.db_config or DEFAULT_CONFIG,
+            self._index._sys_config,
+            spec=spec,
+        )
+
 
 cdef class DatabaseConnectionView:
-
-    _eql_to_compiled: typing.Mapping[bytes, dbstate.QueryUnitGroup]
 
     def __init__(self, db: Database, *, query_cache, protocol_version):
         self._db = db
@@ -319,23 +603,20 @@ cdef class DatabaseConnectionView:
         else:
             self._capability_mask = <uint64_t>compiler.Capability.ALL
 
-        self._db_config_temp = None
-        self._db_config_dbver = None
-
         self._last_comp_state = None
         self._last_comp_state_id = 0
 
-        # Whenever we are in a transaction that had executed a
-        # DDL command, we use this cache for compiled queries.
-        self._eql_to_compiled = lru.LRUMapping(
-            maxsize=defines._MAX_QUERIES_CACHE)
-
+        self._in_tx_seq = 0
         self._reset_tx_state()
 
-    cdef _invalidate_local_cache(self):
-        self._eql_to_compiled.clear()
+    def __del__(self):
+        # In any case if _reset_tx_state() is not called, remove self from
+        # ACTIVE_TX_LIST to be safe
+        self._db.tx_seq_end_tx(self._in_tx_seq)
 
     cdef _reset_tx_state(self):
+        self._db.tx_seq_end_tx(self._in_tx_seq)
+        self._in_tx_seq = 0
         self._txid = None
         self._in_tx = False
         self._in_tx_config = None
@@ -347,14 +628,15 @@ cdef class DatabaseConnectionView:
         self._in_tx_with_sysconfig = False
         self._in_tx_with_dbconfig = False
         self._in_tx_with_set = False
+        self._in_tx_root_user_schema_pickle = None
         self._in_tx_user_schema_pickle = None
+        self._in_tx_user_schema_version = None
         self._in_tx_global_schema_pickle = None
         self._in_tx_new_types = {}
         self._in_tx_user_config_spec = None
         self._in_tx_state_serializer = None
         self._tx_error = False
         self._in_tx_dbver = 0
-        self._invalidate_local_cache()
 
     cdef clear_tx_error(self):
         self._tx_error = False
@@ -379,7 +661,6 @@ cdef class DatabaseConnectionView:
         self.set_session_config(config)
         self.set_globals(globals)
         self.set_state_serializer(state_serializer)
-        self._invalidate_local_cache()
 
     cdef declare_savepoint(self, name, spid):
         state = (
@@ -464,41 +745,19 @@ cdef class DatabaseConnectionView:
         if self._in_tx:
             return self._in_tx_db_config
         else:
-            if self._db_config_temp is not None:
-                # See `set_database_config()` for an explanation on
-                # *why* we do this.
-                if self._db_config_dbver is self._db.dbver:
-                    assert self._db_config_dbver is not None
-                    return self._db_config_temp
-                else:
-                    self._db_config_temp = None
-                    self._db_config_dbver = None
-
             return self._db.db_config
-
-    cdef update_database_config(self):
-        # Unfortunately it's unsafe to just synchronously
-        # update `self._db.db_config` to a new config. What if two
-        # connections are updating different DB config settings
-        # concurrently?
-        # The only way to avoid a race here is to always schedule
-        # a full DB state sync every time there's a DB config change.
-        self._db.schedule_config_update()
 
     cdef set_database_config(self, new_conf):
         if self._in_tx:
             self._in_tx_db_config = new_conf
         else:
-            # The idea here is to save the new DB conf in a temporary
-            # storage until the DB state is refreshed by a call to
-            # `update_database_config()` from `on_success()`. This is to
-            # make it possible to immediately use the updated DB config in
-            # this session. This is still racy, but the probability of
-            # a race is very low so we go for it (and races like this aren't
-            # critical and resolve in time.)
-            # Check out `get_database_config()` to see how this is used.
-            self._db_config_temp = new_conf
-            self._db_config_dbver = self._db.dbver
+            # N.B: If we *aren't* in a transaction, we rely on calling
+            # process_side_effects() promptly to introspect the new
+            # state.
+            # (We do it this way to avoid potential races between
+            # multiple connections do db configs.)
+            pass
+
 
     cdef get_system_config(self):
         return self._db._index.get_sys_config()
@@ -535,15 +794,18 @@ cdef class DatabaseConnectionView:
 
         if self._in_tx:
             try:
-                return int(self._in_tx_new_types[type_id])
+                tinfo = self._in_tx_new_types[type_id]
             except KeyError:
                 pass
+            else:
+                return int(tinfo[0])
 
-        tid = self._db.backend_ids.get(type_id)
-        if tid is None:
+        tinfo = self._db.backend_ids.get(type_id)
+        if tinfo is None:
             raise RuntimeError(
                 f'cannot resolve backend OID for type {type_id}')
-        return tid
+
+        return int(tinfo[0])
 
     cdef bytes serialize_state(self):
         cdef list state
@@ -694,6 +956,16 @@ cdef class DatabaseConnectionView:
             aliases, session_config, globals_, type_id, data
         )
 
+    cdef bint needs_commit_after_state_sync(self):
+        return any(
+            tx_conf in self._config
+            for tx_conf in [
+                "default_transaction_isolation",
+                "default_transaction_deferrable",
+                # default_transaction_access_mode is not yet a backend config
+            ]
+        )
+
     property txid:
         def __get__(self):
             return self._txid
@@ -712,6 +984,12 @@ cdef class DatabaseConnectionView:
                 return self._in_tx_dbver
             return self._db.dbver
 
+    property schema_version:
+        def __get__(self):
+            if self._in_tx and self._in_tx_user_schema_version:
+                return self._in_tx_user_schema_version
+            return self._db.schema_version
+
     @property
     def server(self):
         return self._db._index._server
@@ -729,12 +1007,10 @@ cdef class DatabaseConnectionView:
     cdef cache_compiled_query(self, object key, object query_unit_group):
         assert query_unit_group.cacheable
 
-        key = (key, self.get_modaliases(), self.get_session_config())
+        if self._tx_error or self._in_tx_with_ddl:
+            return
 
-        if self._in_tx_with_ddl:
-            self._eql_to_compiled[key] = query_unit_group
-        else:
-            self._db._cache_compiled_query(key, query_unit_group)
+        self._db._cache_compiled_query(key, query_unit_group)
 
     cdef lookup_compiled_query(self, object key):
         if (self._tx_error or
@@ -742,17 +1018,7 @@ cdef class DatabaseConnectionView:
                 self._in_tx_with_ddl):
             return None
 
-        key = (key, self.get_modaliases(), self.get_session_config())
-
-        if self._in_tx_with_ddl:
-            query_unit_group = self._eql_to_compiled.get(key)
-        else:
-            query_unit_group, qu_dbver = self._db._eql_to_compiled.get(
-                key, DICTDEFAULT)
-            if query_unit_group is not None and qu_dbver != self._db.dbver:
-                query_unit_group = None
-
-        return query_unit_group
+        return self._db._eql_to_compiled.get(key, None)
 
     cdef tx_error(self):
         if self._in_tx:
@@ -764,26 +1030,27 @@ cdef class DatabaseConnectionView:
 
         if query_unit.tx_id is not None:
             self._txid = query_unit.tx_id
-            self._start_tx()
-
-        if self._in_tx and not self._txid:
-            raise errors.InternalServerError('unset txid in transaction')
+            self.start_tx()
 
         if self._in_tx:
             self._apply_in_tx(query_unit)
 
-    cdef _start_tx(self):
+    cdef start_tx(self):
         state_serializer = self.get_state_serializer()
         self._in_tx = True
         self._in_tx_config = self._config
         self._in_tx_globals = self._globals
         self._in_tx_db_config = self._db.db_config
         self._in_tx_modaliases = self._modaliases
+        self._in_tx_root_user_schema_pickle = self._db.user_schema_pickle
         self._in_tx_user_schema_pickle = self._db.user_schema_pickle
+        self._in_tx_user_schema_version = self._db.schema_version
         self._in_tx_global_schema_pickle = \
             self._db._index._global_schema_pickle
         self._in_tx_user_config_spec = self._db.user_config_spec
         self._in_tx_state_serializer = state_serializer
+        self._in_tx_dbver = self._db.dbver
+        self._in_tx_seq = self._db.tx_seq_begin_tx()
 
     cdef _apply_in_tx(self, query_unit):
         if query_unit.has_ddl:
@@ -795,7 +1062,9 @@ cdef class DatabaseConnectionView:
         if query_unit.has_set:
             self._in_tx_with_set = True
         if query_unit.user_schema is not None:
+            self._in_tx_dbver = next_dbver()
             self._in_tx_user_schema_pickle = query_unit.user_schema
+            self._in_tx_user_schema_version = query_unit.user_schema_version
             self._in_tx_user_config_spec = config.FlatSpec(
                 *query_unit.ext_config_settings
             )
@@ -807,7 +1076,7 @@ cdef class DatabaseConnectionView:
             self.raise_in_tx_error()
 
         if not self._in_tx:
-            self._start_tx()
+            self.start_tx()
 
         self._apply_in_tx(query_unit)
 
@@ -817,29 +1086,24 @@ cdef class DatabaseConnectionView:
     cdef on_success(self, query_unit, new_types):
         side_effects = 0
 
-        if query_unit.tx_savepoint_rollback:
-            # Need to invalidate the cache in case there were
-            # SET ALIAS or CONFIGURE or DDL commands.
-            self._invalidate_local_cache()
-
         if not self._in_tx:
             if new_types:
                 self._db._update_backend_ids(new_types)
             if query_unit.user_schema is not None:
-                self._in_tx_dbver = next_dbver()
                 self._db._set_and_signal_new_user_schema(
                     query_unit.user_schema,
+                    query_unit.user_schema_version,
                     query_unit.extensions,
                     query_unit.ext_config_settings,
+                    query_unit.feature_used_metrics,
                     pickle.loads(query_unit.cached_reflection)
                         if query_unit.cached_reflection is not None
-                        else None
+                        else None,
                 )
                 side_effects |= SideEffects.SchemaChanges
             if query_unit.system_config:
                 side_effects |= SideEffects.InstanceConfigChanges
             if query_unit.database_config:
-                self.update_database_config()
                 side_effects |= SideEffects.DatabaseConfigChanges
             if query_unit.create_db:
                 side_effects |= SideEffects.DatabaseChanges
@@ -871,20 +1135,18 @@ cdef class DatabaseConnectionView:
             if query_unit.user_schema is not None:
                 self._db._set_and_signal_new_user_schema(
                     query_unit.user_schema,
+                    query_unit.user_schema_version,
                     query_unit.extensions,
                     query_unit.ext_config_settings,
+                    query_unit.feature_used_metrics,  # XXX? does this get set?
                     pickle.loads(query_unit.cached_reflection)
                         if query_unit.cached_reflection is not None
-                        else None
+                        else None,
                 )
                 side_effects |= SideEffects.SchemaChanges
             if self._in_tx_with_sysconfig:
                 side_effects |= SideEffects.InstanceConfigChanges
             if self._in_tx_with_dbconfig:
-                self._db_config_temp = self._in_tx_db_config
-                self._db_config_dbver = self._db.dbver
-
-                self.update_database_config()
                 side_effects |= SideEffects.DatabaseConfigChanges
             if query_unit.global_schema is not None:
                 side_effects |= SideEffects.GlobalSchemaChanges
@@ -910,6 +1172,7 @@ cdef class DatabaseConnectionView:
         global_schema,
         roles,
         cached_reflection,
+        feature_used_metrics,
     ):
         assert self._in_tx
         side_effects = 0
@@ -923,8 +1186,10 @@ cdef class DatabaseConnectionView:
         if user_schema is not None:
             self._db._set_and_signal_new_user_schema(
                 user_schema,
+                self._in_tx_user_schema_version,
                 extensions,
                 ext_config_settings,
+                feature_used_metrics,
                 pickle.loads(cached_reflection)
                     if cached_reflection is not None
                     else None
@@ -933,10 +1198,6 @@ cdef class DatabaseConnectionView:
         if self._in_tx_with_sysconfig:
             side_effects |= SideEffects.InstanceConfigChanges
         if self._in_tx_with_dbconfig:
-            self._db_config_temp = self._in_tx_db_config
-            self._db_config_dbver = self._db.dbver
-
-            self.update_database_config()
             side_effects |= SideEffects.DatabaseConfigChanges
         if global_schema is not None:
             side_effects |= SideEffects.GlobalSchemaChanges
@@ -945,6 +1206,78 @@ cdef class DatabaseConnectionView:
 
         self._reset_tx_state()
         return side_effects
+
+    cdef config_lookup(self, name):
+        return self.server.config_lookup(
+            name,
+            self.get_session_config(),
+            self.get_database_config(),
+            self.get_system_config(),
+        )
+
+    async def recompile_cached_queries(self, user_schema, schema_version):
+        compiler_pool = self.server.get_compiler_pool()
+        compile_concurrency = max(1, compiler_pool.get_size_hint() // 2)
+        concurrency_control = asyncio.Semaphore(compile_concurrency)
+        rv = []
+
+        recompile_timeout = self.config_lookup(
+            "auto_rebuild_query_cache_timeout",
+        )
+
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        if recompile_timeout is not None:
+            stop_time = t0 + recompile_timeout.to_microseconds() / 1e6
+        else:
+            stop_time = None
+
+        async def recompile_request(query_req: rpc.CompilationRequest):
+            async with concurrency_control:
+                try:
+                    if stop_time is not None and loop.time() > stop_time:
+                        return
+
+                    database_config = self.get_database_config()
+                    system_config = self.get_compilation_system_config()
+                    query_req = copy.copy(query_req)
+                    query_req.set_schema_version(schema_version)
+                    query_req.set_database_config(database_config)
+                    query_req.set_system_config(system_config)
+                    async with asyncio.timeout_at(stop_time):
+                        unit_group, _, _ = await compiler_pool.compile(
+                            self.dbname,
+                            user_schema,
+                            self.get_global_schema_pickle(),
+                            self.reflection_cache,
+                            database_config,
+                            system_config,
+                            query_req.serialize(),
+                            "<unknown>",
+                            client_id=self.tenant.client_id,
+                        )
+                except Exception:
+                    # ignore cache entry that cannot be recompiled
+                    pass
+                else:
+                    rv.append((query_req, unit_group))
+
+        async with asyncio.TaskGroup() as g:
+            req: rpc.CompilationRequest
+            # Reversed so that we compile more recently used first.
+            for req, grp in reversed(self._db._eql_to_compiled.items()):
+                if (
+                    len(grp) == 1
+                    # Only recompile queries from the *latest* version,
+                    # to avoid quadratic slowdown problems.
+                    and req.schema_version == self.schema_version
+                    # SQL queries require _amend_typedesc_in_sql() with a
+                    # backend connection, which is not available here.
+                    and req.input_language != enums.InputLanguage.SQL
+                ):
+                    g.create_task(recompile_request(req))
+
+        return rv
 
     async def apply_config_ops(self, conn, ops):
         settings = self.get_config_spec()
@@ -974,23 +1307,71 @@ cdef class DatabaseConnectionView:
 
     async def parse(
         self,
-        query_req: QueryRequestInfo,
-        cached_globally=False,
+        query_req: rpc.CompilationRequest,
+        cached_globally: bint = False,
+        use_metrics: bint = True,
+        allow_capabilities: uint64_t = <uint64_t>compiler.Capability.ALL,
+        pgcon: pgcon.PGConnection | None = None,
+        tag: str | None = None,
     ) -> CompiledQuery:
-        source = query_req.source
+        query_unit_group = None
+        if self._query_cache_enabled:
+            if cached_globally:
+                # WARNING: only set cached_globally to True when the query is
+                # strictly referring to only shared stable objects in user
+                # schema or anything from std schema, for example:
+                #     YES:  select ext::auth::UIConfig { ... }
+                #     NO:   select default::User { ... }
+                query_unit_group = (
+                    self.server.system_compile_cache.get(query_req)
+                )
+            else:
+                query_unit_group = self.lookup_compiled_query(query_req)
+
+            # Fast-path to skip all the locks if it's a cache HIT
+            if query_unit_group is not None:
+                return self.as_compiled(
+                    query_req, query_unit_group, use_metrics)
+
+        lock = None
+        schema_version = self.schema_version
+
+        # Lock on the query compilation to avoid other coroutines running
+        # the same compile and waste computational resources
         if cached_globally:
-            # WARNING: only set cached_globally to True when the query is
-            # strictly referring to only shared stable objects in user schema
-            # or anything from std schema, for example:
-            #     YES:  select ext::auth::UIConfig { ... }
-            #     NO:   select default::User { ... }
-            query_unit_group = self.server.system_compile_cache.get(query_req)
+            lock_table = self.server.system_compile_cache_locks
         else:
-            query_unit_group = self.lookup_compiled_query(query_req)
-        cached = True
-        if query_unit_group is None:
-            # Cache miss; need to compile this query.
-            cached = False
+            lock_table = self._db._cache_locks
+        while True:
+            # We need a loop here because schema_version is a part of the key,
+            # there could be a DDL while we're waiting for the lock.
+            lock = lock_table.get(query_req)
+            if lock is None:
+                lock = asyncio.Lock()
+                lock_table[query_req] = lock
+            await lock.acquire()
+            if self.schema_version == schema_version:
+                break
+            else:
+                lock.release()
+                if not lock._waiters:
+                    del lock_table[query_req]
+                schema_version = self.schema_version
+                # Updating the schema_version will make query_req a new key
+                query_req.set_schema_version(schema_version)
+
+        try:
+            # Check the cache again with the lock acquired
+            if self._query_cache_enabled:
+                if cached_globally:
+                    query_unit_group = (
+                        self.server.system_compile_cache.get(query_req)
+                    )
+                else:
+                    query_unit_group = self.lookup_compiled_query(query_req)
+                if query_unit_group is not None:
+                    return self.as_compiled(
+                        query_req, query_unit_group, use_metrics)
 
             try:
                 query_unit_group = await self._compile(query_req)
@@ -998,7 +1379,7 @@ cdef class DatabaseConnectionView:
                 raise
             except errors.EdgeDBError:
                 if self.in_tx_error():
-                    # Because we are in an error state it is more reasonable
+                    # Because we are in an error state it's more reasonable
                     # to fail with TransactionError("commands ignored")
                     # rather than with a potentially more cryptic error.
                     # An exception from this rule are syntax errors and
@@ -1010,11 +1391,216 @@ cdef class DatabaseConnectionView:
 
             self.check_capabilities(
                 query_unit_group.capabilities,
-                query_req.allow_capabilities,
+                allow_capabilities,
                 errors.DisabledCapabilityError,
                 "disabled by the client",
             )
+            self._check_in_tx_error(query_unit_group)
 
+            if query_req.input_language is enums.InputLanguage.SQL:
+                if len(query_unit_group) > 1:
+                    raise errors.UnsupportedFeatureError(
+                        "multi-statement SQL scripts are not supported yet"
+                    )
+
+                if pgcon is None:
+                    raise errors.InternalServerError(
+                        "a valid backend connection is required to fully "
+                        "compile a query in SQL mode",
+                    )
+                await self._amend_typedesc_in_sql(
+                    query_req,
+                    query_unit_group,
+                    pgcon,
+                    tag,
+                )
+
+            if self._query_cache_enabled and query_unit_group.cacheable:
+                if cached_globally:
+                    self.server.system_compile_cache[query_req] = (
+                        query_unit_group
+                    )
+                else:
+                    self.cache_compiled_query(query_req, query_unit_group)
+        finally:
+            if lock is not None:
+                lock.release()
+                if not lock._waiters:
+                    del lock_table[query_req]
+
+        recompiled_cache = None
+        if (
+            not self.in_tx()
+            or len(query_unit_group) > 0
+            and query_unit_group[0].tx_commit
+        ):
+            # Recompile all cached queries if:
+            #  * Issued a DDL or committing a tx with DDL (recompilation
+            #    before in-tx DDL needs to fix _in_tx_with_ddl caching 1st)
+            #  * Config.auto_rebuild_query_cache is turned on
+            #
+            # Ideally we should compute the proper user_schema, database_config
+            # and system_config for recompilation from server/compiler.py with
+            # proper handling of config values. For now we just use the values
+            # in the current dbview and not support certain marginal cases.
+            user_schema = None
+            user_schema_version = None
+            for unit in query_unit_group:
+                if unit.tx_rollback:
+                    break
+                if unit.user_schema:
+                    user_schema = unit.user_schema
+                    user_schema_version = unit.user_schema_version
+            if user_schema and not self.config_lookup(
+                "auto_rebuild_query_cache",
+            ):
+                user_schema = None
+            if user_schema:
+                recompiled_cache = await self.recompile_cached_queries(
+                    user_schema, user_schema_version
+                )
+
+        if use_metrics:
+            if query_req.input_language is enums.InputLanguage.EDGEQL:
+                metrics.edgeql_query_compilations.inc(
+                    1.0, self.tenant.get_instance_name(), 'compiler'
+                )
+            else:
+                metrics.sql_compilations.inc(
+                    1.0, self.tenant.get_instance_name()
+                )
+
+        source = query_req.source
+        if query_unit_group.force_non_normalized:
+            source = source.denormalized()
+        return CompiledQuery(
+            query_unit_group=query_unit_group,
+            first_extra=source.first_extra(),
+            extra_counts=source.extra_counts(),
+            extra_blobs=source.extra_blobs(),
+            extra_formatted_as_text=source.extra_formatted_as_text(),
+            extra_type_oids=source.extra_type_oids(),
+            request=query_req,
+            recompiled_cache=recompiled_cache,
+        )
+
+    async def _amend_typedesc_in_sql(
+        self,
+        query_req: rpc.CompilationRequest,
+        qug: dbstate.QueryUnitGroup,
+        pgcon: pgcon.PGConnection,
+        tag: str | None,
+    ) -> None:
+        # The SQL QueryUnitGroup as initially returned from the compiler
+        # is missing the input/output type descriptors because we currently
+        # don't run static SQL type inference.  To mend that we ask Postgres
+        # to infer the the result types (as an OID tuple) and then use
+        # our OID -> scalar type mapping to construct an EdgeQL free shape with
+        # corresponding properties which we then send to the compiler to
+        # compute the type descriptors.
+        to_describe = []
+
+        desc_map = {}
+        source = query_req.source
+        if qug.force_non_normalized:
+            source = source.denormalized()
+
+        first_extra = source.first_extra()
+        num_injected_params = 0
+        if qug.globals is not None:
+            num_injected_params += len(qug.globals)
+        if first_extra is not None:
+            extra_type_oids = source.extra_type_oids()
+            all_type_oids = [0] * first_extra + extra_type_oids
+            num_injected_params += len(extra_type_oids)
+        else:
+            all_type_oids = []
+
+        for i, query_unit in enumerate(qug):
+            intro_sql = query_unit.introspection_sql
+            if intro_sql is None:
+                intro_sql = query_unit.sql
+            if tag is not None:
+                # maintenance reminder: please also update make_query_prefix()
+                tag_json = json.dumps({"tag": tag})
+                intro_sql = b''.join([
+                    b'-- ',
+                    tag_json.encode(defines.EDGEDB_ENCODING),
+                    b'\n',
+                    intro_sql,
+                ])
+            try:
+                param_desc, result_desc = await pgcon.sql_describe(
+                    intro_sql, all_type_oids)
+            except pgerror.BackendError as ex:
+                ex._from_sql = True
+                if 'P' in ex.fields:
+                    ex.fields['P'] = str(
+                        int(ex.fields['P']) - query_unit.sql_prefix_len
+                    )
+                if query_unit.source_map:
+                    ex._source_map = query_unit.source_map
+
+                raise
+
+            result_types = []
+            for col, toid in result_desc:
+                edb_type_id = self._db.backend_oid_to_id.get(toid)
+                if edb_type_id is None:
+                    raise errors.UnsupportedFeatureError(
+                        f"unsupported SQL type in column \"{col}\" "
+                        f"with type OID {toid}"
+                    )
+
+                result_types.append((col, edb_type_id))
+            params = []
+            if num_injected_params:
+                param_desc = param_desc[:-num_injected_params]
+            for pi, toid in enumerate(param_desc):
+                edb_type_id = self._db.backend_oid_to_id.get(toid)
+                if edb_type_id is None:
+                    raise errors.UnsupportedFeatureError(
+                        f"unsupported type in SQL parameter ${pi} "
+                        f"with type OID {toid}"
+                    )
+
+                params.append(edb_type_id)
+
+            to_describe.append((params, result_types))
+            desc_map[len(to_describe) - 1] = i
+
+        if to_describe:
+            desc_qug = await self._compile_sql_descriptors(
+                query_req, to_describe)
+
+            for i, desc_qu in enumerate(desc_qug):
+                qu_i = desc_map[i]
+
+                if query_req.output_format is not enums.OutputFormat.NONE:
+                    qug[qu_i].out_type_data = desc_qu[1][0]
+                    qug[qu_i].out_type_id = desc_qu[1][1]
+
+                qug[qu_i].in_type_data = desc_qu[0][0]
+                qug[qu_i].in_type_id = desc_qu[0][1]
+                qug[qu_i].in_type_args = desc_qu[0][2]
+                qug[qu_i].in_type_args_real_count = desc_qu[0][3]
+
+            # XXX We don't support SQL scripts just yet, so for now
+            # we can just copy the last QU's descriptors and
+            # apply them to the whole group (IOW a group is really
+            # a group of ONE now.)
+            # In near future we'll need to properly implement arg
+            # remap.
+            if query_req.output_format is not enums.OutputFormat.NONE:
+                qug.out_type_data = desc_qug[-1][1][0]
+                qug.out_type_id = desc_qug[-1][1][1]
+
+            qug.in_type_data = desc_qug[-1][0][0]
+            qug.in_type_id = desc_qug[-1][0][1]
+            qug.in_type_args = desc_qug[-1][0][2]
+            qug.in_type_args_real_count = desc_qug[-1][0][3]
+
+    cdef inline _check_in_tx_error(self, query_unit_group):
         if self.in_tx_error():
             # The current transaction is aborted, so we must fail
             # all commands except ROLLBACK or ROLLBACK TO SAVEPOINT.
@@ -1028,27 +1614,34 @@ cdef class DatabaseConnectionView:
             ):
                 self.raise_in_tx_error()
 
-        if not cached and query_unit_group.cacheable:
-            if cached_globally:
-                self.server.system_compile_cache[query_req] = query_unit_group
-            else:
-                self.cache_compiled_query(query_req, query_unit_group)
+    cdef as_compiled(self, query_req, query_unit_group, bint use_metrics=True):
+        cdef use_pending_func_cache = False
+        if query_unit_group.cache_state == 1:
+            use_pending_func_cache = (
+                not self._in_tx_seq
+                or self._in_tx_seq > query_unit_group.tx_seq_id
+            )
 
-        metrics.edgeql_query_compilations.inc(
-            1.0,
-            'cache' if cached else 'compiler'
-        )
+        self._check_in_tx_error(query_unit_group)
+        if use_metrics:
+            metrics.edgeql_query_compilations.inc(
+                1.0, self.tenant.get_instance_name(), 'cache'
+            )
 
+        source = query_req.source
         return CompiledQuery(
             query_unit_group=query_unit_group,
             first_extra=source.first_extra(),
             extra_counts=source.extra_counts(),
             extra_blobs=source.extra_blobs(),
+            extra_formatted_as_text=source.extra_formatted_as_text(),
+            extra_type_oids=source.extra_type_oids(),
+            use_pending_func_cache=use_pending_func_cache,
         )
 
     async def _compile(
         self,
-        query_req: QueryRequestInfo,
+        query_req: rpc.CompilationRequest,
     ) -> dbstate.QueryUnitGroup:
         compiler_pool = self._db._index._server.get_compiler_pool()
 
@@ -1056,19 +1649,15 @@ cdef class DatabaseConnectionView:
         try:
             if self.in_tx():
                 result = await compiler_pool.compile_in_tx(
+                    self.dbname,
+                    self._in_tx_root_user_schema_pickle,
                     self.txid,
                     self._last_comp_state,
                     self._last_comp_state_id,
-                    query_req.source,
-                    query_req.output_format,
-                    query_req.expect_one,
-                    query_req.implicit_limit,
-                    query_req.inline_typeids,
-                    query_req.inline_typenames,
-                    self._protocol_version,
-                    query_req.inline_objectids,
-                    query_req.input_format is compiler.InputFormat.JSON,
+                    query_req.serialize(),
+                    query_req.source.text(),
                     self.in_tx_error(),
+                    client_id=self.tenant.client_id,
                 )
             else:
                 result = await compiler_pool.compile(
@@ -1078,26 +1667,42 @@ cdef class DatabaseConnectionView:
                     self.reflection_cache,
                     self.get_database_config(),
                     self.get_compilation_system_config(),
-                    query_req.source,
-                    self.get_modaliases(),
-                    self.get_session_config(),
-                    query_req.output_format,
-                    query_req.expect_one,
-                    query_req.implicit_limit,
-                    query_req.inline_typeids,
-                    query_req.inline_typenames,
-                    self._protocol_version,
-                    query_req.inline_objectids,
-                    query_req.input_format is compiler.InputFormat.JSON,
+                    query_req.serialize(),
+                    query_req.source.text(),
                     client_id=self.tenant.client_id,
                 )
         finally:
             metrics.edgeql_query_compilation_duration.observe(
-                time.monotonic() - started_at)
+                time.monotonic() - started_at,
+                self.tenant.get_instance_name(),
+            )
+            metrics.query_compilation_duration.observe(
+                time.monotonic() - started_at,
+                self.tenant.get_instance_name(),
+                "edgeql",
+            )
 
         unit_group, self._last_comp_state, self._last_comp_state_id = result
 
         return unit_group
+
+    async def _compile_sql_descriptors(
+        self,
+        query_req: rpc.CompilationRequest,
+        types_in_out: defines.ProtocolVersion,
+    ) -> dbstate.QueryUnitGroup:
+        compiler_pool = self._db._index._server.get_compiler_pool()
+
+        cfg_ser = self.server.compilation_config_serializer
+        req = rpc.CompilationRequest(
+            source=rpc.SQLParamsSource(types_in_out),
+            protocol_version=query_req.protocol_version,
+            schema_version=query_req.schema_version,
+            input_language=enums.InputLanguage.SQL_PARAMS,
+            compilation_config_serializer=cfg_ser,
+        )
+
+        return await self._compile(req)
 
     cdef check_capabilities(
         self,
@@ -1131,6 +1736,23 @@ cdef class DatabaseConnectionView:
                     ~enums.Capability.WRITE,
                     errors.DisabledCapabilityError,
                     msg,
+                )
+
+        if not self.in_tx() and query_capabilities & enums.Capability.WRITE:
+            isolation = self.config_lookup("default_transaction_isolation")
+            if isolation and isolation.to_str() != "Serializable":
+                raise query_capabilities.make_error(
+                    ~enums.Capability.WRITE,
+                    errors.TransactionError,
+                    f"default_transaction_isolation is set to "
+                    f"{isolation.to_str()}",
+                )
+            access_mode = self.config_lookup("default_transaction_access_mode")
+            if access_mode and access_mode.to_str() == "ReadOnly":
+                raise query_capabilities.make_error(
+                    ~enums.Capability.WRITE,
+                    errors.TransactionError,
+                    "default_transaction_access_mode is set to ReadOnly",
                 )
 
     async def reload_state_serializer(self):
@@ -1176,7 +1798,7 @@ cdef class DatabaseIndex:
         except KeyError:
             return 0
 
-        return len((<Database>db)._views)
+        return sum(1 for dbv in (<Database>db)._views if not dbv.is_transient)
 
     def get_sys_config(self):
         return self._sys_config
@@ -1205,7 +1827,7 @@ cdef class DatabaseIndex:
             return self._dbs[dbname]
         except KeyError:
             raise errors.UnknownDatabaseError(
-                f'database {dbname!r} does not exist')
+                f'database branch {dbname!r} does not exist')
 
     def maybe_get_db(self, dbname):
         return self._dbs.get(dbname)
@@ -1222,39 +1844,69 @@ cdef class DatabaseIndex:
         dbname,
         *,
         user_schema_pickle,
+        schema_version,
         db_config,
         reflection_cache,
         backend_ids,
         extensions,
         ext_config_settings,
+        early=False,
+        feature_used_metrics=None,
     ):
         cdef Database db
         db = self._dbs.get(dbname)
         if db is not None:
             db._set_and_signal_new_user_schema(
                 user_schema_pickle,
+                schema_version,
                 extensions,
                 ext_config_settings,
+                feature_used_metrics,
                 reflection_cache,
                 backend_ids,
                 db_config,
+                not early,
             )
         else:
             db = Database(
                 self,
                 dbname,
                 user_schema_pickle=user_schema_pickle,
+                schema_version=schema_version,
                 db_config=db_config,
                 reflection_cache=reflection_cache,
                 backend_ids=backend_ids,
                 extensions=extensions,
                 ext_config_settings=ext_config_settings,
+                feature_used_metrics=feature_used_metrics,
             )
             self._dbs[dbname] = db
+            if not early:
+                db.start_stop_extensions()
+        self.set_current_branches()
         return db
 
     def unregister_db(self, dbname):
-        self._dbs.pop(dbname)
+        db = self._dbs.pop(dbname)
+        db.stop()
+        self.set_current_branches()
+
+    cdef inline set_current_branches(self):
+        metrics.current_branches.set(
+            sum(
+                dbname != defines.EDGEDB_SYSTEM_DB
+                for dbname in self._dbs
+            ),
+            self._tenant.get_instance_name(),
+        )
+        metrics.current_introspected_branches.set(
+            sum(
+                dbname != defines.EDGEDB_SYSTEM_DB
+                and db.user_schema_pickle is not None
+                for dbname, db in self._dbs.items()
+            ),
+            self._tenant.get_instance_name(),
+        )
 
     def iter_dbs(self):
         return iter(self._dbs.values())
@@ -1354,3 +2006,10 @@ cdef class DatabaseIndex:
                 dbs, self._global_schema_pickle, self._comp_sys_config
             )
         return self._cached_compiler_args
+
+    def lookup_config(self, name: str):
+        return config.lookup(
+            name,
+            self._sys_config,
+            spec=self._sys_config_spec,
+        )

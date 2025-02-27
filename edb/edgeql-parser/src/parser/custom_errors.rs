@@ -107,6 +107,17 @@ impl<'s> Parser<'s> {
                 });
             },
 
+            ParserRule::Create => {
+                if matches!(token.kind, Kind::Keyword(Keyword("branch"))) {
+                    return Some(Error {
+                        message: "Missing one of keywords 'EMPTY', 'SCHEMA' or 'DATA'".to_string(),
+                        span: Span { start: token.span.start - 1, end: token.span.start },
+                        hint: None,
+                        details: None,
+                    })
+                }
+            }
+
             _ => {}
         }
         None
@@ -208,6 +219,11 @@ impl<'s> Parser<'s> {
                     }
                 }
 
+                CSTNode::Terminal(Terminal {
+                    kind: Kind::Keyword(Keyword("create")),
+                    ..
+                }) => return Some((i, ParserRule::Create)),
+
                 _ => {}
             }
 
@@ -250,7 +266,7 @@ impl<'s> Parser<'s> {
     ///              D - X
     ///              E
     /// ```
-    fn compare_stack<'a>(&self, expected: &[Cond], top_offset: usize, ctx: &Context) -> bool {
+    fn compare_stack(&self, expected: &[Cond], top_offset: usize, ctx: &Context) -> bool {
         let mut current = self.get_from_top(top_offset);
 
         for validator in expected.iter().rev() {
@@ -272,10 +288,11 @@ fn unexpected_reserved_keyword(text: &str, span: Span) -> Error {
     Error {
         message: format!("Unexpected keyword '{text_upper}'"),
         span,
-        details: Some(format!(
+        details: Some(
             "This name is a reserved keyword and cannot be \
             used as an identifier"
-        )),
+                .to_string(),
+        ),
         hint: Some(format!(
             "Use a different identifier or quote the name \
             with backticks: `{text}`"
@@ -342,6 +359,7 @@ enum ParserRule {
     Array,
     Tuple,
     ListOfArguments,
+    Create,
 }
 
 impl std::fmt::Display for ParserRule {
@@ -354,6 +372,7 @@ impl std::fmt::Display for ParserRule {
             ParserRule::Array => f.write_str("array"),
             ParserRule::Tuple => f.write_str("tuple"),
             ParserRule::ListOfArguments => f.write_str("list of arguments"),
+            ParserRule::Create => f.write_str("create"),
         }
     }
 }
@@ -369,7 +388,7 @@ pub fn post_process(errors: Vec<Error>) -> Vec<Error> {
                 {
                     let last = new_errors.pop().unwrap();
                     let text = last.message.strip_prefix("Unexpected keyword '").unwrap();
-                    let text = text.strip_suffix("'").unwrap();
+                    let text = text.strip_suffix('\'').unwrap();
 
                     new_errors.push(unexpected_reserved_keyword(text, last.span));
                     continue;

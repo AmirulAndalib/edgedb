@@ -25,7 +25,17 @@ import contextlib
 import decimal
 import json
 import re
-from typing import *
+from typing import (
+    Any,
+    Optional,
+    Tuple,
+    Union,
+    Mapping,
+    Dict,
+    List,
+    FrozenSet,
+    NamedTuple,
+)
 
 import graphql
 from graphql.language import ast as gql_ast
@@ -85,8 +95,15 @@ INT_FLOAT_ERROR = re.compile(
 
 
 class GraphQLTranslatorContext:
-    def __init__(self, *, gqlcore: gt.GQLCoreSchema,
-                 variables, query, document_ast, operation_name):
+    def __init__(
+        self,
+        *,
+        gqlcore: gt.GQLCoreSchema,
+        variables,
+        query,
+        document_ast,
+        operation_name,
+    ):
         self.variables = variables
         self.fragments = {}
         self.validated_fragments = {}
@@ -205,10 +222,9 @@ class GraphQLTranslator:
         return self._context.gqlcore.get(name)
 
     def is_list_type(self, node):
-        return (
-            isinstance(node, gql_ast.ListTypeNode) or
-            (isinstance(node, gql_ast.NonNullTypeNode) and
-                self.is_list_type(node.type))
+        return isinstance(node, gql_ast.ListTypeNode) or (
+            isinstance(node, gql_ast.NonNullTypeNode)
+            and self.is_list_type(node.type)
         )
 
     def get_field_type(self, base, name, *, args=None):
@@ -287,8 +303,8 @@ class GraphQLTranslator:
                     else:
                         raise err
 
-                name = el.expr.steps[0].ptr.name
-                el.compexpr.args[0] = qlast.StringConstant.from_python(
+                name = el.expr.steps[0].name
+                el.compexpr.args[0] = qlast.Constant.string(
                     json.dumps(result.data[name]))
                 for var in vars.touched:
                     operation.critvars[var] = self._context.vars[var].val
@@ -514,11 +530,7 @@ class GraphQLTranslator:
                     maintype=base.edb_base_name_ast
                 )
             ))
-        steps.append(qlast.Ptr(
-            ptr=qlast.ObjectRef(
-                name=node.name.value
-            )
-        ))
+        steps.append(qlast.Ptr(name=node.name.value))
 
         return is_top, path, prevt, target, steps
 
@@ -526,7 +538,7 @@ class GraphQLTranslator:
         if self._is_duplicate_field(node):
             return
 
-        is_top, path, prevt, target, steps = \
+        _is_top, _path, prevt, target, steps = \
             self._prepare_field(node)
 
         json_mode = False
@@ -542,9 +554,7 @@ class GraphQLTranslator:
             spec = qlast.ShapeElement(
                 expr=qlast.Path(
                     steps=[qlast.Ptr(
-                        ptr=qlast.ObjectRef(
-                            name=(node.alias or node.name).value
-                        )
+                        name=(node.alias or node.name).value,
                     )]
                 ),
                 compexpr=eql,
@@ -568,10 +578,8 @@ class GraphQLTranslator:
             spec = qlast.ShapeElement(
                 expr=qlast.Path(
                     steps=[qlast.Ptr(
-                        ptr=qlast.ObjectRef(
-                            # this is already a sub-query
-                            name=(node.alias or node.name).value
-                        )
+                        # this is already a sub-query
+                        name=(node.alias or node.name).value
                     )]
                 ),
                 compexpr=eql,
@@ -586,10 +594,8 @@ class GraphQLTranslator:
             spec = qlast.ShapeElement(
                 expr=qlast.Path(
                     steps=[qlast.Ptr(
-                        ptr=qlast.ObjectRef(
-                            # this is already a sub-query
-                            name=(node.alias or node.name).value
-                        )
+                        # this is already a sub-query
+                        name=(node.alias or node.name).value
                     )]
                 ),
                 compexpr=eql,
@@ -856,9 +862,9 @@ class GraphQLTranslator:
 
         # convert integers into qlast literals
         if offset is not None and not isinstance(offset, qlast.Base):
-            offset = qlast.IntegerConstant(value=str(max(0, offset)))
+            offset = qlast.Constant.integer(max(0, offset))
         if limit is not None:
-            limit = qlast.IntegerConstant(value=str(max(0, limit)))
+            limit = qlast.Constant.integer(max(0, limit))
 
         return offset, limit
 
@@ -872,7 +878,7 @@ class GraphQLTranslator:
                 expr=value
             )
         else:
-            return qlast.IntegerConstant(value=str(value))
+            return qlast.Constant.integer(value)
 
     def _get_general_offset_limit(self, after, before, first, last):
         # Convert any static values to corresponding qlast and
@@ -894,7 +900,7 @@ class GraphQLTranslator:
             offset = qlast.BinOp(
                 left=after,
                 op='+',
-                right=qlast.IntegerConstant(value='1')
+                right=qlast.Constant.integer('1')
             )
 
         if before is not None:
@@ -989,8 +995,7 @@ class GraphQLTranslator:
                     fname = field.name.value
                     # capture the full path to the field being updated
                     eqlpath = self.get_path_prefix()
-                    eqlpath.append(
-                        qlast.Ptr(ptr=qlast.ObjectRef(name=fname)))
+                    eqlpath.append(qlast.Ptr(name=fname))
                     eqlpath = qlast.Path(steps=eqlpath)
 
                     # set-up the current path to point to the thing
@@ -1003,13 +1008,7 @@ class GraphQLTranslator:
                         result.append(
                             qlast.ShapeElement(
                                 expr=qlast.Path(
-                                    steps=[
-                                        qlast.Ptr(
-                                            ptr=qlast.ObjectRef(
-                                                name=field.name.value
-                                            )
-                                        )
-                                    ]
+                                    steps=[qlast.Ptr(name=field.name.value)]
                                 ),
                                 operation=qlast.ShapeOperation(op=shapeop),
                                 compexpr=value,
@@ -1037,7 +1036,7 @@ class GraphQLTranslator:
         fname = field.name.value
         # by default we expect an assign
         shapeop = qlast.ShapeOp.ASSIGN
-        ptrname = eqlpath.steps[-1].ptr.name
+        ptrname = eqlpath.steps[-1].name
 
         # NOTE: there will be more operations in the future
         if fname == 'set':
@@ -1157,11 +1156,7 @@ class GraphQLTranslator:
                 result.append(
                     qlast.ShapeElement(
                         expr=qlast.Path(
-                            steps=[
-                                qlast.Ptr(
-                                    ptr=qlast.ObjectRef(name=field.name.value)
-                                )
-                            ]
+                            steps=[qlast.Ptr(name=field.name.value)]
                         ),
                         compexpr=compexpr,
                     )
@@ -1192,7 +1187,7 @@ class GraphQLTranslator:
                         func='assert_distinct',
                         args=[compexpr],
                         kwargs={
-                            'message': qlast.StringConstant.from_python(msg)
+                            'message': qlast.Constant.string(msg)
                         }
                     )
                 else:
@@ -1202,7 +1197,7 @@ class GraphQLTranslator:
                         func='assert_single',
                         args=[compexpr],
                         kwargs={
-                            'message': qlast.StringConstant.from_python(msg)
+                            'message': qlast.Constant.string(msg)
                         }
                     )
 
@@ -1459,9 +1454,7 @@ class GraphQLTranslator:
                     )
                 )
             else:
-                prefix.append(
-                    qlast.Ptr(ptr=qlast.ObjectRef(name=step.name))
-                )
+                prefix.append(qlast.Ptr(name=step.name))
 
         return prefix
 
@@ -1531,7 +1524,7 @@ class GraphQLTranslator:
         _, target = self._get_parent_and_current_type()
 
         name = self.get_path_prefix()
-        name.append(qlast.Ptr(ptr=qlast.ObjectRef(name=fname)))
+        name.append(qlast.Ptr(name=fname))
         name = qlast.Path(
             steps=name,
             # paths that start with a Ptr are partial
@@ -1599,7 +1592,7 @@ class GraphQLTranslator:
         if not node.fields:
             return [qlast.SortExpr(
                 path=qlast.Path(
-                    steps=[qlast.Ptr(ptr=qlast.ObjectRef(name='id'))],
+                    steps=[qlast.Ptr(name='id')],
                     partial=True,
                 ),
                 direction=qlast.SortAsc,
@@ -1612,8 +1605,7 @@ class GraphQLTranslator:
             orderby.append(qlast.SortExpr(
                 path=qlast.Path(
                     steps=[
-                        qlast.Ptr(ptr=qlast.ObjectRef(name=name))
-                        for name in ordering.names
+                        qlast.Ptr(name=name) for name in ordering.names
                     ],
                     partial=True,
                 ),
@@ -1691,12 +1683,14 @@ class GraphQLTranslator:
             optional = False
 
         if self.is_list_type(vartype):
-            if target.is_array:
-                raise errors.QueryError(err_msg)
-            elif target.is_multirange:
+            if target.is_multirange:
                 subtype = target.edb_base.get_subtypes(target.edb_schema)[0]
                 st_name = subtype.get_name(target.edb_schema)
                 castname = qlast.ObjectRef(name=str(st_name))
+            else:
+                # So far the only list allowed is a multirange
+                # representation.
+                raise errors.QueryError(err_msg)
 
         elif vartype.name.value in gt.GQL_TO_EDB_SCALARS_MAP:
             castname = qlast.ObjectRef(
@@ -1743,26 +1737,30 @@ class GraphQLTranslator:
         )
 
     def visit_StringValueNode(self, node):
-        return qlast.StringConstant.from_python(node.value)
+        return qlast.Constant.string(node.value)
 
     def visit_IntValueNode(self, node):
         # produces an int64 or bigint
         val = int(node.value)
         if s_utils.MIN_INT64 <= val <= s_utils.MAX_INT64:
-            return qlast.IntegerConstant(value=str(val))
+            return qlast.Constant.integer(val)
         else:
-            return qlast.BigintConstant(value=f'{val}n')
+            return qlast.Constant(
+                value=f'{val}n', kind=qlast.ConstantKind.BIGINT
+            )
 
     def visit_FloatValueNode(self, node):
         # Treat all Float as Decimal by default and downcast as necessary
-        return qlast.DecimalConstant(value=f'{node.value}n')
+        return qlast.Constant(
+            value=f'{node.value}n', kind=qlast.ConstantKind.DECIMAL
+        )
 
     def visit_BooleanValueNode(self, node):
         value = 'true' if node.value else 'false'
-        return qlast.BooleanConstant(value=value)
+        return qlast.Constant.boolean(value)
 
     def visit_EnumValueNode(self, node):
-        return qlast.StringConstant.from_python(node.value)
+        return qlast.Constant.string(node.value)
 
     def _visit_list_of_inputs(self, inputlist, op):
         if not isinstance(inputlist, gql_ast.ListValueNode):
@@ -1811,6 +1809,8 @@ class GraphQLTranslator:
             for res in results:
                 if isinstance(res, Field):
                     flattened.append(res)
+                elif isinstance(res, dict):
+                    flattened.extend(res.values())
                 elif typeutils.is_container(res):
                     flattened.extend(res)
                 else:
@@ -1888,8 +1888,7 @@ class TokenLexer(graphql.language.lexer.Lexer):
 
 
 def parse_tokens(
-    text: str,
-    tokens: List[Tuple[gql_lexer.TokenKind, int, int, int, int, str]]
+    text: str, tokens: List[Tuple[gql_lexer.TokenKind, int, int, int, int, str]]
 ) -> graphql.Document:
     try:
         src = graphql.Source(text)
@@ -1903,7 +1902,8 @@ def parse_tokens(
 
 
 def convert_errors(
-    errs: List[gql_error.GraphQLError], *,
+    errs: List[gql_error.GraphQLError],
+    *,
     substitutions: Optional[Dict[str, Tuple[str, int, int]]],
 ) -> List[gql_error.GraphQLErrors]:
     result = []
@@ -1989,7 +1989,7 @@ def augment_error_message(gqlcore: gt.GQLCoreSchema, message: str):
 
         message += (
             f' There\'s no corresponding type or alias "{name}" exposed in '
-            'EdgeDB. Please check the configuration settings for this port '
+            'Gel. Please check the configuration settings for this port '
             'to make sure that you\'re connecting to the right database.'
         )
 
@@ -1997,8 +1997,7 @@ def augment_error_message(gqlcore: gt.GQLCoreSchema, message: str):
 
 
 def convert_default(
-    node: gql_ast.ValueNode,
-    varname: str
+    node: gql_ast.ValueNode, varname: str
 ) -> Union[str, float, int, bool]:
     if isinstance(node, (gql_ast.StringValueNode,
                          gql_ast.BooleanValueNode,

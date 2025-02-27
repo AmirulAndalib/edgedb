@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Type, cast, TYPE_CHECKING
 
 from edb import errors
 
@@ -35,6 +35,9 @@ from . import objects as so
 from . import referencing
 from . import schema as s_schema
 from . import types as s_types
+
+if TYPE_CHECKING:
+    from . import pointers as s_pointers
 
 
 class Rewrite(
@@ -69,6 +72,13 @@ class Rewrite(
         # inheritance for rewrites, and do lookups into parent object types
         # when retrieving them.
         return False
+
+    def get_ptr_target(self, schema: s_schema.Schema) -> s_types.Type:
+        pointer: s_pointers.Pointer = cast(
+            's_pointers.Pointer', self.get_subject(schema))
+        ptr_target = pointer.get_target(schema)
+        assert ptr_target
+        return ptr_target
 
 
 class RewriteCommandContext(
@@ -129,14 +139,32 @@ class RewriteCommand(
         track_schema_ref_exprs: bool = False,
     ) -> s_expr.CompiledExpression:
         if field.name == 'expr':
+            from edb.common import ast
+            from edb.ir import ast as irast
             from edb.ir import pathid
-            from . import pointers
+            from . import pointers as s_pointers
+            from . import objtypes as s_objtypes
+            from . import links as s_links
 
             parent_ctx = self.get_referrer_context_or_die(context)
-            pointer = parent_ctx.op.get_object(schema, context)
-            assert isinstance(pointer, pointers.Pointer)
+            pointer = parent_ctx.op.scls
+            assert isinstance(pointer, s_pointers.Pointer)
+
             source = pointer.get_source(schema)
-            assert isinstance(source, s_types.Type)
+            if isinstance(source, s_objtypes.ObjectType):
+                subject = source
+            elif isinstance(source, s_links.Link):
+                subject = source.get_target(schema)
+                assert subject
+
+                span = self.get_attribute_span('expr')
+                raise errors.SchemaDefinitionError(
+                    'rewrites on link properties are not supported',
+                    span=span,
+                )
+            else:
+                raise NotImplementedError('unsupported rewrite source')
+
             # XXX: in_ddl_context_name is disabled for now because
             # it causes the compiler to reject DML; we might actually
             # want it for something, though, so we might need to
@@ -147,13 +175,14 @@ class RewriteCommand(
 
             kind = self._get_kind(schema)
 
-            anchors = {}
+            anchors: dict[str, s_types.Type | pathid.PathId] = {}
 
             # __subject__
             anchors["__subject__"] = pathid.PathId.from_type(
                 schema,
-                source,
+                subject,
                 typename=sn.QualName(module="__derived__", name="__subject__"),
+                env=None,
             )
             # __specified__
             bool_type = schema.get("std::bool", type=s_types.Type)
@@ -162,7 +191,7 @@ class RewriteCommand(
                 named=True,
                 element_types={
                     pn.name: bool_type
-                    for pn in source.get_pointers(schema).keys(schema)
+                    for pn in subject.get_pointers(schema).keys(schema)
                 },
             )
             anchors['__specified__'] = specified_type
@@ -171,13 +200,61 @@ class RewriteCommand(
             if qltypes.RewriteKind.Update == kind:
                 anchors['__old__'] = pathid.PathId.from_type(
                     schema,
-                    source,
+                    subject,
                     typename=sn.QualName(module='__derived__', name='__old__'),
+                    env=None,
                 )
 
             singletons = frozenset(anchors.values())
 
-            assert isinstance(source, s_types.Type)
+            # If the `__specified__` anchor is used, create references to the
+            # matching pointers.
+            #
+            # These references are necessary in order to compute the dependency
+            # and ordering of Rewrite commands when producing DDL.
+            #
+            # If creating Type T with two properties, A and B, such that
+            # A has a Rewrite containing `__specified__.B`.
+            #
+            # Without the references, the DDL may look like:
+            # - Create Type T
+            #   - Create Property A
+            #     - Create Rewrite using __specified__.B
+            #   - Create Property B
+            #
+            # This will cause an issue when compiling the Rewrite. At that
+            # point, the schema will not know about B and so the tuple will not
+            # have element `.B`.
+            #
+            # The reference will cause the reordering of commands and the DDL
+            # may instead look like:
+            # - Create Object O
+            #   - Create Property A
+            #   - Create Property B
+            #   - Alter Property A
+            #     - Create Rewrite using __specified__.B
+            #
+            # With Create Rewrite ordered after Property B, the tuple for
+            # `__specified__` will correctly have element `.B`.
+            def find_extra_refs(ir_expr: irast.Set) -> set[so.Object]:
+                def find_specified(node: irast.TupleIndirectionPointer) -> bool:
+                    return node.source.anchor == '__specified__'
+
+                ref_ptr_names: set[str] = set()
+                for tuple_node in ast.find_children(
+                    ir_expr,
+                    irast.TupleIndirectionPointer,
+                    test_func=find_specified,
+                ):
+                    ref_ptr_names.add(tuple_node.ptrref.name.name)
+
+                ref_ptrs: set[so.Object] = set(
+                    pointer
+                    for pointer in subject.get_pointers(schema).objects(schema)
+                    if pointer.get_shortname(schema).name in ref_ptr_names
+                )
+
+                return ref_ptrs
 
             return type(value).compiled(
                 value,
@@ -193,6 +270,8 @@ class RewriteCommand(
                     # in_ddl_context_name=in_ddl_context_name,
                     detached=True,
                 ),
+                find_extra_refs=find_extra_refs,
+                context=context,
             )
         else:
             return super().compile_expr_field(
@@ -207,7 +286,8 @@ class RewriteCommand(
         value: Any,
     ) -> Optional[s_expr.Expression]:
         if field.name == 'expr':
-            return s_expr.Expression(text='false')
+            return s_types.type_dummy_expr(
+                self.scls.get_ptr_target(schema), schema)
         else:
             raise NotImplementedError(f'unhandled field {field.name!r}')
 
@@ -216,11 +296,43 @@ class RewriteCommand(
         schema: s_schema.Schema,
         context: sd.CommandContext,
     ) -> None:
-        # XXX: verify we don't have the same bug as access policies
-        # where linkprop defaults are broken.
-        # (I think we won't need to, since we'll operate after
-        # the *real* operations)
-        pass
+        expr: s_expr.Expression = self.scls.get_expr(schema)
+
+        if not expr.irast:
+            expr = self.compile_expr_field(
+                schema, context, Rewrite.get_field('expr'), expr
+            )
+            assert expr.irast
+
+        ir = expr.irast
+        compiled_schema = ir.schema
+        typ: s_types.Type = ir.stype
+
+        if (
+            typ.is_view(compiled_schema)
+            # Using an alias/global always creates a new subtype view,
+            # but we want to allow those here, so check whether there
+            # is a shape more directly.
+            and not (
+                len(shape := ir.view_shapes.get(typ, [])) == 1
+                and shape[0].is_id_pointer(compiled_schema)
+            )
+        ):
+            span = self.get_attribute_span('expr')
+            raise errors.SchemaDefinitionError(
+                f'rewrite expression may not include a shape',
+                span=span,
+            )
+
+        ptr_target = self.scls.get_ptr_target(compiled_schema)
+        if not typ.assignment_castable_to(ptr_target, compiled_schema):
+            span = self.get_attribute_span('expr')
+            raise errors.SchemaDefinitionError(
+                f'rewrite expression is of invalid type: '
+                f'{typ.get_displayname(compiled_schema)}, '
+                f'expected {ptr_target.get_displayname(compiled_schema)}',
+                span=span,
+            )
 
     @classmethod
     def _cmd_tree_from_ast(
@@ -293,7 +405,7 @@ class CreateRewrite(
                     context.modaliases,
                     context.localnames,
                 ),
-                source_context=astnode.expr.context,
+                span=astnode.expr.span,
             )
         return group
 
@@ -346,7 +458,7 @@ class AlterRewrite(
             raise errors.SchemaDefinitionError(
                 f'cannot alter the definition of inherited trigger '
                 f'{self.scls.get_displayname(schema)}',
-                context=self.source_context,
+                span=self.span,
             )
 
         return schema

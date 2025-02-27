@@ -18,8 +18,21 @@
 
 
 from __future__ import annotations
-from typing import *
-from typing import overload
+from typing import (
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Iterable,
+    Sequence,
+    List,
+    Set,
+    overload,
+    TYPE_CHECKING,
+)
+
+
+from edb import errors
 
 from . import delta as sd
 from . import indexes
@@ -156,7 +169,7 @@ class Source(
 
     def get_addon_columns(
         self, schema: s_schema.Schema
-    ) -> Sequence[Tuple[str, Tuple[str, str]]]:
+    ) -> Sequence[Tuple[str, str, Tuple[str, str]]]:
         """
         Returns a list of columns that are present in the backing table of
         this source, apart from the columns for pointers.
@@ -165,11 +178,14 @@ class Source(
         from edb.common import debug
 
         if not debug.flags.zombodb:
-            (fts_index, _) = indexes.get_effective_fts_index(self, schema)
+            fts_index, _ = indexes.get_effective_object_index(
+                schema, self, sn.QualName("std::fts", "index")
+            )
 
             if fts_index:
                 res.append(
                     (
+                        '__fts_document__',
                         '__fts_document__',
                         (
                             'pg_catalog',
@@ -177,6 +193,29 @@ class Source(
                         ),
                     )
                 )
+
+        ext_ai_index, _ = indexes.get_effective_object_index(
+            schema, self, sn.QualName("ext::ai", "index")
+        )
+        if ext_ai_index:
+            idx_id = indexes.get_ai_index_id(schema, ext_ai_index)
+            dimensions = ext_ai_index.must_get_json_annotation(
+                schema,
+                sn.QualName(
+                    "ext::ai", "embedding_dimensions"),
+                int,
+            )
+            res.append(
+                (
+                    f'__ext_ai_{idx_id}_embedding__',
+                    f'__ext_ai_{idx_id}_embedding__',
+                    (
+                        'edgedb',
+                        f'vector({dimensions})',
+                    ),
+                )
+            )
+
         return res
 
 
@@ -206,14 +245,24 @@ def populate_pointer_set_for_source_union(
             if len(ptrs) == 1:
                 ptr = ptrs[0]
             else:
-                schema, ptr = s_pointers.get_or_create_union_pointer(
-                    schema,
-                    ptrname=pn,
-                    source=union,
-                    direction=s_pointers.PointerDirection.Outbound,
-                    components=set(ptrs),
-                    modname=modname,
-                )
+                try:
+                    schema, ptr = s_pointers.get_or_create_union_pointer(
+                        schema,
+                        ptrname=pn,
+                        source=union,
+                        direction=s_pointers.PointerDirection.Outbound,
+                        components=set(ptrs),
+                        modname=modname,
+                    )
+                except errors.SchemaError as e:
+                    # ptrs may have different verbose names
+                    # ensure the same one is always chosen
+                    vn = sorted(p.get_verbosename(schema) for p in ptrs)[0]
+                    e.args = (
+                        (f'with {vn} {e.args[0]}',)
+                        + e.args[1:]
+                    )
+                    raise e
 
             union_pointers[pn] = ptr
 

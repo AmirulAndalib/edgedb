@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Tuple, Iterable, List
 
 import functools
 
@@ -38,21 +38,24 @@ InferredVolatility = context.InferredVolatility
 IMMUTABLE = qltypes.Volatility.Immutable
 STABLE = qltypes.Volatility.Stable
 VOLATILE = qltypes.Volatility.Volatile
+MODIFYING = qltypes.Volatility.Modifying
 
 
 # Volatility inference computes two volatility results:
 # A basic one, and one for consumption by materialization.
 #
 # The one for consumption by materialization differs in that it
-# (counterintuitively) does not consider DML to be volatile
+# (counterintuitively) does not consider DML to be volatile/modifying
 # (since DML has its own "materialization" mechanism).
 #
 # We represent this output as a pair, but for ergonomics, inference
 # functions are allowed to still produce a single volatility value,
 # which is normalized when necessary.
 
-def _normalize_volatility(vol: InferredVolatility) -> Tuple[
-        qltypes.Volatility, qltypes.Volatility]:
+
+def _normalize_volatility(
+    vol: InferredVolatility,
+) -> Tuple[qltypes.Volatility, qltypes.Volatility]:
     if not isinstance(vol, tuple):
         return (vol, vol)
     else:
@@ -137,39 +140,62 @@ def __infer_type_introspection(
 
 
 @_infer_volatility_inner.register
+def __infer_type_root(
+    ir: irast.TypeRoot,
+    env: context.Environment,
+) -> InferredVolatility:
+    return STABLE
+
+
+@_infer_volatility_inner.register
+def __infer_cleared_expr(
+    ir: irast.RefExpr,
+    env: context.Environment,
+) -> InferredVolatility:
+    return IMMUTABLE
+
+
+@_infer_volatility_inner.register
+def _infer_pointer(
+    ir: irast.Pointer,
+    env: context.Environment,
+) -> InferredVolatility:
+    vol = _infer_volatility(ir.source, env)
+    # If there's an expression on an rptr, and it comes from
+    # the schema, we need to actually infer it, since it won't
+    # have been processed at a shape declaration.
+    if ir.expr is not None and not ir.ptrref.defined_here:
+        vol = _max_volatility((
+            vol,
+            _infer_volatility(ir.expr, env),
+        ))
+
+    # If source is an object, then a pointer reference implies
+    # a table scan, and so we can assume STABLE at the minimum.
+    #
+    # A single dereference of a singleton path can be IMMUTABLE,
+    # though, which we need in order to enforce that indexes
+    # don't call STABLE functions.
+    if (
+        irtyputils.is_object(ir.source.typeref)
+        and ir.source.path_id not in env.singletons
+    ):
+        vol = _max_volatility((vol, STABLE))
+
+    return vol
+
+
+@_infer_volatility_inner.register
 def __infer_set(
     ir: irast.Set,
     env: context.Environment,
 ) -> InferredVolatility:
     vol: InferredVolatility
+
     if ir.path_id in env.singletons:
         vol = IMMUTABLE
-    elif ir.rptr is not None:
-        vol = _infer_volatility(ir.rptr.source, env)
-        # If there's an expression on an rptr, and it comes from
-        # the schema, we need to actually infer it, since it won't
-        # have been processed at a shape declaration.
-        if ir.expr is not None and not ir.rptr.ptrref.defined_here:
-            vol = _max_volatility((
-                vol,
-                _infer_volatility(ir.expr, env),
-            ))
-
-        # If source is an object, then a pointer reference implies
-        # a table scan, and so we can assume STABLE at the minimum.
-        #
-        # A single dereference of a singleton path can be IMMUTABLE,
-        # though, which we need in order to enforce that indexes
-        # don't call STABLE functions.
-        if (
-            irtyputils.is_object(ir.rptr.source.typeref)
-            and ir.rptr.source.path_id not in env.singletons
-        ):
-            vol = _max_volatility((vol, STABLE))
-    elif ir.expr is not None:
-        vol = _infer_volatility(ir.expr, env)
     else:
-        vol = STABLE
+        vol = _infer_volatility(ir.expr, env)
 
     # Cache our best-known as to this point volatility, to prevent
     # infinite recursion.
@@ -178,12 +204,12 @@ def __infer_set(
     if ir.shape:
         vol = _max_volatility([
             _common_volatility(
-                (el.expr for el, _ in ir.shape if el.expr), env
+                (el.expr.expr for el, _ in ir.shape if el.expr.expr), env
             ),
             vol,
         ])
 
-    if ir.is_binding:
+    if ir.is_binding and ir.is_binding != irast.BindingKind.Schema:
         vol = IMMUTABLE
 
     return vol
@@ -194,13 +220,17 @@ def __infer_func_call(
     ir: irast.FunctionCall,
     env: context.Environment,
 ) -> InferredVolatility:
+    func_volatility = (
+        _infer_volatility(ir.body, env) if ir.body else ir.volatility
+    )
+
     if ir.args:
         return _max_volatility([
-            _common_volatility((arg.expr for arg in ir.args), env),
-            ir.volatility
+            _common_volatility((arg.expr for arg in ir.args.values()), env),
+            func_volatility
         ])
     else:
-        return ir.volatility
+        return func_volatility
 
 
 @_infer_volatility_inner.register
@@ -210,7 +240,7 @@ def __infer_oper_call(
 ) -> InferredVolatility:
     if ir.args:
         return _max_volatility([
-            _common_volatility((arg.expr for arg in ir.args), env),
+            _common_volatility((arg.expr for arg in ir.args.values()), env),
             ir.volatility
         ])
     else:
@@ -228,6 +258,14 @@ def __infer_const(
 @_infer_volatility_inner.register
 def __infer_param(
     ir: irast.Parameter,
+    env: context.Environment,
+) -> InferredVolatility:
+    return STABLE if ir.is_global else IMMUTABLE
+
+
+@_infer_volatility_inner.register
+def __infer_inlined_param(
+    ir: irast.InlinedParameterExpr,
     env: context.Environment,
 ) -> InferredVolatility:
     return STABLE if ir.is_global else IMMUTABLE
@@ -282,7 +320,7 @@ def __infer_select_stmt(
         components.append(ir.limit)
 
     if ir.bindings is not None:
-        components.extend(ir.bindings)
+        components.extend(part for part, _ in ir.bindings)
 
     return _common_volatility(components, env)
 
@@ -319,7 +357,7 @@ def __infer_dml_stmt(
 ) -> InferredVolatility:
     # For materialization purposes, DML is not volatile.  (Since it
     # has its *own* elaborate mechanism using top-level CTEs).
-    return VOLATILE, STABLE
+    return MODIFYING, STABLE
 
 
 @_infer_volatility_inner.register
@@ -388,10 +426,10 @@ def infer_volatility(
 ) -> qltypes.Volatility:
     result = _normalize_volatility(_infer_volatility(ir, env))[exclude_dml]
 
-    if result not in {VOLATILE, STABLE, IMMUTABLE}:
+    if result not in {VOLATILE, STABLE, IMMUTABLE, MODIFYING}:
         raise errors.QueryError(
             'could not determine the volatility of '
             'set produced by expression',
-            context=ir.context)
+            span=ir.span)
 
     return result

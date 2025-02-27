@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Tuple, Type, Sequence, Dict, List, NamedTuple
 
 import collections
 import uuid
@@ -321,7 +321,7 @@ def generate_structure(
                 SELECT
                     coalesce(jsonb_object_agg(cfg.name, cfg), '{}'::jsonb)
                 FROM
-                    edgedb._read_sys_config(
+                    edgedb_VER._read_sys_config(
                         sources::edgedb._sys_config_source_t[],
                         max_source::edgedb._sys_config_source_t
                     ) AS cfg
@@ -373,6 +373,7 @@ def generate_structure(
                     py_cls is s_obj.InternalObject
                     or not issubclass(py_cls, s_obj.InternalObject)
                 )
+                and py_cls._abstract is not False
             )
 
             schema = _run_ddl(
@@ -524,7 +525,7 @@ def generate_structure(
                     read_ptr = f'{read_ptr}[IS {rschema_name}]'
 
                 if field.reflection_proxy:
-                    proxy_type, proxy_link = field.reflection_proxy
+                    _proxy_type, proxy_link = field.reflection_proxy
                     read_ptr = (
                         f'{read_ptr}: {{name, value := .{proxy_link}.id}}'
                     )

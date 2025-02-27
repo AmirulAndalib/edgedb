@@ -20,7 +20,23 @@
 """Query scope tree implementation."""
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Optional,
+    Tuple,
+    AbstractSet,
+    Iterator,
+    Mapping,
+    Collection,
+    List,
+    Set,
+    FrozenSet,
+    NamedTuple,
+    Protocol,
+    cast,
+    TYPE_CHECKING,
+)
+
 if TYPE_CHECKING:
     from typing_extensions import TypeGuard
 
@@ -29,9 +45,17 @@ import textwrap
 import weakref
 
 from edb import errors
-from edb.common import context as pctx
+from edb.common import span
 from edb.common import term
+from edb.common.typeutils import not_none
+
 from . import pathid
+from . import ast as irast
+
+
+class WarningContext(Protocol):
+    def log_warning(self, warning: errors.EdgeDBError) -> None:
+        ...
 
 
 class FenceInfo(NamedTuple):
@@ -58,6 +82,9 @@ class ScopeTreeNode:
 
     fenced: bool
     """Whether the subtree represents a SET OF argument."""
+
+    warn: bool
+    """Whether to warn when paths are factored from beneath two warns."""
 
     is_group: bool
     """Whether the node reprents a GROUP binding (and so *is* multi...)."""
@@ -99,6 +126,7 @@ class ScopeTreeNode:
         self.fenced = fenced
         self.unnest_fence = False
         self.factoring_fence = False
+        self.warn = False
         self.factoring_allowlist = set()
         self.optional = optional
         self.children = []
@@ -155,7 +183,7 @@ class ScopeTreeNode:
             name = self.path_id.pformat_internal(debug=debug)
         return f'{name}{" [OPT]" if self.optional else ""}'
 
-    def debugname(self, fuller: bool=False) -> str:
+    def debugname(self, fuller: bool = False) -> str:
         parts = [f'{self._name(debug=fuller)}']
         if self.unique_id:
             parts.append(f'uid:{self.unique_id}')
@@ -167,7 +195,8 @@ class ScopeTreeNode:
             parts.append('no-factor')
         if self.is_group:
             parts.append('group')
-        parts.append(f'0x{id(self):0x}')
+        if self.warn:
+            parts.append('warn')
         return ' '.join(parts)
 
     @property
@@ -176,6 +205,17 @@ class ScopeTreeNode:
             unnest_fence=self.unnest_fence,
             factoring_fence=self.factoring_fence,
         )
+
+    def fence_info_ex(
+        self, path_id: pathid.PathId, namespaces: AbstractSet[str]
+    ) -> FenceInfo:
+        finfo = self.fence_info
+        if any(
+            _paths_equal(path_id, wl, namespaces)
+            for wl in self.factoring_allowlist
+        ):
+            finfo = finfo._replace(factoring_fence=False)
+        return finfo
 
     @property
     def ancestors(self) -> Iterator[ScopeTreeNode]:
@@ -194,8 +234,9 @@ class ScopeTreeNode:
             node = node.parent
 
     @property
-    def ancestors_and_namespaces(self) \
-            -> Iterator[Tuple[ScopeTreeNode, FrozenSet[pathid.Namespace]]]:
+    def ancestors_and_namespaces(
+        self,
+    ) -> Iterator[Tuple[ScopeTreeNode, FrozenSet[pathid.Namespace]]]:
         """An iterator of node's ancestors and namespaces, including self."""
         namespaces: FrozenSet[str] = frozenset()
         node: Optional[ScopeTreeNode] = self
@@ -367,8 +408,9 @@ class ScopeTreeNode:
         for pd in self.path_descendants:
             pd.path_id = pd.path_id.strip_namespace(ns)
 
-    def attach_child(self, node: ScopeTreeNode,
-                     context: Optional[pctx.ParserContext]=None) -> None:
+    def attach_child(
+        self, node: ScopeTreeNode, span: Optional[span.Span] = None
+    ) -> None:
         """Attach a child node to this node.
 
         This is a low-level operation, no tree validation is
@@ -379,7 +421,7 @@ class ScopeTreeNode:
                 if child.path_id == node.path_id:
                     raise errors.InvalidReferenceError(
                         f'{node.path_id} is already present in {self!r}',
-                        context=context,
+                        span=span,
                     )
 
         if node.unique_id is not None:
@@ -405,28 +447,22 @@ class ScopeTreeNode:
         self,
         path_id: pathid.PathId,
         *,
-        flatten_intersection: bool=False,
         optional: bool=False,
-        context: Optional[pctx.ParserContext],
+        span: Optional[span.Span],
+        ctx: WarningContext,
     ) -> None:
         """Attach a scope subtree representing *path_id*."""
 
         subtree = parent = ScopeTreeNode(fenced=True)
-        is_lprop = flatten_intersection
-
-        for prefix in reversed(list(path_id.iter_prefixes(include_ptr=True))):
-            if prefix.is_ptr_path():
-                is_lprop = True
-                continue
-
+        is_lprop = False
+        lprop_base = None
+        for prefix in reversed(list(path_id.iter_prefixes())):
             new_child = ScopeTreeNode(path_id=prefix,
                                       optional=optional and parent is subtree)
-            parent.attach_child(new_child)
 
-            # If the path is a link property, or a tuple
-            # indirection, then its prefix is added at
-            # the *same* scope level, otherwise, the prefix
-            # is nested.
+            # Normally the prefix is nested, except that tuple
+            # indirection prefixes and the *object* prefixes of link
+            # properties are are at the same level.
             #
             # For example, Foo.bar.baz, where Foo is an object type,
             # forms this scope shape:
@@ -439,30 +475,61 @@ class ScopeTreeNode:
             #   <tuple>.bar
             #   <tuple>.bar.baz
             #
-            # This is because both link properties and tuples are
-            # *always* singletons, and so there is no semantic ambiguity
-            # as to the cardinality of the path prefix in different
-            # contexts.
+            # And Foo.bar[is Typ]@baz results in:
+            #   Foo.bar[is Typ]@baz
+            #    |-Foo.bar[is Typ]
+            #       |-Foo.bar
+            #   Foo
             #
-            # We could include other cases with invariant cardinality here,
-            # like type intersection, but we want to preserve the prefix
-            # visibility information for the sake of possible optimizations.
-            if (
-                not (is_lprop or prefix.is_linkprop_path())
-                and not prefix.is_tuple_indirection_path()
-            ):
+            # For tuples, this is permissable because their fields are always
+            # singletons.
+            # FIXME: I think that it should not be *necessary* for tuples,
+            # but test_edgeql_volatility_select_tuples_* fail if it is changed,
+            # I think for incidental reasons.
+            #
+            # For link properties, this is necessary because referring
+            # to a link property at the end of a path suppresses
+            # deduplication of the link, which is realized by forcing
+            # the link source to be visible. We avoid making the rest of
+            # the path visible, to preserve prefix visibility information
+            # for certain optimizations. (Foo.bar[is Typ] can be compiled
+            # such that it joins directly on Typ (instead of on Bar first),
+            # but *only* if Foo.bar isn't visible without the type intersection.
+            if prefix.is_linkprop_path():
+                assert lprop_base is None
+                # If we just saw a linkprop, track where, since we'll
+                # need to come back to this level in the tree once we
+                # reach the "object prefix" of it.
+                lprop_base = parent
+                is_lprop = True
+            elif is_lprop:
+                # Skip through type intersections (i.e [IS Foo]) until
+                # we actually get to the link.
+                if not prefix.is_type_intersection_path():
+                    is_lprop = False
+            else:
+                # If we've reached the "object prefix" of a path
+                # referencing a linkprop, pop back up to the level the
+                # linkprop was attached to.
+                if lprop_base is not None:
+                    parent = lprop_base
+                    lprop_base = None
+
+            parent.attach_child(new_child)
+            if not prefix.is_tuple_indirection_path():
                 parent = new_child
 
-            # Skip through type intersections (i.e [IS Foo]) until
-            # we actually get to the link.
-            if not prefix.is_type_intersection_path():
-                is_lprop = False
+        self.attach_subtree(subtree, span=span, ctx=ctx)
 
-        self.attach_subtree(subtree, context=context)
-
-    def attach_subtree(self, node: ScopeTreeNode,
-                       was_fenced: bool=False,
-                       context: Optional[pctx.ParserContext]=None) -> None:
+    def attach_subtree(
+        self,
+        node: ScopeTreeNode,
+        was_fenced: bool = False,
+        span: Optional[span.Span] = None,
+        fusing: bool = False,
+        *,
+        ctx: WarningContext,
+    ) -> None:
         """Attach a subtree to this node.
 
         *node* is expected to be a balanced scope tree and may be modified
@@ -483,43 +550,7 @@ class ScopeTreeNode:
                 continue
 
             path_id = descendant.path_id.strip_namespace(dns)
-            visible, visible_finfo, vns = self.find_visible_ex(path_id)
-
-            if visible is not None:
-                desc_optional = (
-                    descendant.is_optional_upto(node.parent)
-                    or self.is_optional_upto(visible.parent)
-                )
-
-                if visible_finfo is not None and visible_finfo.factoring_fence:
-                    # This node is already present in the surrounding
-                    # scope and cannot be factored out, such as
-                    # a reference to a correlated set inside a DML
-                    # statement.
-                    raise errors.InvalidReferenceError(
-                        f'cannot reference correlated set '
-                        f'{path_id.pformat()!r} here',
-                        context=context,
-                    )
-
-                # This path is already present in the tree, discard,
-                # but merge its OPTIONAL status, if any.
-
-                desc_fenced = (
-                    descendant.fence is not node.fence
-                    or was_fenced
-                    or visible.fence not in {self, self.parent_fence}
-                )
-                descendant.remove()
-                descendant.optional = desc_optional
-                descendant.strip_path_namespace(dns | vns)
-                visible.fuse_subtree(
-                    descendant,
-                    self_fenced=False,
-                    node_fenced=desc_fenced,
-                    context=context)
-
-            elif descendant.parent_fence is node:
+            if descendant.parent_fence is node:
                 # Unfenced path.
 
                 # Search for occurences elsewhere in the tree that
@@ -542,10 +573,12 @@ class ScopeTreeNode:
                     if desc_optional:
                         descendant.mark_as_optional()
 
+                moved = False
                 for factorable in factorable_nodes:
                     (
                         existing,
                         factor_point,
+                        current_ns,
                         existing_ns,
                         existing_finfo,
                         unnest_fence,
@@ -554,31 +587,79 @@ class ScopeTreeNode:
 
                     self._check_factoring_errors(
                         path_id, descendant, factor_point, existing,
-                        unnest_fence, existing_finfo, context,
+                        unnest_fence, existing_finfo, span,
                     )
 
-                    existing_fenced = existing.parent_fence is not factor_point
+                    existing_fenced = existing.parent_fence is not None and (
+                        factor_point in existing.parent_fence.strict_ancestors
+                    )
                     if existing.is_optional_upto(factor_point):
                         existing.mark_as_optional()
 
-                    existing.remove()
-                    current.remove()
+                    current_warn = (
+                        current.is_warn_upto(factor_point)
+                        or (not moved and self.is_warn_upto(factor_point))
+                    )
+                    existing_warn = existing.is_warn_upto(factor_point)
+                    if current_warn and existing_warn:
+                        # Allow factoring single pointers when the src
+                        # is visible.
+                        #
+                        # TODO: If we want this to work on computeds,
+                        # we need to we need to register the problem
+                        # somewhere and check their cardinality at the
+                        # end.
+                        if (
+                            (src := path_id.src_path())
+                            and self.is_visible(src)
+                            and (
+                                dir := not_none(path_id.rptr()).dir_cardinality(
+                                    not_none(path_id.rptr_dir()))
+                            )
+                            and dir.is_single()
+                        ):
+                            pass
+                        else:
+                            ex = errors.DeprecatedScopingError(
+                                f'attempting to factor out '
+                                f'{path_id.pformat()!r} here',
+                                span=span,
+                            )
+                            ctx.log_warning(ex)
+                    if existing_warn:
+                        existing.warn = True
 
                     # Strip the namespaces of everything in the lifted nodes
                     # based on what they have been lifted through.
                     existing.strip_path_namespace(existing_ns)
-                    current.strip_path_namespace(existing_ns)
+                    current.strip_path_namespace(current_ns)
 
-                    factor_point.attach_child(existing)
+                    current.remove()
+                    if (
+                        factor_point is not existing.parent
+                        and factor_point is not existing
+                    ):
+                        existing.remove()
+                        factor_point.attach_child(existing)
 
                     # Discard the node from the subtree being attached.
                     existing.fuse_subtree(
                         current,
                         self_fenced=existing_fenced,
                         node_fenced=node_fenced,
-                        context=context)
+                        span=span,
+                        ctx=ctx,
+                    )
 
                     current = existing
+                    moved = True
+
+                    # HACK: If we are being called from fuse_subtree,
+                    # skip all but the first. This is because we don't
+                    # want to merge any children before the parent
+                    # fully finishes all of its factoring.
+                    if fusing:
+                        break
 
         for child in tuple(node.children):
             # Attach whatever is remaining in the subtree.
@@ -597,7 +678,7 @@ class ScopeTreeNode:
         existing: ScopeTreeNodeWithPathId,
         unnest_fence: bool,
         existing_finfo: FenceInfo,
-        context: Optional[pctx.ParserContext],
+        span: Optional[span.Span],
     ) -> None:
         if existing_finfo.factoring_fence:
             # This node is already present in the surrounding
@@ -607,7 +688,7 @@ class ScopeTreeNode:
             raise errors.InvalidReferenceError(
                 f'cannot reference correlated set '
                 f'{path_id.pformat()!r} here',
-                context=context,
+                span=span,
             )
 
         if (
@@ -620,14 +701,10 @@ class ScopeTreeNode:
                 ) is None
             )
             and (
-                not path_id.is_type_intersection_path()
-                or (
-                    (src_path := path_id.src_path())
-                    and src_path is not None
-                    and not self.is_visible(src_path)
-                )
+                not (src_path := path_id.src_path())
+                or not self.is_visible(src_path)
             )
-            and not existing._node_paths_are_props()
+            and not existing._node_paths_are_not_links()
         ):
             path_ancestor = descendant.path_ancestor
             if path_ancestor is not None:
@@ -651,16 +728,15 @@ class ScopeTreeNode:
                 f'{imp}reference to {offending_id} '
                 f'changes the interpretation of {existing_id} '
                 f'elsewhere in the query',
-                context=context,
+                span=span,
             )
 
-    def _node_paths_are_props(self) -> bool:
+    def _node_paths_are_not_links(self) -> bool:
         """
-        Check if all the pointers a path might be hoisted past are properties
+        Check if all the pointers a path might be hoisted past are not links
 
         If the node is a path_id node, return true if the rptrs on
-        all of the chain of parent nodes with path_ids are properties
-        (not links).
+        all of the chain of parent nodes with path_ids are not links.
 
         This is in support of allowing queries like
           select Card.element filter Card.name = 'Imp'
@@ -671,7 +747,10 @@ class ScopeTreeNode:
 
         node: ScopeTreeNode | None = self
         while node and node.path_id:
-            if node.path_id.rptr() and node.path_id.is_objtype_path():
+            if (
+                isinstance(node.path_id.rptr(), irast.PointerRef)
+                and node.path_id.is_objtype_path()
+            ):
                 return False
             node = node.parent
         return True
@@ -681,7 +760,9 @@ class ScopeTreeNode:
         node: ScopeTreeNode,
         self_fenced: bool=False,
         node_fenced: bool=False,
-        context: Optional[pctx.ParserContext]=None,
+        span: Optional[span.Span]=None,
+        *,
+        ctx: WarningContext,
     ) -> None:
         node.remove()
 
@@ -698,7 +779,9 @@ class ScopeTreeNode:
         else:
             subtree = node
 
-        self.attach_subtree(subtree, was_fenced=self_fenced, context=context)
+        self.attach_subtree(
+            subtree, was_fenced=self_fenced, span=span, fusing=True, ctx=ctx
+        )
 
     def remove_subtree(self, node: ScopeTreeNode) -> None:
         """Remove the given subtree from this node."""
@@ -708,7 +791,8 @@ class ScopeTreeNode:
         node._set_parent(None)
 
     def remove_descendants(
-            self, path_id: pathid.PathId, new: ScopeTreeNode) -> None:
+        self, path_id: pathid.PathId, new: ScopeTreeNode
+    ) -> None:
         """Remove all descendant nodes matching *path_id*."""
 
         matching = set()
@@ -784,14 +868,13 @@ class ScopeTreeNode:
         allow_group: bool=False,
     ) -> Tuple[
         Optional[ScopeTreeNode],
-        Optional[FenceInfo],
+        FenceInfo,
         AbstractSet[pathid.Namespace],
     ]:
         """Find the visible node with the given *path_id*."""
         namespaces: Set[pathid.Namespace] = set()
-        finfo = None
         found = None
-
+        nodes: List[ScopeTreeNode] = []
         for node, ans in self.ancestors_and_namespaces:
             if (node.path_id is not None
                     and _paths_equal(node.path_id, path_id, namespaces)):
@@ -810,33 +893,25 @@ class ScopeTreeNode:
             namespaces |= ans
 
             if node is not self:
-                ans_finfo = node.fence_info
-                if any(
-                    _paths_equal(path_id, wl, namespaces)
-                    for wl in node.factoring_allowlist
-                ):
-                    ans_finfo = FenceInfo(
-                        unnest_fence=ans_finfo.unnest_fence,
-                        factoring_fence=False,
-                    )
+                nodes.append(node)
 
-                if finfo is None:
-                    finfo = ans_finfo
-                else:
-                    finfo = finfo | ans_finfo
+        finfo = FenceInfo(False, False)
+        for node in nodes:
+            finfo |= node.fence_info_ex(path_id, namespaces)
 
         if found and found.is_group and not allow_group:
             found = None
         return found, finfo, namespaces
 
     def find_visible(
-        self, path_id: pathid.PathId, *, allow_group: bool=False
+        self, path_id: pathid.PathId, *, allow_group: bool = False
     ) -> Optional[ScopeTreeNode]:
         node, _, _ = self.find_visible_ex(path_id, allow_group=allow_group)
         return node
 
     def is_visible(
-            self, path_id: pathid.PathId, *, allow_group: bool=False) -> bool:
+        self, path_id: pathid.PathId, *, allow_group: bool = False
+    ) -> bool:
         return self.find_visible(path_id, allow_group=allow_group) is not None
 
     def is_any_prefix_visible(self, path_id: pathid.PathId) -> bool:
@@ -902,10 +977,7 @@ class ScopeTreeNode:
 
         return matched
 
-    def find_descendant_and_ns(
-        self,
-        path_id: pathid.PathId
-    ) -> Tuple[
+    def find_descendant_and_ns(self, path_id: pathid.PathId) -> Tuple[
         Optional[ScopeTreeNode],
         AbstractSet[pathid.Namespace],
         Optional[FenceInfo],
@@ -925,6 +997,14 @@ class ScopeTreeNode:
             node = node.parent
         return False
 
+    def is_warn_upto(self, ancestor: Optional[ScopeTreeNode]) -> bool:
+        node: Optional[ScopeTreeNode] = self
+        while node and node is not ancestor:
+            if node.warn:
+                return True
+            node = node.parent
+        return False
+
     def find_factorable_nodes(
         self,
         path_id: pathid.PathId,
@@ -932,6 +1012,7 @@ class ScopeTreeNode:
         Tuple[
             ScopeTreeNodeWithPathId,
             ScopeTreeNode,
+            AbstractSet[pathid.Namespace],
             AbstractSet[pathid.Namespace],
             FenceInfo,
             bool,
@@ -954,10 +1035,11 @@ class ScopeTreeNode:
         We find all such factorable nodes and return them sorted by
         factoring point, from closest to furthest up.
         """
-        namespaces: Set[str] = set()
+        namespaces: AbstractSet[str] = frozenset()
         unnest_fence_seen = False
         fence_seen = False
         points = []
+        up_finfo = FenceInfo(False, False)
 
         # Track the last seen node so that we can skip it while looking
         # for descendants, to avoid performance pathologies, but also
@@ -975,18 +1057,21 @@ class ScopeTreeNode:
                 node.descendants_and_namespaces_ex(
                     unfenced_only=fence_seen, skip=last)
             ):
-                cns: AbstractSet[str] = namespaces | dns
+                cns = namespaces | dns
                 if (has_path_id(descendant)
                         and not descendant.is_group
                         and _paths_equal(descendant.path_id, path_id, cns)):
                     points.append((
-                        descendant, node, cns, finfo,
+                        descendant, node, namespaces, dns, finfo | up_finfo,
                         unnest_fence_seen, fence_seen,
                     ))
 
             namespaces |= ans
             unnest_fence_seen |= node.unnest_fence
             fence_seen |= node.fenced
+
+            if node is not self:
+                up_finfo |= node.fence_info_ex(path_id, namespaces)
 
             last = node
 
@@ -1033,7 +1118,7 @@ class ScopeTreeNode:
     def dump(self) -> None:
         print(self.pdebugformat())
 
-    def dump_full(self, others: Collection[ScopeTreeNode]=()) -> None:
+    def dump_full(self, others: Collection[ScopeTreeNode] = ()) -> None:
         """Do a debug dump of the root but hilight the current node."""
         styles = {}
         if term.supports_colors(sys.stdout.fileno()):
@@ -1043,6 +1128,7 @@ class ScopeTreeNode:
         print(self.root.pdebugformat(styles=styles))
 
     def _set_parent(self, parent: Optional[ScopeTreeNode]) -> None:
+        assert self is not parent
         current_parent = self.parent
         if parent is current_parent:
             return
@@ -1063,8 +1149,11 @@ class ScopeTreeNodeWithPathId(ScopeTreeNode):
     path_id: pathid.PathId
 
 
-def _paths_equal(path_id_1: pathid.PathId, path_id_2: pathid.PathId,
-                 namespaces: AbstractSet[str]) -> bool:
+def _paths_equal(
+    path_id_1: pathid.PathId,
+    path_id_2: pathid.PathId,
+    namespaces: AbstractSet[str],
+) -> bool:
     if namespaces:
         path_id_1 = path_id_1.strip_namespace(namespaces)
         path_id_2 = path_id_2.strip_namespace(namespaces)

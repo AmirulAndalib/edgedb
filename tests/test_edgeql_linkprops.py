@@ -259,6 +259,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_basic_03(self):
         await self.assert_query_result(
             r'''
@@ -347,7 +348,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
                     cost
                 }
                 FILTER
-                    .cost = .<deck[IS User]@count
+                    .cost IN .<deck[IS User]@count
                 ORDER BY .name;
             ''',
             [
@@ -415,6 +416,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_cross_01(self):
         await self.assert_query_result(
             r'''
@@ -431,6 +433,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_cross_02(self):
         await self.assert_query_result(
             r'''
@@ -459,6 +462,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_cross_03(self):
         await self.assert_query_result(
             r'''
@@ -514,6 +518,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_implication_01(self):
         await self.assert_query_result(
             r'''
@@ -593,6 +598,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_implication_02(self):
         await self.assert_query_result(
             r'''
@@ -614,6 +620,7 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_props_implication_03(self):
         await self.assert_query_result(
             r'''
@@ -708,6 +715,13 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
                 SELECT DISTINCT User.deck@count;
             ''',
             {1, 2, 3, 4},
+        )
+
+        await self.assert_query_result(
+            r'''
+                SELECT User.deck@count FILTER User.deck.element = 'Fire'
+            ''',
+            tb.bag([1, 2, 2]),
         )
 
         await self.assert_query_result(
@@ -1300,6 +1314,27 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ]
         )
 
+    @test.xerror('Stack overflow!')
+    async def test_edgeql_props_back_09(self):
+        await self.assert_query_result(
+            r'''
+            select assert_exists((
+                select Card { name, z := .<deck[IS User] {
+                  name, @count := @count }}
+                filter .name = 'Dragon'
+            ));
+            ''',
+            [
+                {
+                    "name": "Dragon",
+                    "z": tb.bag([
+                        {"x": 2, "name": "Alice"},
+                        {"x": 1, "name": "Dave"},
+                    ])
+                }
+            ]
+        )
+
     async def test_edgeql_props_schema_back_00(self):
         with self.assertRaisesRegex(
                 edgedb.QueryError,
@@ -1575,3 +1610,30 @@ class TestEdgeQLLinkproperties(tb.QueryTestCase):
             ''',
             [{}],
         )
+
+    async def test_edgeql_props_target_06(self):
+        # This should not work
+        with self.assertRaisesRegex(
+            edgedb.QueryError,
+            r"@target may only be used in index and constraint definitions"
+        ):
+            await self.con.query(
+                r'''
+                SELECT schema::ObjectType {
+                  name,
+                  is_abstract,
+                  bases: {
+                    name,
+                  } ORDER BY @index ASC,
+                  pointers: {
+                    cardinality,
+                    required,
+                    name,
+                    target: {
+                      name,
+                    },
+                    kind := 'link' IF @target IS schema::Link ELSE 'property'
+                  },
+                } FILTER NOT .is_compound_type;
+                '''
+            )

@@ -29,13 +29,14 @@ from . import ddl
 
 
 class View(base.DBObject):
-    def __init__(self, name, query):
+    def __init__(self, name, query, materialized=False):
         super().__init__()
         self.name = name
         self.query = query
+        self.materialized = materialized
 
     def get_type(self) -> str:
-        return "VIEW"
+        return "VIEW" if not self.materialized else "MATERIALIZED VIEW"
 
     def get_id(self):
         return qn(*self.name)
@@ -55,32 +56,55 @@ class CreateView(ddl.SchemaObjectOperation):
         self.view = view
         self.or_replace = or_replace
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         query = textwrap.indent(textwrap.dedent(self.view.query), '    ')
         return (
             f'CREATE {"OR REPLACE" if self.or_replace else ""}'
-            f' VIEW {qn(*self.view.name)} AS\n{query}'
+            f' {self.view.get_type()} {qn(*self.view.name)} AS\n{query}'
         )
 
 
 class DropView(ddl.SchemaObjectOperation):
 
-    def code(self, block: base.PLBlock) -> str:
-        return f'DROP VIEW {qn(*self.name)}'
+    def __init__(
+        self,
+        name,
+        *,
+        conditional=False,
+        conditions=None,
+        neg_conditions=None,
+        materialized=False,
+    ):
+        super().__init__(
+            name,
+            conditions=conditions,
+            neg_conditions=neg_conditions,
+        )
+        self.conditional = conditional
+        self.materialized = materialized
+
+    def code(self) -> str:
+        mat = 'MATERIALIZED ' if self.materialized else ''
+        if self.conditional:
+            return f'DROP {mat}VIEW IF EXISTS {qn(*self.name)}'
+        else:
+            return f'DROP {mat}VIEW {qn(*self.name)}'
 
 
 class ViewExists(base.Condition):
 
-    def __init__(self, name):
+    def __init__(self, name, materialized=False):
         self.name = name
+        self.materialized = materialized
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
+        mat = 'mat' if self.materialized else ''
         return textwrap.dedent(f'''\
             SELECT
-                viewname
+                {mat}viewname
             FROM
-                pg_catalog.pg_views
+                pg_catalog.pg_{mat}views
             WHERE
                 schemaname = {ql(self.name[0])}
-                AND viewname = {ql(self.name[1])}
+                AND {mat}viewname = {ql(self.name[1])}
         ''')

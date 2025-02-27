@@ -17,7 +17,7 @@
 #
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Tuple, Sequence, Dict, List
 
 import re
 import hashlib
@@ -30,11 +30,31 @@ from edb import errors
 TRAILING_WS_IN_CONTINUATION = re.compile(r'\\ \s+\n')
 
 
+def deserialize(serialized: bytes, text: str) -> Source:
+    match serialized[0]:
+        case 0:
+            tokens = ql_parser.unpack(serialized)
+            assert isinstance(tokens, list)
+            return Source(text, tokens, serialized)
+        case 1:
+            entry = ql_parser.unpack(serialized)
+            assert isinstance(entry, ql_parser.Entry)
+            return NormalizedSource(entry, text, serialized)
+
+    raise ValueError(f"Invalid type/version byte: {serialized[0]}")
+
+
 class Source:
-    def __init__(self, text: str, tokens: List[ql_parser.Token]) -> None:
-        self._cache_key = hashlib.blake2b(text.encode('utf-8')).digest()
+    def __init__(
+        self,
+        text: str,
+        tokens: List[ql_parser.OpaqueToken],
+        serialized: bytes,
+    ) -> None:
+        self._cache_key = hashlib.blake2b(serialized).digest()
         self._text = text
         self._tokens = tokens
+        self._serialized = serialized
 
     def text(self) -> str:
         return self._text
@@ -45,7 +65,7 @@ class Source:
     def variables(self) -> Dict[str, Any]:
         return {}
 
-    def tokens(self) -> List[ql_parser.Token]:
+    def tokens(self) -> List[ql_parser.OpaqueToken]:
         return self._tokens
 
     def first_extra(self) -> Optional[int]:
@@ -57,23 +77,45 @@ class Source:
     def extra_blobs(self) -> Sequence[bytes]:
         return ()
 
-    @classmethod
-    def from_string(cls, text: str) -> Source:
-        return cls(text=text, tokens=_tokenize(text))
+    def extra_formatted_as_text(self) -> bool:
+        return False
+
+    def extra_type_oids(self) -> Sequence[int]:
+        return ()
+
+    def serialize(self) -> bytes:
+        return self._serialized
+
+    @staticmethod
+    def from_string(text: str) -> Source:
+        result = _tokenize(text)
+        assert isinstance(result.out, list)
+        return Source(
+            text=text, tokens=result.out, serialized=result.pack()
+        )
 
     def __repr__(self):
         return f'<edgeql.Source text={self._text!r}>'
 
+    def denormalized(self) -> Source:
+        return self
+
 
 class NormalizedSource(Source):
-    def __init__(self, normalized: ql_parser.Entry, text: str) -> None:
+    def __init__(
+        self,
+        normalized: ql_parser.Entry,
+        text: str,
+        serialized: bytes,
+    ) -> None:
         self._text = text
-        self._cache_key = normalized.key()
-        self._tokens = normalized.tokens()
-        self._variables = normalized.variables()
-        self._first_extra = normalized.first_extra()
-        self._extra_counts = normalized.extra_counts()
-        self._extra_blobs = normalized.extra_blobs()
+        self._cache_key = normalized.key
+        self._tokens = normalized.tokens
+        self._variables = normalized.get_variables()
+        self._first_extra = normalized.first_extra
+        self._extra_counts = normalized.extra_counts
+        self._extra_blobs = normalized.extra_blobs
+        self._serialized = serialized
 
     def text(self) -> str:
         return self._text
@@ -84,7 +126,7 @@ class NormalizedSource(Source):
     def variables(self) -> Dict[str, Any]:
         return self._variables
 
-    def tokens(self) -> List[ql_parser.Token]:
+    def tokens(self) -> List[ql_parser.OpaqueToken]:
         return self._tokens
 
     def first_extra(self) -> Optional[int]:
@@ -96,14 +138,18 @@ class NormalizedSource(Source):
     def extra_blobs(self) -> Sequence[bytes]:
         return self._extra_blobs
 
-    @classmethod
-    def from_string(cls, text: str) -> NormalizedSource:
-        return cls(_normalize(text), text)
+    @staticmethod
+    def from_string(text: str) -> NormalizedSource:
+        normalized = _normalize(text)
+        return NormalizedSource(normalized, text, normalized.pack())
+
+    def denormalized(self) -> Source:
+        return Source.from_string(self._text)
 
 
 def inflate_span(
     source: str, span: Tuple[int, Optional[int]]
-) -> Tuple[ql_parser.SourcePoint, ql_parser.SourcePoint]:
+) -> Tuple[ql_parser.SourcePoint, Optional[ql_parser.SourcePoint]]:
     (start, end) = span
     source_bytes = source.encode('utf-8')
 
@@ -129,12 +175,12 @@ def inflate_position(
     )
 
 
-def _tokenize(eql: str) -> List[ql_parser.Token]:
+def _tokenize(eql: str) -> ql_parser.ParserResult:
     result = ql_parser.tokenize(eql)
 
-    if len(result.errors()) > 0:
+    if len(result.errors) > 0:
         # TODO: emit multiple errors
-        error = result.errors()[0]
+        error = result.errors[0]
 
         message, span, hint, details = error
         position = inflate_position(eql, span)
@@ -144,7 +190,7 @@ def _tokenize(eql: str) -> List[ql_parser.Token]:
             message, position=position, hint=hint, details=details
         )
 
-    return result.out()
+    return result
 
 
 def _normalize(eql: str) -> ql_parser.Entry:

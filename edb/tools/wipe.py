@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Tuple, List, TYPE_CHECKING
 
 import asyncio
 import json
@@ -35,7 +35,6 @@ from edb.tools.edb import edbcommands
 from edb.server import compiler as edbcompiler
 from edb.server import defines as edbdef
 from edb.server import pgcluster
-from edb.server import pgconnparams
 
 from edb.pgsql import common as pgcommon
 from edb.pgsql.common import quote_ident as qi
@@ -55,7 +54,7 @@ class AbsPath(click.Path):
 @click.option(
     '--backend-dsn',
     type=str,
-    help='DSN of the remote Postgres instance to wipe EdgeDB from')
+    help='DSN of the remote Postgres instance to wipe Gel from')
 @click.option(
     '-D',
     '--data-dir',
@@ -65,7 +64,7 @@ class AbsPath(click.Path):
     '--tenant-id',
     type=str,
     multiple=True,
-    help='The tenant ID of an EdgeDB server to wipe.  May be specified'
+    help='The tenant ID of an Gel server to wipe.  May be specified'
          ' multiple times.  If not specified, all tenants are wiped.')
 @click.option(
     '-y',
@@ -118,11 +117,9 @@ async def do_wipe(
             data_dir,
             tenant_id='<unknown>',
         )
-        cluster.set_connection_params(
-            pgconnparams.ConnectionParameters(
-                user='postgres',
-                database='template1',
-            ),
+        cluster.update_connection_params(
+            user='postgres',
+            database='template1',
         )
     else:
         raise click.UsageError(
@@ -130,7 +127,7 @@ async def do_wipe(
         )
 
     if not yes and not dry_run and not list_tenants and not click.confirm(
-            'This will DELETE all EdgeDB data from the target '
+            'This will DELETE all Gel data from the target '
             'PostgreSQL instance.  ARE YOU SURE?'):
         click.echo('OK. Not proceeding.')
         return
@@ -146,7 +143,7 @@ async def do_wipe(
             cluster_started_by_us = True
 
     try:
-        conn = await cluster.connect()
+        conn = await cluster.connect(source_description="Wipe")
         if tenant_id:
             tenants = list(tenant_id)
         else:
@@ -197,7 +194,10 @@ async def wipe_tenant(
     )
 
     try:
-        tpl_conn = await cluster.connect(database=tpl_db)
+        tpl_conn = await cluster.connect(
+            database=tpl_db,
+            source_description="wipe_tenant",
+        )
     except pgcon.BackendCatalogNameError:
         click.secho(
             f'Instance tenant {tenant!r} does not have the '
@@ -308,7 +308,7 @@ async def _get_dbs_and_roles(
 
     _, get_databases_sql = edbcompiler.compile_edgeql_script(
         compilerctx,
-        'SELECT sys::Database.name',
+        'SELECT sys::Branch.name',
     )
 
     databases = list(sorted(

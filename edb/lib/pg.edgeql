@@ -17,43 +17,76 @@
 #
 
 
-CREATE MODULE pg;
+CREATE MODULE std::pg;
 
-CREATE ABSTRACT INDEX pg::hash {
+CREATE ABSTRACT INDEX std::pg::hash {
     CREATE ANNOTATION std::description :=
         'Index based on a 32-bit hash derived from the indexed value.';
     SET code := 'hash ((__col__))';
 };
 
-CREATE ABSTRACT INDEX pg::btree {
+create index match for anytype using std::pg::hash;
+
+CREATE ABSTRACT INDEX std::pg::btree {
     CREATE ANNOTATION std::description :=
         'B-tree index can be used to retrieve data in sorted order.';
     SET code := 'btree ((__col__) NULLS FIRST)';
 };
 
-CREATE ABSTRACT INDEX pg::gin {
+create index match for anytype using std::pg::btree;
+
+CREATE ABSTRACT INDEX std::pg::gin {
     CREATE ANNOTATION std::description :=
         'GIN is an "inverted index" appropriate for data values that \
         contain multiple elements, such as arrays and JSON.';
     SET code := 'gin ((__col__))';
 };
 
-CREATE ABSTRACT INDEX pg::gist {
+create index match for array<anytype> using std::pg::gin;
+create index match for std::json using std::pg::gin;
+
+CREATE ABSTRACT INDEX std::pg::gist {
     CREATE ANNOTATION std::description :=
         'GIST index can be used to optimize searches involving ranges.';
     SET code := 'gist ((__col__))';
 };
 
-CREATE ABSTRACT INDEX pg::spgist {
+create index match for array<anytype> using std::pg::gist;
+create index match for range<std::anypoint> using std::pg::gist;
+create index match for multirange<std::anypoint> using std::pg::gist;
+
+CREATE ABSTRACT INDEX std::pg::spgist {
     CREATE ANNOTATION std::description :=
         'SP-GIST index can be used to optimize searches involving ranges \
         and strings.';
     SET code := 'spgist ((__col__))';
 };
 
-CREATE ABSTRACT INDEX pg::brin {
+create index match for range<std::anypoint> using std::pg::spgist;
+create index match for std::str using std::pg::spgist;
+
+CREATE ABSTRACT INDEX std::pg::brin {
     CREATE ANNOTATION std::description :=
         'BRIN (Block Range INdex) index works with summaries about the values \
         stored in consecutive physical block ranges in the database.';
     SET code := 'brin ((__col__))';
 };
+
+create index match for range<std::anypoint> using std::pg::brin;
+create index match for std::anyreal using std::pg::brin;
+create index match for std::bytes using std::pg::brin;
+create index match for std::str using std::pg::brin;
+create index match for std::uuid using std::pg::brin;
+create index match for std::datetime using std::pg::brin;
+create index match for std::duration using std::pg::brin;
+create index match for std::cal::local_datetime using std::pg::brin;
+create index match for std::cal::local_date using std::pg::brin;
+create index match for std::cal::local_time using std::pg::brin;
+create index match for std::cal::relative_duration using std::pg::brin;
+create index match for std::cal::date_duration using std::pg::brin;
+
+create scalar type std::pg::json extending std::anyscalar;
+create scalar type std::pg::timestamptz extending std::anycontiguous;
+create scalar type std::pg::timestamp extending std::anycontiguous;
+create scalar type std::pg::date extending std::anydiscrete;
+create scalar type std::pg::interval extending std::anycontiguous;

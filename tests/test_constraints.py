@@ -18,6 +18,7 @@
 
 
 import os.path
+import re
 
 import edgedb
 
@@ -408,6 +409,13 @@ class TestConstraintsSchema(tb.QueryTestCase):
             };
         """)
 
+        # Update to same values should be fine
+        await self.con.execute("""
+            UPDATE PropertyContainer SET {
+                tags := {"one", "two"}
+            };
+        """)
+
         async with self.assertRaisesRegexTx(
             edgedb.ConstraintViolationError,
             "tags violates exclusivity constraint",
@@ -427,6 +435,12 @@ class TestConstraintsSchema(tb.QueryTestCase):
                     tags := {"four", "four"}
                 };
             """)
+
+        await self.con.execute("""
+            UPDATE PropertyContainer SET {
+                tags := "one"
+            };
+        """)
 
     async def test_constraints_objects(self):
         async with self._run_and_rollback():
@@ -458,6 +472,235 @@ class TestConstraintsSchema(tb.QueryTestCase):
                         label := (SELECT Label
                                   FILTER .text = "obj_test" LIMIT 1) };
                 """)
+
+    async def test_constraints_endpoint_constraint_01(self):
+        # testing (@source, @lang) on a single link
+        # This constraint is pointless and can never fail
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label := ((insert Label) { @lang := 'xxx' })
+            };
+        """)
+
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label := ((insert Label) { @lang := 'xxx' })
+            };
+        """)
+
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label := ((select Label limit 1) { @lang := 'yyy' })
+            };
+        """)
+
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label := ((select Label limit 1) { @lang := 'xxx' })
+            };
+        """)
+
+    async def test_constraints_endpoint_constraint_02(self):
+        # testing (@source, @lang) on a multi link
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels := ((insert Label { text := "x" }) {
+                 @lang := 'x' })
+            };
+        """)
+
+        await self.con.execute("""
+            update UniqueName set {
+                translated_labels := Label {@lang := 'x' }
+            };
+        """)
+
+        # Should be fine
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels := ((insert Label { text := "y"  }) {
+                  @lang := 'x' })
+            };
+        """)
+
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels := (Label { @lang := .text })
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueName {
+                    translated_labels := (Label { @lang := 'x' })
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueNameInherited {
+                    translated_labels := (Label { @lang := 'x' })
+                };
+            """)
+
+    async def test_constraints_endpoint_constraint_03(self):
+        # testing (@target, @lang) on a single link
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label_tgt := ((insert Label { text := "x" }) {
+                 @lang := 'x' })
+            };
+        """)
+
+        # Same @lang different @target
+        await self.con.execute("""
+            insert UniqueName {
+                translated_label_tgt := ((insert Label { text := "y" }) {
+                  @lang := 'x' })
+            };
+        """)
+
+        # Same @target different @lang
+        await self.con.execute("""
+            insert UniqueNameInherited {
+                translated_label_tgt := (
+                  select Label { @lang := 'y' } filter .text = 'x' limit 1)
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueName {
+                    translated_label_tgt := (
+                      select Label { @lang := 'x' } filter .text = 'x' limit 1)
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueNameInherited {
+                    translated_label_tgt := (
+                      select Label { @lang := 'x' } filter .text = 'x' limit 1)
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                update UniqueName
+                filter .translated_label_tgt.text = 'x'
+                set { translated_label_tgt :=
+                    .translated_label_tgt { @lang := '!' }
+                }
+            """)
+
+        await self.con.execute("""
+            update UniqueName
+            filter .translated_label_tgt.text = 'x'
+            set { translated_label_tgt :=
+                .translated_label_tgt { @lang := @lang }
+            }
+        """)
+
+    async def test_constraints_endpoint_constraint_04(self):
+        # testing (@target, @lang) on a multi link
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels_tgt := ((insert Label { text := "x" }) {
+                 @lang := 'x' })
+            };
+        """)
+
+        # Same @lang different @target
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels_tgt := ((insert Label { text := "y" }) {
+                  @lang := 'x' })
+            };
+        """)
+
+        # Same @target different @lang
+        await self.con.execute("""
+            insert UniqueName {
+                translated_labels_tgt := (
+                  select Label { @lang := 'y' } filter .text = 'x')
+            };
+        """)
+
+        await self.con.execute("""
+            insert UniqueNameInherited {
+                translated_labels_tgt := (
+                  select Label { @lang := 'x!' })
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueName {
+                    translated_labels_tgt := (
+                      select Label { @lang := 'x' } filter .text = 'x')
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueNameInherited {
+                    translated_labels_tgt := (
+                      select Label { @lang := 'x' } filter .text = 'x')
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                insert UniqueNameInherited {
+                    translated_labels_tgt := (
+                      select Label { @lang := .text ++ '!' }
+                      filter .text = 'x')
+                };
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            'violates exclusivity constraint'
+        ):
+            await self.con.execute("""
+                update UniqueName
+                filter 'x' in .translated_labels_tgt.text
+                set { translated_labels_tgt :=
+                    .translated_labels_tgt { @lang := '!' }
+                }
+            """)
+
+        await self.con.execute("""
+            update UniqueName
+            filter 'x' in .translated_labels_tgt.text
+            set { translated_labels_tgt :=
+                .translated_labels_tgt { @lang := @lang }
+            }
+        """)
 
 
 class TestConstraintsSchemaMigration(tb.QueryTestCase):
@@ -720,7 +963,7 @@ class TestConstraintsDDL(tb.DDLTestCase):
                     ON (len(__subject__))
             {
                 SET errmessage :=
-                    '{__subject__} must be no longer than {max} characters.';
+                    '\(__subject__) must be no longer than \(max) characters.';
                 USING (__subject__ <= max);
             };
 
@@ -728,7 +971,7 @@ class TestConstraintsDDL(tb.DDLTestCase):
                     ON (len(__subject__)) EXTENDING std::max_value
             {
                 SET errmessage :=
-                    '{__subject__} must be no longer than {max} characters.';
+                    '\(__subject__) must be no longer than \(max) characters.';
             };
 
             CREATE TYPE ConstraintOnTest1 {
@@ -948,8 +1191,7 @@ class TestConstraintsDDL(tb.DDLTestCase):
         qry = r"""
             CREATE ABSTRACT CONSTRAINT mymax3(max: std::int64) {
                 SET errmessage :=
-                    '{__subject__} must be no longer ' ++
-                    'than {max} characters.';
+                    'My custom ' ++ 'message.';
                 USING (__subject__ <= max);
             };
 
@@ -965,13 +1207,18 @@ class TestConstraintsDDL(tb.DDLTestCase):
         # making sure the constraint was applied successfully
         async with self.assertRaisesRegexTx(
             edgedb.ConstraintViolationError,
-            'foo must be no longer than 3 characters.',
+            'My custom message.',
+            _details="violated constraint 'default::mymax3' on "
+            "property 'foo' of "
+            "object type 'default::ConstraintOnTest3'",
         ):
-            await self.con.execute("""
+            await self.con.execute(
+                """
                 INSERT ConstraintOnTest3 {
                     foo := 'Test'
                 };
-            """)
+                """
+            )
 
         # testing interpolation
         await self.con.execute(r"""
@@ -986,10 +1233,34 @@ class TestConstraintsDDL(tb.DDLTestCase):
         async with self.assertRaisesRegexTx(
             edgedb.ConstraintViolationError,
             '{"json": "{nope} {min} 4"}',
+            _details="violated constraint 'std::min_len_value' on "
+            "property 'email' of "
+            "object type 'default::ConstraintOnTest4_2'",
         ):
-            await self.con.execute("""
+            await self.con.execute(
+                """
                 INSERT ConstraintOnTest4_2 { email := '' };
-            """)
+                """
+            )
+
+        await self.con.execute(r"""
+            CREATE type ConstraintOnTest4_3 {
+                CREATE required property email -> str {
+                    CREATE constraint min_len_value(4) {
+                        SET errmessage := '\\(min) \\(min)';
+                    };
+                };
+            };
+        """)
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            re.escape(r'\(min) \(min)'),
+        ):
+            await self.con.execute(
+                """
+                INSERT ConstraintOnTest4_3 { email := '' };
+                """
+            )
 
     async def test_constraints_ddl_05(self):
         # Test that constraint expression returns a boolean.
@@ -1149,9 +1420,9 @@ class TestConstraintsDDL(tb.DDLTestCase):
             """)
 
         async with self.assertRaisesRegexTx(
-            edgedb.InvalidConstraintDefinitionError,
-            "cannot use aggregate functions or operators in a "
-            "non-aggregating constraint",
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::EXISTS' "
+            "in a constraint",
         ):
             await self.con.execute("""
                 ALTER TYPE ObjCnstr2 {
@@ -1160,9 +1431,9 @@ class TestConstraintsDDL(tb.DDLTestCase):
             """)
 
         async with self.assertRaisesRegexTx(
-            edgedb.InvalidConstraintDefinitionError,
-            "cannot use aggregate functions or operators in a "
-            "non-aggregating constraint",
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::EXISTS' "
+            "in a constraint",
         ):
             await self.con.execute("""
                 ALTER TYPE ObjCnstr2 {
@@ -1575,6 +1846,19 @@ class TestConstraintsDDL(tb.DDLTestCase):
                 };
             """)
 
+    async def test_constraints_ddl_error_07(self):
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            r'Constant sets not allowed in singleton mode'
+        ):
+            await self.con.execute(r"""
+                CREATE TYPE ConstraintOnTest_err_07 {
+                    CREATE PROPERTY less_than_three -> std::int64 {
+                        CREATE CONSTRAINT std::one_of({1,2,3});
+                    };
+                };
+            """)
+
     async def test_constraints_tuple(self):
         await self.con.execute(r"""
             CREATE TYPE Transaction {
@@ -1773,3 +2057,1849 @@ class TestConstraintsDDL(tb.DDLTestCase):
             edgedb.ConstraintViolationError, "Minimum allowed value for"
         ):
             await self.con.execute("insert X { y := -1 }")
+
+    async def test_constraints_abstract_object_01(self):
+        await self.con.execute(
+            """
+                create abstract type ChatBase {
+                    create multi property messages: str {
+                        create constraint exclusive;
+                    };
+                };
+
+                create type Dialog extending ChatBase;
+                create type Monolog extending ChatBase;
+                insert Dialog;
+                insert Monolog;
+            """
+        )
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            "messages violates exclusivity constraint"
+        ):
+            await self.con.execute("""
+                update ChatBase set { messages += 'hello world' };
+            """)
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            "messages violates exclusivity constraint"
+        ):
+            await self.con.execute("""
+                analyze
+                update ChatBase set { messages += 'hello world' };
+            """)
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            "messages violates exclusivity constraint"
+        ):
+            await self.con.execute("""
+                update ChatBase set { messages := 'hello world' };
+            """)
+
+    async def test_constraints_abstract_object_02(self):
+        await self.con.execute(
+            """
+                create abstract type ChatBase {
+                    create single property messages: str {
+                        create constraint exclusive;
+                    };
+                };
+
+                create type Dialog extending ChatBase;
+                create type Monolog extending ChatBase;
+                insert Dialog;
+                insert Monolog;
+            """
+        )
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            "messages violates exclusivity constraint"
+        ):
+            await self.con.execute("""
+                update ChatBase set { messages := 'hello world' };
+            """)
+
+    async def test_constraints_abstract_object_03(self):
+        # Add one where the constraint comes from a different type
+        # than the update
+        await self.con.execute(
+            """
+                create abstract type ChatBase {
+                    create single property messages: str {
+                    };
+                };
+                create abstract type ChatBase2 {
+                    create single property messages: str {
+                        create constraint exclusive;
+                    };
+                };
+
+                create type Dialog extending ChatBase, ChatBase2;
+                create type Monolog extending ChatBase, ChatBase2;
+                insert Dialog;
+                insert Monolog;
+            """
+        )
+        async with self.assertRaisesRegexTx(
+            edgedb.ConstraintViolationError,
+            "messages violates exclusivity constraint"
+        ):
+            await self.con.execute("""
+                update ChatBase set { messages := 'hello world' };
+            """)
+
+    async def test_constraints_singleton_set_ops_01(self):
+        await self.con.execute(
+            """
+            create type X {
+                create property a -> int64 {
+                    create constraint expression on (
+                        __subject__ in {1}
+                    );
+                }
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::IN' "
+            "in a constraint"
+        ):
+            await self.con.execute(
+                """
+                create type Y {
+                    create multi property a -> int64 {
+                        create constraint expression on (
+                            __subject__ in {1}
+                        );
+                    }
+                };
+            """)
+
+    async def test_constraints_singleton_set_ops_02(self):
+        await self.con.execute(
+            """
+            create type X {
+                create property a -> int64 {
+                    create constraint expression on (
+                        __subject__ not in {1}
+                    );
+                }
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::NOT IN' "
+            "in a constraint"
+        ):
+            await self.con.execute(
+                """
+                create type Y {
+                    create multi property a -> int64 {
+                        create constraint expression on (
+                            __subject__ not in {1}
+                        );
+                    }
+                };
+            """)
+
+    async def test_constraints_singleton_set_ops_03(self):
+        await self.con.execute(
+            """
+            create type X {
+                create property a -> int64 {
+                    create constraint expression on (
+                        exists(__subject__)
+                    );
+                }
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::EXISTS' "
+            "in a constraint"
+        ):
+            await self.con.execute(
+                """
+                create type Y {
+                    create multi property a -> int64 {
+                        create constraint expression on (
+                            exists(__subject__)
+                        );
+                    }
+                };
+            """)
+
+    async def test_constraints_singleton_set_ops_04(self):
+        await self.con.execute(
+            """
+            create type X {
+                create property a -> int64 {
+                    create constraint expression on (
+                        __subject__ ?? 1 = 0
+                    );
+                }
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            r"cannot use SET OF operator 'std::\?\?' "
+            r"in a constraint"
+        ):
+            await self.con.execute(
+                """
+                create type Y {
+                    create multi property a -> int64 {
+                        create constraint expression on (
+                            __subject__ ?? 1 = 0
+                        );
+                    }
+                };
+            """)
+
+    async def test_constraints_singleton_set_ops_05(self):
+        await self.con.execute(
+            """
+            create type X {
+                create property a -> tuple<bool, int64> {
+                    create constraint expression on (
+                        __subject__.1 < 0
+                        if __subject__.0 else
+                        __subject__.1 >= 0
+                    );
+                }
+            };
+        """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.UnsupportedFeatureError,
+            "cannot use SET OF operator 'std::IF' "
+            "in a constraint"
+        ):
+            await self.con.execute(
+                """
+                create type Y {
+                    create multi property a -> tuple<bool, int64> {
+                        create constraint expression on (
+                            __subject__.1 < 0
+                            if __subject__.0 else
+                            __subject__.1 >= 0
+                        );
+                    }
+                };
+            """)
+
+
+class TestConstraintsInheritance(tb.DDLTestCase):
+
+    async def _check_constraint_inheritance(
+        self,
+        constraint_groups: list[list[tuple[str, ...]]]
+    ) -> None:
+        all_constrained_entries = list(set(
+            entry
+            for group in constraint_groups
+            for entry in group
+        ))
+
+        relatives: dict[tuple[str, ...], set[str]] = {
+            entry: set()
+            for entry in all_constrained_entries
+        }
+        for group in constraint_groups:
+            for entry in group:
+                relatives[entry] = relatives[entry].union(
+                    other[0] for other in group
+                )
+
+        for entry in all_constrained_entries:
+            for other in all_constrained_entries:
+                if entry[0] == other[0]:
+                    continue
+
+                name = entry[0]
+                other_name = other[0]
+
+                if len(entry) == 2:
+                    prop = entry[1]
+
+                    if other_name in relatives[entry]:
+                        async with self.assertRaisesRegexTx(
+                            edgedb.ConstraintViolationError,
+                            f"violates exclusivity constraint"
+                        ):
+                            await self.con.execute(
+                                f"insert {name} {{"
+                                f"    {prop} := '{other_name.lower()}'"
+                                f"}};"
+                            )
+                    else:
+                        await self.con.execute(
+                            f"insert {name} {{"
+                            f"    {prop} := '{other_name.lower()}'"
+                            f"}};"
+                        )
+                        await self.con.execute(
+                            f"delete {name} filter .{prop} = ("
+                            f"    '{other_name.lower()}'"
+                            f");"
+                        )
+
+                elif len(entry) == 4:
+                    link = entry[1]
+                    link_type = entry[2]
+                    link_prop = entry[3]
+
+                    if other_name in relatives[entry]:
+                        async with self.assertRaisesRegexTx(
+                            edgedb.ConstraintViolationError,
+                            f"violates exclusivity constraint"
+                        ):
+                            await self.con.execute(
+                                f"insert {name} {{"
+                                f"    {link} := (insert {link_type}) {{"
+                                f"        @{link_prop} := ("
+                                f"            '{other_name.lower()}'"
+                                f"        )"
+                                f"    }}"
+                                f"}};"
+                            )
+                    else:
+                        await self.con.execute(
+                            f"insert {name} {{"
+                            f"    {link} := (insert {link_type}) {{"
+                            f"        @{link_prop} := ("
+                            f"            '{other_name.lower()}'"
+                            f"        )"
+                            f"    }}"
+                            f"}};"
+                        )
+                        await self.con.execute(
+                            f"delete {name} "
+                            f"filter .{link}@{link_prop} = ("
+                            f"    '{other_name.lower()}'"
+                            f");"
+                        )
+
+                else:
+                    raise NotImplementedError()
+
+    async def _apply_schema_inheritance_single_object(self):
+        # - single inheritance
+        #   - type constraint
+        await self.con.execute("""
+            create type AAA {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type BBB extending AAA;
+            create type XXX extending AAA;
+            insert AAA {name := 'aaa'};
+            insert BBB {name := 'bbb'};
+            insert XXX {name := 'xxx'};
+        """)
+
+    async def test_constraints_inheritance_single_object_01(self):
+        await self._apply_schema_inheritance_single_object()
+
+        # Add descendant
+        await self.con.execute("""
+            create type CCC extending XXX;
+            insert CCC {name := 'ccc'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name'), ('XXX', 'name'), ('CCC', 'name')]
+        ])
+
+    async def test_constraints_inheritance_single_object_02(self):
+        await self._apply_schema_inheritance_single_object()
+
+        # Add base
+        await self.con.execute("""
+            create type CCC {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type DDD extending CCC;
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending CCC;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name'), ('XXX', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_single_object_03(self):
+        await self._apply_schema_inheritance_single_object()
+
+        # Change base
+        await self.con.execute("""
+            create type CCC {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type DDD extending CCC;
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+                extending CCC;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_single_object_04(self):
+        await self._apply_schema_inheritance_single_object()
+
+        # Remove base
+        await self.con.execute("""
+            delete XXX;
+            alter type XXX { drop extending AAA; };
+            alter type XXX { create required property name -> str; };
+            insert XXX {name := 'xxx'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name')],
+            [('XXX', 'name')],
+        ])
+
+    async def _apply_schema_inheritance_mutli_object(self):
+        # - multiple inheritance
+        #   - abstract type constraint
+        #   - type constraint
+        await self.con.execute("""
+            create abstract type AAA {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type BBB extending AAA;
+            create type CCC {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type DDD extending CCC;
+            create type XXX extending AAA, CCC;
+            insert BBB {name := 'bbb'};
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+            insert XXX {name := 'xxx'};
+        """)
+
+    async def test_constraints_inheritance_multi_object_01(self):
+        await self._apply_schema_inheritance_mutli_object()
+
+        # Add descendant
+        await self.con.execute("""
+            create type EEE extending XXX;
+            insert EEE {name := 'eee'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('BBB', 'name'),
+                ('XXX', 'name'),
+                ('EEE', 'name'),
+            ],
+            [
+                ('CCC', 'name'),
+                ('DDD', 'name'),
+                ('XXX', 'name'),
+                ('EEE', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_object_02(self):
+        await self._apply_schema_inheritance_mutli_object()
+
+        # Add base
+        await self.con.execute("""
+            create type EEE {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type FFF extending EEE;
+            insert EEE {name := 'eee'};
+            insert FFF {name := 'fff'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('BBB', 'name'), ('XXX', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+            [('EEE', 'name'), ('FFF', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_multi_object_03(self):
+        await self._apply_schema_inheritance_mutli_object()
+
+        # Change base
+        await self.con.execute("""
+            create type EEE {
+                create required property name -> str;
+                create constraint exclusive on (.name);
+            };
+            create type FFF extending EEE;
+            insert EEE {name := 'eee'};
+            insert FFF {name := 'fff'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+            [('EEE', 'name'), ('FFF', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_multi_object_04(self):
+        await self._apply_schema_inheritance_mutli_object()
+
+        # Remove base
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+        ])
+
+    async def _apply_schema_inheritance_single_pointer(self):
+        # - single inheritance
+        #   - property
+        await self.con.execute("""
+            create type AAA {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type BBB extending AAA;
+            create type XXX extending AAA;
+            insert AAA {name := 'aaa'};
+            insert BBB {name := 'bbb'};
+            insert XXX {name := 'xxx'};
+        """)
+
+    async def test_constraints_inheritance_single_pointer_01(self):
+        await self._apply_schema_inheritance_single_pointer()
+
+        # Add descendant
+        await self.con.execute("""
+            create type CCC extending XXX;
+            insert CCC {name := 'ccc'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'name'),
+                ('BBB', 'name'),
+                ('XXX', 'name'),
+                ('CCC', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_pointer_02(self):
+        await self._apply_schema_inheritance_single_pointer()
+
+        # Add base
+        await self.con.execute("""
+            create type CCC {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type DDD extending CCC;
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending CCC;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'name'),
+                ('BBB', 'name'),
+                ('XXX', 'name'),
+            ],
+            [
+                ('CCC', 'name'),
+                ('DDD', 'name'),
+                ('XXX', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_pointer_03(self):
+        await self._apply_schema_inheritance_single_pointer()
+
+        # Change base
+        await self.con.execute("""
+            create type CCC {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type DDD extending CCC;
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+                extending CCC;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'name'),
+                ('BBB', 'name'),
+            ],
+            [
+                ('CCC', 'name'),
+                ('DDD', 'name'),
+                ('XXX', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_pointer_04(self):
+        await self._apply_schema_inheritance_single_pointer()
+
+        # Remove base
+        await self.con.execute("""
+            delete XXX;
+            alter type XXX { drop extending AAA; };
+            alter type XXX {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            insert XXX {name := 'xxx'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'name'),
+                ('BBB', 'name'),
+            ],
+            [
+                ('XXX', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_multi_pointer(self):
+        # - multiple inheritance
+        #   - pointer constraint
+        #   - pointer constraint
+        await self.con.execute("""
+            create type AAA {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type BBB extending AAA;
+            create type CCC {
+                create required property name -> str
+                {
+                    create constraint exclusive;
+                };
+            };
+            create type DDD extending CCC;
+            create type XXX extending AAA, CCC;
+            insert AAA {name := 'aaa'};
+            insert BBB {name := 'bbb'};
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+            insert XXX {name := 'xxx'};
+        """)
+
+    async def test_constraints_inheritance_multi_pointer_01(self):
+        await self._apply_schema_inheritance_multi_pointer()
+
+        # Add descendant
+        await self.con.execute("""
+            create type EEE extending XXX;
+            insert EEE {name := 'eee'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'name'),
+                ('BBB', 'name'),
+                ('XXX', 'name'),
+                ('EEE', 'name'),
+            ],
+            [
+                ('CCC', 'name'),
+                ('DDD', 'name'),
+                ('XXX', 'name'),
+                ('EEE', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_pointer_02(self):
+        await self._apply_schema_inheritance_multi_pointer()
+
+        # Add base
+        await self.con.execute("""
+            create type EEE {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type FFF extending EEE;
+            insert EEE {name := 'eee'};
+            insert FFF {name := 'fff'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name'), ('XXX', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+            [('EEE', 'name'), ('FFF', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_multi_pointer_03(self):
+        await self._apply_schema_inheritance_multi_pointer()
+
+        # Change base
+        await self.con.execute("""
+            create type EEE {
+                create required property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create type FFF extending EEE;
+            insert EEE {name := 'eee'};
+            insert FFF {name := 'fff'};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+            [('EEE', 'name'), ('FFF', 'name'), ('XXX', 'name')],
+        ])
+
+    async def test_constraints_inheritance_multi_pointer_04(self):
+        await self._apply_schema_inheritance_multi_pointer()
+
+        # Remove base
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name'), ('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name'), ('XXX', 'name')],
+        ])
+
+    async def _apply_schema_inheritance_single_abstract_link(self):
+        # - single inheritance
+        #   - abstract link constraint
+        await self.con.execute("""
+            create type Tag;
+            create abstract link PPP {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link QQQ extending PPP;
+            create abstract link XXX extending PPP;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag extending QQQ -> Tag;
+            };
+            create type YYY {
+                create required link tag extending XXX -> Tag;
+            };
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag := (insert Tag){@name := 'bbb'}};
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+    async def test_constraints_inheritance_single_abstract_link_01(self):
+        await self._apply_schema_inheritance_single_abstract_link()
+
+        # Add descendant
+        await self.con.execute("""
+            create abstract link RRR extending XXX;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('CCC', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_02(self):
+        await self._apply_schema_inheritance_single_abstract_link()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link SSS extending RRR;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending RRR;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_03(self):
+        await self._apply_schema_inheritance_single_abstract_link()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link SSS extending RRR;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending RRR;
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_04(self):
+        await self._apply_schema_inheritance_single_abstract_link()
+
+        # Remove base
+        await self.con.execute("""
+            delete YYY;
+            alter abstract link XXX { drop extending PPP; };
+            alter abstract link XXX {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_multi_abstract_link(self):
+        # - multiple inheritance
+        #   - abstract link constraint
+        #   - abstract link constraint
+        await self.con.execute("""
+            create type Tag;
+            create abstract link PPP {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link QQQ extending PPP;
+            create abstract link RRR {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link SSS extending RRR;
+            create abstract link XXX extending PPP, RRR;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag extending QQQ -> Tag;
+            };
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            create type YYY {
+                create required link tag extending XXX -> Tag;
+            };
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag := (insert Tag){@name := 'bbb'}};
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+    async def test_constraints_inheritance_multi_abstract_link_01(self):
+        await self._apply_schema_inheritance_multi_abstract_link()
+
+        # Add descendant
+        await self.con.execute("""
+            create abstract link TTT extending XXX;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_02(self):
+        await self._apply_schema_inheritance_multi_abstract_link()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag extending UUU -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag := (insert Tag){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending TTT;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_03(self):
+        await self._apply_schema_inheritance_multi_abstract_link()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag extending UUU -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag := (insert Tag){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending TTT;
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_04(self):
+        await self._apply_schema_inheritance_multi_abstract_link()
+
+        # Remove base
+        await self.con.execute("""
+            alter abstract link XXX {
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_multi_mixed_link(self):
+        # - multiple inheritance
+        #   - abstract link constraint
+        #   - abstract type link constraint
+        await self.con.execute("""
+            create type Tag;
+            create type Tag2;
+            create abstract link PPP {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link QQQ extending PPP;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag2 extending QQQ -> Tag2;
+            };
+            create abstract type CCC {
+                create required link tag -> Tag {
+                    create property name -> str;
+                    create constraint exclusive on (@name);
+                };
+            };
+            create type DDD extending CCC;
+            create type XXX extending AAA, CCC;
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag2 := (insert Tag2){@name := 'bbb'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+            insert XXX {tag := (insert Tag){@name := 'xxx'}};
+        """)
+
+    async def test_constraints_inheritance_multi_mixed_link_01(self):
+        await self._apply_schema_inheritance_multi_mixed_link()
+
+        # Add descendant
+        await self.con.execute("""
+            create type EEE extending XXX;
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_02(self):
+        await self._apply_schema_inheritance_multi_mixed_link()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link SSS extending RRR;
+            create type EEE {
+                create required link tag extending RRR -> Tag;
+            };
+            create type FFF {
+                create required link tag2 extending SSS -> Tag2;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag2 := (insert Tag2){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_03(self):
+        await self._apply_schema_inheritance_multi_mixed_link()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str;
+                create constraint exclusive on (@name);
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag2 extending UUU -> Tag2;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag2 := (insert Tag2){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_04(self):
+        await self._apply_schema_inheritance_multi_mixed_link()
+
+        # Remove base
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_single_abstract_link_prop(self):
+        # - single inheritance
+        #   - abstract link constraint
+        await self.con.execute("""
+            create type Tag;
+            create abstract link PPP {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link QQQ extending PPP;
+            create abstract link XXX extending PPP;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag extending QQQ -> Tag;
+            };
+            create type YYY {
+                create required link tag extending XXX -> Tag;
+            };
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag := (insert Tag){@name := 'bbb'}};
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+    async def test_constraints_inheritance_single_abstract_link_prop_01(self):
+        await self._apply_schema_inheritance_single_abstract_link_prop()
+
+        # Add descendant
+        await self.con.execute("""
+            create abstract link RRR extending XXX;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('CCC', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_prop_02(self):
+        await self._apply_schema_inheritance_single_abstract_link_prop()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link SSS extending RRR;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending RRR;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_prop_03(self):
+        await self._apply_schema_inheritance_single_abstract_link_prop()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link SSS extending RRR;
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending RRR;
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_single_abstract_link_prop_04(self):
+        await self._apply_schema_inheritance_single_abstract_link_prop()
+
+        # Remove base
+        await self.con.execute("""
+            delete YYY;
+            alter abstract link XXX { drop extending PPP; };
+            alter abstract link XXX {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_multi_abstract_link_prop(self):
+        # - multiple inheritance
+        #   - abstract link constraint
+        #   - abstract link constraint
+        await self.con.execute("""
+            create type Tag;
+            create abstract link PPP {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link QQQ extending PPP;
+            create abstract link RRR {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link SSS extending RRR;
+            create abstract link XXX extending PPP, RRR;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag extending QQQ -> Tag;
+            };
+            create type CCC {
+                create required link tag extending RRR -> Tag;
+            };
+            create type DDD {
+                create required link tag extending SSS -> Tag;
+            };
+            create type YYY {
+                create required link tag extending XXX -> Tag;
+            };
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag := (insert Tag){@name := 'bbb'}};
+            insert CCC {tag := (insert Tag){@name := 'ccc'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+            insert YYY {tag := (insert Tag){@name := 'yyy'}};
+        """)
+
+    async def test_constraints_inheritance_multi_abstract_link_prop_01(self):
+        await self._apply_schema_inheritance_multi_abstract_link_prop()
+
+        # Add descendant
+        await self.con.execute("""
+            create abstract link TTT extending XXX;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_prop_02(self):
+        await self._apply_schema_inheritance_multi_abstract_link_prop()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag extending UUU -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag := (insert Tag){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending TTT;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_prop_03(self):
+        await self._apply_schema_inheritance_multi_abstract_link_prop()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag extending UUU -> Tag;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag := (insert Tag){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter abstract link XXX {
+                extending TTT;
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_abstract_link_prop_04(self):
+        await self._apply_schema_inheritance_multi_abstract_link_prop()
+
+        # Remove base
+        await self.con.execute("""
+            alter abstract link XXX {
+                drop extending PPP;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('CCC', 'tag', 'Tag', 'name'),
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('YYY', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def _apply_schema_inheritance_multi_mixed_link_prop(self):
+        # - multiple inheritance
+        #   - abstract link property constraint
+        #   - abstract type link property constraint
+        await self.con.execute("""
+            create type Tag;
+            create type Tag2;
+            create abstract link PPP {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link QQQ extending PPP;
+            create type AAA {
+                create required link tag extending PPP -> Tag;
+            };
+            create type BBB {
+                create required link tag2 extending QQQ -> Tag2;
+            };
+            create abstract type CCC {
+                create required link tag -> Tag {
+                    create property name -> str {
+                        create constraint exclusive;
+                    };
+                };
+            };
+            create type DDD extending CCC;
+            create type XXX extending AAA, CCC;
+            insert AAA {tag := (insert Tag){@name := 'aaa'}};
+            insert BBB {tag2 := (insert Tag2){@name := 'bbb'}};
+            insert DDD {tag := (insert Tag){@name := 'ddd'}};
+            insert XXX {tag := (insert Tag){@name := 'xxx'}};
+        """)
+
+    async def test_constraints_inheritance_multi_mixed_link_prop_01(self):
+        await self._apply_schema_inheritance_multi_mixed_link_prop()
+
+        # Add descendant
+        await self.con.execute("""
+            create type EEE extending XXX;
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+                ('EEE', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_prop_02(self):
+        await self._apply_schema_inheritance_multi_mixed_link_prop()
+
+        # Add base
+        await self.con.execute("""
+            create abstract link RRR {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link SSS extending RRR;
+            create type EEE {
+                create required link tag extending RRR -> Tag;
+            };
+            create type FFF {
+                create required link tag2 extending SSS -> Tag2;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag2 := (insert Tag2){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_prop_03(self):
+        await self._apply_schema_inheritance_multi_mixed_link_prop()
+
+        # Change base
+        await self.con.execute("""
+            create abstract link TTT {
+                create property name -> str {
+                    create constraint exclusive;
+                };
+            };
+            create abstract link UUU extending TTT;
+            create type EEE {
+                create required link tag extending TTT -> Tag;
+            };
+            create type FFF {
+                create required link tag2 extending UUU -> Tag2;
+            };
+            insert EEE {tag := (insert Tag){@name := 'eee'}};
+            insert FFF {tag2 := (insert Tag2){@name := 'fff'}};
+        """)
+
+        await self.con.execute("""
+            alter type XXX {
+                extending EEE;
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+            [
+                ('EEE', 'tag', 'Tag', 'name'),
+                ('FFF', 'tag2', 'Tag2', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_multi_mixed_link_prop_04(self):
+        await self._apply_schema_inheritance_multi_mixed_link_prop()
+
+        # Remove base
+        await self.con.execute("""
+            alter type XXX {
+                drop extending AAA;
+            }
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [
+                ('AAA', 'tag', 'Tag', 'name'),
+                ('BBB', 'tag2', 'Tag2', 'name'),
+            ],
+            [
+                ('DDD', 'tag', 'Tag', 'name'),
+                ('XXX', 'tag', 'Tag', 'name'),
+            ],
+        ])
+
+    async def test_constraints_inheritance_abstract_constraint_01(self):
+        # Abstract constraints do not share their exclusiveness with descendants
+        await self.con.execute("""
+            create abstract constraint PPP extending exclusive;
+            create abstract constraint QQQ extending PPP;
+            create abstract constraint RRR extending PPP;
+            create type AAA {
+                create required property name -> str
+                {
+                    create constraint PPP;
+                };
+            };
+            create type BBB {
+                create required property name -> str
+                {
+                    create constraint QQQ;
+                };
+            };
+            create type CCC {
+                create required property name -> str
+                {
+                    create constraint RRR;
+                };
+            };
+            create type DDD extending CCC;
+            insert AAA {name := 'aaa'};
+            insert BBB {name := 'bbb'};
+            insert CCC {name := 'ccc'};
+            insert DDD {name := 'ddd'};
+        """)
+
+        # Check constraints
+        await self._check_constraint_inheritance([
+            [('AAA', 'name')],
+            [('BBB', 'name')],
+            [('CCC', 'name'), ('DDD', 'name')],
+        ])

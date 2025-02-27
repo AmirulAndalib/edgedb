@@ -31,7 +31,7 @@ std::assert_single(
     CREATE ANNOTATION std::description :=
         "Check that the input set contains at most one element, raise
          CardinalityViolationError otherwise.";
-    SET volatility := 'Stable';
+    SET volatility := 'Immutable';
     SET preserves_optionality := true;
     USING SQL EXPRESSION;
 };
@@ -49,7 +49,7 @@ std::assert_exists(
     CREATE ANNOTATION std::description :=
         "Check that the input set contains at least one element, raise
          CardinalityViolationError otherwise.";
-    SET volatility := 'Stable';
+    SET volatility := 'Immutable';
     SET preserves_upper_cardinality := true;
     USING SQL EXPRESSION;
 };
@@ -67,7 +67,7 @@ std::assert_distinct(
     CREATE ANNOTATION std::description :=
         "Check that the input set is a proper set, i.e. all elements
          are unique";
-    SET volatility := 'Stable';
+    SET volatility := 'Immutable';
     SET preserves_optionality := true;
     SET preserves_upper_cardinality := true;
     USING SQL EXPRESSION;
@@ -86,7 +86,7 @@ std::assert(
     SET volatility := 'Stable';
     USING SQL $$
     SELECT (
-        edgedb.raise_on_null(
+        edgedb_VER.raise_on_null(
             nullif("input", false),
             'cardinality_violation',
             "constraint" => 'std::assert',
@@ -95,6 +95,21 @@ std::assert(
     )
     $$;
 };
+
+# std::materialized_exists -- force materialization of a set
+# ----------------------------------------------------------
+
+CREATE FUNCTION
+std::materialized(
+    input: anytype,
+) -> anytype
+{
+    CREATE ANNOTATION std::description :=
+        "Force materialization of a set.";
+    SET volatility := 'Volatile';
+    USING SQL EXPRESSION;
+};
+
 
 # std::len
 # --------
@@ -547,7 +562,7 @@ std::contains(haystack: array<anytype>, needle: anytype) -> std::bool
         'A polymorphic function to test if a sequence contains a certain element.';
     SET volatility := 'Immutable';
     # Postgres only manages to inline this function if it isn't marked strict,
-    # and we want it to be inlined so that pg::gin indexes work with it.
+    # and we want it to be inlined so that std::pg::gin indexes work with it.
     SET impl_is_strict := false;
     USING SQL $$
     SELECT "haystack" @> ARRAY["needle"]
@@ -562,7 +577,7 @@ std::contains(haystack: json, needle: json) -> std::bool
         'A polymorphic function to test if one JSON value contains another JSON value.';
     SET volatility := 'Immutable';
     # Postgres only manages to inline this function if it isn't marked strict,
-    # and we want it to be inlined so that pg::gin indexes work with it.
+    # and we want it to be inlined so that std::pg::gin indexes work with it.
     SET impl_is_strict := false;
     USING SQL $$
     SELECT "haystack" @> "needle"

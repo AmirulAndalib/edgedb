@@ -18,7 +18,14 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    TypeAlias,
+)
 
 import textwrap
 
@@ -29,11 +36,14 @@ from . import base
 from . import ddl
 
 
+EnumName: TypeAlias = tuple[str, str]
+
+
 class EnumExists(base.Condition):
-    def __init__(self, name):
+    def __init__(self, name: EnumName) -> None:
         self.name = name
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return textwrap.dedent(f'''\
             SELECT
                 t.typname
@@ -50,46 +60,69 @@ class EnumExists(base.Condition):
 
 class Enum(base.DBObject):
     def __init__(
-        self, name: Tuple[str, ...], values: Sequence[str], *, metadata=None
-    ):
+        self,
+        name: EnumName,
+        values: Sequence[str],
+        *,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         self.name = name
         self.values = values
         super().__init__(metadata=metadata)
 
 
 class CreateEnum(ddl.SchemaObjectOperation):
-    def __init__(self, enum: Enum, *, conditions=None, neg_conditions=None):
+    def __init__(
+        self,
+        enum: Enum,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         super().__init__(
             enum.name, conditions=conditions, neg_conditions=neg_conditions)
         self.values = enum.values
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         vals = ', '.join(ql(v) for v in self.values)
         return f'CREATE TYPE {qn(*self.name)} AS ENUM ({vals})'
 
 
 class AlterEnum(ddl.DDLOperation):
-    def __init__(self, name, *, conditions=None, neg_conditions=None):
+    def __init__(
+        self,
+        name: EnumName,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         super().__init__(conditions=conditions, neg_conditions=neg_conditions)
         self.name = name
 
     def prefix_code(self) -> str:
         return f'ALTER TYPE {qn(*self.name)}'
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return '<edb.sync.%s %s>' % (self.__class__.__name__, self.name)
 
 
 class AlterEnumAddValue(AlterEnum):
-    def __init__(self, name, value, *, before=None, after=None,
-                 conditional=False):
+    def __init__(
+        self,
+        name: EnumName,
+        value: str,
+        *,
+        before: Optional[str] = None,
+        after: Optional[str] = None,
+        conditional: bool = False,
+    ):
         super().__init__(name)
         self.value = value
         self.before = before
         self.after = after
         self.conditional = conditional
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         code = self.prefix_code()
         code += ' ADD VALUE'
         if self.conditional:
@@ -98,11 +131,11 @@ class AlterEnumAddValue(AlterEnum):
         if self.before:
             code += f' BEFORE {ql(self.before)}'
         elif self.after:
-            code += f' AFTER {ql(self.before)}'
+            code += f' AFTER {ql(self.after)}'
 
         return code
 
 
 class DropEnum(ddl.SchemaObjectOperation):
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return f'DROP TYPE {qn(*self.name)}'
