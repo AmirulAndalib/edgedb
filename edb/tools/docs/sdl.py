@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Any, Dict
 
 from edb.tools.pygments.edgeql import EdgeQLLexer
 
@@ -46,7 +46,7 @@ class SDLSynopsisDirective(shared.CodeBlock):
 class SDLDomain(s_domains.Domain):
 
     name = "sdl"
-    label = "EdgeDB Schema Definition Language"
+    label = "Gel Schema Definition Language"
 
     directives = {
         'synopsis': SDLSynopsisDirective,

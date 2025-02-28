@@ -17,10 +17,25 @@
 """PostgreSQL cluster management."""
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    Tuple,
+    Type,
+    Iterable,
+    Mapping,
+    Sequence,
+    Coroutine,
+    Unpack,
+    Dict,
+    List,
+    cast,
+    TYPE_CHECKING,
+)
 
 import asyncio
-import functools
+import copy
 import hashlib
 import json
 import logging
@@ -30,28 +45,30 @@ import pathlib
 import re
 import shlex
 import shutil
+import signal
 import struct
 import textwrap
 import urllib.parse
 
 from edb import buildmeta
+from edb import errors
+from edb.common import lru
 from edb.common import supervisor
 from edb.common import uuidgen
 
 from edb.server import args as srvargs
 from edb.server import defines
+from edb.server import pgconnparams
 from edb.server.ha import base as ha_base
 from edb.pgsql import common as pgcommon
 from edb.pgsql import params as pgparams
 
-from . import pgconnparams
-
 if TYPE_CHECKING:
     from edb.server import pgcon
 
-
 logger = logging.getLogger('edb.pgcluster')
 pg_dump_logger = logging.getLogger('pg_dump')
+pg_restore_logger = logging.getLogger('pg_restore')
 pg_ctl_logger = logging.getLogger('pg_ctl')
 pg_config_logger = logging.getLogger('pg_config')
 initdb_logger = logging.getLogger('initdb')
@@ -59,6 +76,19 @@ postgres_logger = logging.getLogger('postgres')
 
 get_database_backend_name = pgcommon.get_database_backend_name
 get_role_backend_name = pgcommon.get_role_backend_name
+
+EDGEDB_SERVER_SETTINGS = {
+    'client_encoding': 'utf-8',
+    # DO NOT raise client_min_messages above NOTICE level
+    # because server indirect block return machinery relies
+    # on NoticeResponse as the data channel.
+    'client_min_messages': 'NOTICE',
+    'search_path': 'edgedb',
+    'timezone': 'UTC',
+    'intervalstyle': 'iso_8601',
+    'jit': 'off',
+    'default_transaction_isolation': 'serializable',
+}
 
 
 class ClusterError(Exception):
@@ -77,9 +107,8 @@ class BaseCluster:
         instance_params: Optional[pgparams.BackendInstanceParams] = None,
     ) -> None:
         self._connection_addr: Optional[Tuple[str, int]] = None
-        self._connection_params: Optional[
-            pgconnparams.ConnectionParameters
-        ] = None
+        self._connection_params: pgconnparams.ConnectionParams = \
+            pgconnparams.ConnectionParams(server_settings=EDGEDB_SERVER_SETTINGS)
         self._pg_config_data: Dict[str, str] = {}
         self._pg_bin_dir: Optional[pathlib.Path] = None
         if instance_params is None:
@@ -112,7 +141,9 @@ class BaseCluster:
             assert (
                 role_name == defines.EDGEDB_SUPERUSER
             ), f"role_name={role_name} is not allowed"
-            return self.get_connection_params().user
+            rv = self.get_connection_params().user
+            assert rv is not None
+            return rv
 
         return get_database_backend_name(
             role_name,
@@ -134,19 +165,29 @@ class BaseCluster:
     def destroy(self) -> None:
         raise NotImplementedError
 
-    async def connect(self, **kwargs: Any) -> pgcon.PGConnection:
+    async def connect(self,
+                      *,
+                      source_description: str,
+                      apply_init_script: bool = False,
+                      **kwargs: Unpack[pgconnparams.CreateParamsKwargs]
+    ) -> pgcon.PGConnection:
+        """Connect to this cluster, with optional overriding parameters. If
+        overriding parameters are specified, they are applied to a copy of the
+        connection parameters before the connection takes place."""
         from edb.server import pgcon
 
-        conn_info = self.get_connection_spec()
-        conn_info.update(kwargs)
-        dbname = conn_info.get("database") or conn_info.get("user")
-        assert isinstance(dbname, str)
-        return await pgcon.connect(
-            conn_info,
-            dbname=dbname,
+        connection = copy.copy(self.get_connection_params())
+        addr = self._get_connection_addr()
+        assert addr is not None
+        connection.update(hosts=[addr])
+        connection.update(**kwargs)
+        conn = await pgcon.pg_connect(
+            connection,
+            source_description=source_description,
             backend_params=self.get_runtime_params(),
-            apply_init_script=False,
+            apply_init_script=apply_init_script,
         )
+        return conn
 
     async def start_watching(
         self, failover_cb: Optional[Callable[[], None]] = None
@@ -174,54 +215,25 @@ class BaseCluster:
             capabilities=caps
         )
 
-    def get_connection_addr(self) -> Optional[Tuple[str, int]]:
-        return self._get_connection_addr()
-
-    def set_connection_params(
+    def update_connection_params(
         self,
-        params: pgconnparams.ConnectionParameters,
+        **kwargs: Unpack[pgconnparams.CreateParamsKwargs],
     ) -> None:
-        self._connection_params = params
+        self._connection_params.update(**kwargs)
+
+    def get_pgaddr(self) -> pgconnparams.ConnectionParams:
+        assert self._connection_params is not None
+        addr = self._get_connection_addr()
+        assert addr is not None
+        params = copy.copy(self._connection_params)
+        params.update(hosts=[addr])
+        return params
 
     def get_connection_params(
         self,
-    ) -> pgconnparams.ConnectionParameters:
+    ) -> pgconnparams.ConnectionParams:
         assert self._connection_params is not None
         return self._connection_params
-
-    def get_connection_spec(self) -> Dict[str, Any]:
-        conn_dict: Dict[str, Any] = {}
-        addr = self.get_connection_addr()
-        assert addr is not None
-        conn_dict['host'] = addr[0]
-        conn_dict['port'] = addr[1]
-        params = self.get_connection_params()
-        for k in (
-            'user',
-            'password',
-            'database',
-            'ssl',
-            'sslmode',
-            'server_settings',
-        ):
-            v = getattr(params, k)
-            if v is not None:
-                conn_dict[k] = v
-
-        cluster_settings = conn_dict.get('server_settings', {})
-
-        edgedb_settings = {
-            'client_encoding': 'utf-8',
-            'search_path': 'edgedb',
-            'timezone': 'UTC',
-            'intervalstyle': 'iso_8601',
-            'jit': 'off',
-            'default_transaction_isolation': 'serializable',
-        }
-
-        conn_dict['server_settings'] = {**cluster_settings, **edgedb_settings}
-
-        return conn_dict
 
     def _get_connection_addr(self) -> Optional[Tuple[str, int]]:
         return self._connection_addr
@@ -232,12 +244,39 @@ class BaseCluster:
     async def get_status(self) -> str:
         raise NotImplementedError
 
+    def _dump_restore_conn_args(
+        self,
+        dbname: str,
+    ) -> tuple[list[str], dict[str, str]]:
+        params = copy.copy(self.get_connection_params())
+        addr = self._get_connection_addr()
+        assert addr is not None
+        params.update(database=dbname, hosts=[addr])
+
+        args = [
+            f'--dbname={params.database}',
+            f'--host={params.host}',
+            f'--port={params.port}',
+            f'--username={params.user}',
+        ]
+
+        env = os.environ.copy()
+        if params.password:
+            env['PGPASSWORD'] = params.password
+
+        return args, env
+
     async def dump_database(
         self,
         dbname: str,
         *,
         exclude_schemas: Iterable[str] = (),
+        include_schemas: Iterable[str] = (),
+        include_tables: Iterable[str] = (),
+        include_extensions: Iterable[str] = (),
+        schema_only: bool = False,
         dump_object_owners: bool = True,
+        create_database: bool = False,
     ) -> bytes:
         status = await self.get_status()
         if status != 'running':
@@ -246,27 +285,31 @@ class BaseCluster:
         if self._pg_bin_dir is None:
             await self.lookup_postgres()
         pg_dump = self._find_pg_binary('pg_dump')
-        conn_spec = self.get_connection_spec()
+
+        conn_args, env = self._dump_restore_conn_args(dbname)
 
         args = [
             pg_dump,
             '--inserts',
-            f'--dbname={dbname}',
-            f'--host={conn_spec["host"]}',
-            f'--port={conn_spec["port"]}',
-            f'--username={conn_spec["user"]}',
+            *conn_args,
         ]
 
         if not dump_object_owners:
             args.append('--no-owner')
+        if schema_only:
+            args.append('--schema-only')
+        if create_database:
+            args.append('--create')
 
-        env = os.environ.copy()
-        if conn_spec.get("password"):
-            env['PGPASSWORD'] = conn_spec["password"]
-
-        if exclude_schemas:
-            for exclude_schema in exclude_schemas:
-                args.append(f'--exclude-schema={exclude_schema}')
+        configs = [
+            ('exclude-schema', exclude_schemas),
+            ('schema', include_schemas),
+            ('table', include_tables),
+            ('extension', include_extensions),
+        ]
+        for flag, vals in configs:
+            for val in vals:
+                args.append(f'--{flag}={val}')
 
         stdout_lines, _, _ = await _run_logged_subprocess(
             args,
@@ -275,6 +318,81 @@ class BaseCluster:
             env=env,
         )
         return b'\n'.join(stdout_lines)
+
+    async def _copy_database(
+        self,
+        src_dbname: str,
+        tgt_dbname: str,
+        src_args: list[str],
+        tgt_args: list[str],
+    ) -> None:
+        status = await self.get_status()
+        if status != 'running':
+            raise ClusterError('cannot dump: cluster is not running')
+
+        if self._pg_bin_dir is None:
+            await self.lookup_postgres()
+        pg_dump = self._find_pg_binary('pg_dump')
+        # We actually just use psql to restore, because it is more
+        # tolerant of version differences.
+        # TODO: Maybe use pg_restore when we know we match the backend version?
+        pg_restore = self._find_pg_binary('psql')
+
+        src_conn_args, src_env = self._dump_restore_conn_args(src_dbname)
+        tgt_conn_args, _tgt_env = self._dump_restore_conn_args(tgt_dbname)
+
+        dump_args = [
+            pg_dump, '--verbose', *src_conn_args, *src_args
+        ]
+        restore_args = [
+            pg_restore, *tgt_conn_args, *tgt_args
+        ]
+
+        rpipe, wpipe = os.pipe()
+        wpipef = os.fdopen(wpipe, "wb")
+
+        try:
+            # N.B: uvloop will waitpid() on the child process even if we don't
+            # actually await on it due to a later error.
+            dump_p, dump_out_r, dump_err_r = await _start_logged_subprocess(
+                dump_args,
+                logger=pg_dump_logger,
+                override_stdout=wpipef,
+                log_stdout=False,
+                capture_stdout=False,
+                capture_stderr=False,
+                env=src_env,
+            )
+
+            res_p, res_out_r, res_err_r = await _start_logged_subprocess(
+                restore_args,
+                logger=pg_restore_logger,
+                stdin=rpipe,
+                capture_stdout=False,
+                capture_stderr=False,
+                log_stdout=True,
+                log_stderr=True,
+                env=src_env,
+            )
+        finally:
+            wpipef.close()
+            os.close(rpipe)
+
+        dump_exit_code, _, _, restore_exit_code, _, _ = await asyncio.gather(
+            dump_p.wait(), dump_out_r, dump_err_r,
+            res_p.wait(), res_out_r, res_err_r,
+        )
+
+        if dump_exit_code != 0 and dump_exit_code != -signal.SIGPIPE:
+            raise errors.ExecutionError(
+                f'branch failed: {dump_args[0]} exited with status '
+                f'{dump_exit_code}'
+            )
+        if restore_exit_code != 0:
+            raise errors.ExecutionError(
+                f'branch failed: '
+                f'{restore_args[0]} exited with status {restore_exit_code}'
+            )
 
     def _find_pg_binary(self, binary: str) -> str:
         assert self._pg_bin_dir is not None
@@ -451,6 +569,12 @@ class Cluster(BaseCluster):
             # `max_connections` scenarios.
             'max_locks_per_transaction': 1024,
             'max_pred_locks_per_transaction': 1024,
+            "shared_preload_libraries": ",".join(
+                [
+                    "edb_stat_statements",
+                ]
+            ),
+            "edb_stat_statements.track_planning": "true",
         }
 
         if os.getenv('EDGEDB_DEBUG_PGSERVER'):
@@ -459,7 +583,7 @@ class Cluster(BaseCluster):
         else:
             log_level_map = {
                 'd': 'INFO',
-                'i': 'NOTICE',
+                'i': 'WARNING',  # NOTICE in Postgres is quite noisy
                 'w': 'WARNING',
                 'e': 'ERROR',
                 's': 'PANIC',
@@ -660,6 +784,10 @@ class Cluster(BaseCluster):
         self._connection_addr = None
         connected = False
 
+        params = pgconnparams.ConnectionParams(
+            user="postgres",
+            database="postgres")
+
         for n in range(timeout + 9):
             # pg usually comes up pretty quickly, but not so quickly
             # that we don't hit the wait case. Make our first several
@@ -686,16 +814,11 @@ class Cluster(BaseCluster):
                 continue
 
             try:
+                params.update(hosts=[conn_addr])
                 con = await asyncio.wait_for(
-                    pgcon.connect(
-                        dbname="postgres",
-                        connargs={
-                            "user": "postgres",
-                            "database": "postgres",
-                            "host": conn_addr[0],
-                            "port": conn_addr[1],
-                            "server_settings": {},
-                        },
+                    pgcon.pg_connect(
+                        params,
+                        source_description=f"{self.__class__}._test_connection",
                         backend_params=self.get_runtime_params(),
                         apply_init_script=False,
                     ),
@@ -705,7 +828,10 @@ class Cluster(BaseCluster):
                 OSError,
                 asyncio.TimeoutError,
                 pgcon.BackendConnectionError,
-            ):
+            ) as e:
+                if n % 10 == 0 and 0 < n < timeout + 9 - 1:
+                    logger.error("cannot connect to the backend cluster:"
+                                 " %s, retrying...", e)
                 await asyncio.sleep(sleep_time)
                 continue
             except pgcon.BackendError:
@@ -727,15 +853,18 @@ class Cluster(BaseCluster):
 class RemoteCluster(BaseCluster):
     def __init__(
         self,
-        addr: Tuple[str, int],
-        params: pgconnparams.ConnectionParameters,
         *,
+        connection_addr: tuple[str, int],
+        connection_params: pgconnparams.ConnectionParams,
         instance_params: Optional[pgparams.BackendInstanceParams] = None,
         ha_backend: Optional[ha_base.HABackend] = None,
     ):
         super().__init__(instance_params=instance_params)
-        self._connection_addr = addr
-        self._connection_params = params
+        self._connection_params = connection_params
+        self._connection_params.update(
+            server_settings=EDGEDB_SERVER_SETTINGS
+        )
+        self._connection_addr = connection_addr
         self._ha_backend = ha_backend
 
     def _get_connection_addr(self) -> Optional[Tuple[str, int]]:
@@ -796,7 +925,7 @@ class RemoteCluster(BaseCluster):
         if self._ha_backend is not None:
             self._ha_backend.stop_watching()
 
-    @functools.cache
+    @lru.method_cache
     def get_client_id(self) -> int:
         tenant_id = self._instance_params.tenant_id
         if self._ha_backend is not None:
@@ -871,6 +1000,7 @@ async def get_remote_pg_cluster(
     tenant_id: Optional[str] = None,
     specified_capabilities: Optional[srvargs.BackendCapabilitySets] = None,
 ) -> RemoteCluster:
+    from edb.server import pgcon
     parsed = urllib.parse.urlparse(dsn)
     ha_backend = None
 
@@ -903,14 +1033,10 @@ async def get_remote_pg_cluster(
             if query:
                 dsn += f"?{urllib.parse.urlencode(query)}"
 
-    addrs, params = pgconnparams.parse_dsn(dsn)
-    if len(addrs) > 1:
-        raise ValueError('multiple hosts in Postgres DSN are not supported')
     if tenant_id is None:
         t_id = buildmeta.get_default_tenant_id()
     else:
         t_id = tenant_id
-    rcluster = RemoteCluster(addrs[0], params)
 
     async def _get_cluster_type(
         conn: pgcon.PGConnection,
@@ -985,10 +1111,11 @@ async def get_remote_pg_cluster(
                 configfile_access = True
 
                 if cur_cluster_name:
+                    cn = pgcommon.quote_literal(
+                        cur_cluster_name.decode("utf-8"))
                     await conn.sql_execute(
                         f"""
-                        ALTER SYSTEM SET cluster_name =
-                            {pgcommon.quote_literal(cur_cluster_name)}
+                        ALTER SYSTEM SET cluster_name = {cn}
                         """.encode("utf-8"),
                     )
                 else:
@@ -1052,6 +1179,13 @@ async def get_remote_pg_cluster(
         if roles['rolcreatedb']:
             caps |= pgparams.BackendCapabilities.CREATE_DATABASE
 
+        stats_ver = await conn.sql_fetch_val(b"""
+            SELECT default_version FROM pg_available_extensions
+            WHERE name = 'edb_stat_statements';
+        """)
+        if stats_ver in (b"1.0",):
+            caps |= pgparams.BackendCapabilities.STAT_STATEMENTS
+
         return caps
 
     async def _get_pg_settings(
@@ -1077,7 +1211,16 @@ async def get_remote_pg_cluster(
                 rv += int(value)
         return rv
 
-    conn = await rcluster.connect()
+    probe_connection = pgconnparams.ConnectionParams(dsn=dsn)
+    conn = await pgcon.pg_connect(
+        probe_connection,
+        source_description="remote cluster probe",
+        backend_params=pgparams.get_default_runtime_params(),
+        apply_init_script=False
+    )
+    params = conn.connection
+    addr = conn.addr
+
     try:
         data = json.loads(await conn.sql_fetch_val(
             b"""
@@ -1091,12 +1234,17 @@ async def get_remote_pg_cluster(
                 )
             )""",
         ))
-        user = data["user"]
-        dbname = data["dbname"]
+        params.update(
+            user=data["user"],
+            database=data["dbname"]
+        )
         cluster_type, superuser_name = await _get_cluster_type(conn)
         max_connections = data["connlimit"]
-        if max_connections == -1:
-            max_connections = await _get_pg_settings(conn, 'max_connections')
+        pg_max_connections = await _get_pg_settings(conn, 'max_connections')
+        if max_connections == -1 or not isinstance(max_connections, int):
+            max_connections = pg_max_connections
+        else:
+            max_connections = min(max_connections, pg_max_connections)
         capabilities = await _detect_capabilities(conn)
 
         if (
@@ -1182,11 +1330,9 @@ async def get_remote_pg_cluster(
     finally:
         conn.terminate()
 
-    params.user = user
-    params.database = dbname
     return cluster_type(
-        addrs[0],
-        params,
+        connection_addr=addr,
+        connection_params=params,
         instance_params=instance_params,
         ha_backend=ha_backend,
     )
@@ -1228,6 +1374,7 @@ async def _run_logged_subprocess(
     capture_stdout: bool = True,
     capture_stderr: bool = True,
     timeout: Optional[float] = None,
+    stdin: Any = asyncio.subprocess.PIPE,
     **kwargs: Any,
 ) -> Tuple[List[bytes], List[bytes], int]:
     process, stdout_reader, stderr_reader = await _start_logged_subprocess(
@@ -1238,8 +1385,12 @@ async def _run_logged_subprocess(
         log_stderr=log_stderr,
         capture_stdout=capture_stdout,
         capture_stderr=capture_stderr,
+        stdin=stdin,
         **kwargs,
     )
+
+    if isinstance(stdin, int) and stdin >= 0:
+        os.close(stdin)
 
     exit_code, stdout_lines, stderr_lines = await asyncio.wait_for(
         asyncio.gather(process.wait(), stdout_reader, stderr_reader),
@@ -1261,10 +1412,13 @@ async def _start_logged_subprocess(
     *,
     logger: logging.Logger,
     level: int = logging.DEBUG,
+    override_stdout: Any = None,
+    override_stderr: Any = None,
     log_stdout: bool = True,
     log_stderr: bool = True,
     capture_stdout: bool = True,
     capture_stderr: bool = True,
+    stdin: Any = asyncio.subprocess.PIPE,
     log_processor: Optional[Callable[[str], Tuple[str, int]]] = None,
     **kwargs: Any,
 ) -> Tuple[
@@ -1279,65 +1433,56 @@ async def _start_logged_subprocess(
 
     process = await asyncio.create_subprocess_exec(
         *args,
+        stdin=stdin,
         stdout=(
-            asyncio.subprocess.PIPE if log_stdout or capture_stdout
+            override_stdout
+            if override_stdout
+            else asyncio.subprocess.PIPE
+            if log_stdout or capture_stdout
             else asyncio.subprocess.DEVNULL
         ),
         stderr=(
-            asyncio.subprocess.PIPE if log_stderr or capture_stderr
+            override_stderr
+            if override_stderr
+            else asyncio.subprocess.PIPE
+            if log_stderr or capture_stderr
             else asyncio.subprocess.DEVNULL
         ),
         limit=2 ** 20,  # 1 MiB
         **kwargs,
     )
 
-    assert process.stderr is not None
-    assert process.stdout is not None
-
-    if log_stderr and capture_stderr:
+    if log_stderr or capture_stderr:
+        assert override_stderr is None
+        assert process.stderr is not None
         stderr_reader = _capture_and_log_subprocess_output(
             process.pid,
             process.stderr,
             logger,
             level,
             log_processor,
+            capture_output=capture_stderr,
+            log_output=log_stderr,
         )
-    elif capture_stderr:
-        stderr_reader = _capture_subprocess_output(process.stderr)
-    elif log_stderr:
-        stderr_reader = _log_subprocess_output(
-            process.pid, process.stderr, logger, level, log_processor)
     else:
         stderr_reader = _dummy()
 
-    if log_stdout and capture_stdout:
+    if log_stdout or capture_stdout:
+        assert override_stdout is None
+        assert process.stdout is not None
         stdout_reader = _capture_and_log_subprocess_output(
             process.pid,
             process.stdout,
             logger,
             level,
             log_processor,
+            capture_output=capture_stdout,
+            log_output=log_stdout,
         )
-    elif capture_stdout:
-        stdout_reader = _capture_subprocess_output(process.stdout)
-    elif log_stdout:
-        stdout_reader = _log_subprocess_output(
-            process.pid, process.stdout, logger, level, log_processor)
     else:
         stdout_reader = _dummy()
 
     return process, stdout_reader, stderr_reader
-
-
-async def _capture_subprocess_output(
-    stream: asyncio.StreamReader,
-) -> List[bytes]:
-    lines = []
-    while not stream.at_eof():
-        line = await _safe_readline(stream)
-        if line or not stream.at_eof():
-            lines.append(line.rstrip(b'\n'))
-    return lines
 
 
 async def _capture_and_log_subprocess_output(
@@ -1346,35 +1491,23 @@ async def _capture_and_log_subprocess_output(
     logger: logging.Logger,
     level: int,
     log_processor: Optional[Callable[[str], Tuple[str, int]]] = None,
+    *,
+    capture_output: bool,
+    log_output: bool,
 ) -> List[bytes]:
     lines = []
     while not stream.at_eof():
         line = await _safe_readline(stream)
         if line or not stream.at_eof():
             line = line.rstrip(b'\n')
-            lines.append(line)
-            log_line = line.decode()
-            if log_processor is not None:
-                log_line, level = log_processor(log_line)
-            logger.log(level, log_line, extra={"process": pid})
+            if capture_output:
+                lines.append(line)
+            if log_output:
+                log_line = line.decode()
+                if log_processor is not None:
+                    log_line, level = log_processor(log_line)
+                logger.log(level, log_line, extra={"process": pid})
     return lines
-
-
-async def _log_subprocess_output(
-    pid: int,
-    stream: asyncio.StreamReader,
-    logger: logging.Logger,
-    level: int,
-    log_processor: Optional[Callable[[str], Tuple[str, int]]] = None,
-) -> List[bytes]:
-    while not stream.at_eof():
-        line = await _safe_readline(stream)
-        if line or not stream.at_eof():
-            log_line = line.rstrip(b'\n').decode()
-            if log_processor is not None:
-                log_line, level = log_processor(log_line)
-            logger.log(level, log_line, extra={"process": pid})
-    return []
 
 
 async def _safe_readline(stream: asyncio.StreamReader) -> bytes:

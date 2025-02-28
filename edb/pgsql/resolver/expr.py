@@ -1,4 +1,5 @@
 #
+#
 # This source file is part of the EdgeDB open source project.
 #
 # Copyright 2008-present MagicStack Inc. and the EdgeDB authors.
@@ -19,15 +20,42 @@
 """SQL resolver that compiles public SQL to internal SQL which is executable
 in our internal Postgres instance."""
 
-from typing import *
+from typing import (
+    Iterable,
+    Optional,
+    Tuple,
+    Iterator,
+    Sequence,
+    Dict,
+    List,
+    cast,
+    Set,
+)
+import uuid
 
 from edb import errors
 
 from edb.pgsql import ast as pgast
+from edb.pgsql import common
+from edb.pgsql.parser import parser as pg_parser
+from edb.pgsql.common import quote_ident as qi
+from edb.pgsql import compiler as pgcompiler
+from edb.pgsql.compiler import enums as pgce
+
+from edb.schema import types as s_types
+from edb.schema import pointers as s_pointers
+
+from edb.ir import ast as irast
+
+from edb.edgeql import compiler as qlcompiler
+
+from edb.server.pgcon import errors as pgerror
+from edb.server.compiler import dbstate
 
 from . import dispatch
 from . import context
 from . import static
+from . import command
 
 Context = context.ResolverContextLevel
 
@@ -36,9 +64,20 @@ def infer_alias(res_target: pgast.ResTarget) -> Optional[str]:
     if res_target.name:
         return res_target.name
 
+    val = res_target.val
+
+    if isinstance(val, pgast.TypeCast):
+        val = val.arg
+
+    if isinstance(val, pgast.FuncCall):
+        return val.name[-1]
+
+    if isinstance(val, pgast.ImplicitRowExpr):
+        return 'row'
+
     # if just name has been selected, use it as the alias
-    if isinstance(res_target.val, pgast.ColumnRef):
-        name = res_target.val.name
+    if isinstance(val, pgast.ColumnRef):
+        name = val.name
         if isinstance(name[-1], str):
             return name[-1]
 
@@ -48,9 +87,24 @@ def infer_alias(res_target: pgast.ResTarget) -> Optional[str]:
 # this function cannot go though dispatch,
 # because it may return multiple nodes, due to * notation
 def resolve_ResTarget(
-    res_target: pgast.ResTarget, *, ctx: Context
+    res_target: pgast.ResTarget,
+    *,
+    existing_names: Set[str],
+    ctx: Context,
 ) -> Tuple[Sequence[pgast.ResTarget], Sequence[context.Column]]:
+    targets, columns = _resolve_ResTarget(
+        res_target, existing_names=existing_names, ctx=ctx
+    )
 
+    return (targets, columns)
+
+
+def _resolve_ResTarget(
+    res_target: pgast.ResTarget,
+    *,
+    existing_names: Set[str],
+    ctx: Context,
+) -> Tuple[Sequence[pgast.ResTarget], Sequence[context.Column]]:
     alias = infer_alias(res_target)
 
     # special case for ColumnRef for handing wildcards
@@ -60,16 +114,38 @@ def resolve_ResTarget(
         res = []
         columns = []
         for table, column in col_res:
-            columns.append(column)
+            val = resolve_column_kind(table, column.kind, ctx=ctx)
 
-            assert table.reference_as
-            assert column.reference_as
+            # make sure name is not duplicated
+            # this behavior is technically different then Postgres, but EdgeDB
+            # protocol does not support duplicate names. And we doubt that
+            # anyone is depending on original behavior.
+            nam: str = column.name
+            if nam in existing_names:
+                # prefix with table name
+                rel_var_name = table.alias or table.name
+                if rel_var_name:
+                    nam = rel_var_name + '_' + nam
+            if nam in existing_names:
+                if ctx.options.disambiguate_column_names:
+                    raise errors.QueryError(
+                        f'duplicate column name: `{nam}`',
+                        span=res_target.span,
+                        pgext_code=pgerror.ERROR_UNDEFINED_COLUMN,
+                    )
+            existing_names.add(nam)
+
             res.append(
                 pgast.ResTarget(
-                    val=pgast.ColumnRef(
-                        name=(table.reference_as, column.reference_as)
-                    ),
-                    name=column.name,
+                    name=nam,
+                    val=val,
+                )
+            )
+            columns.append(
+                context.Column(
+                    name=nam,
+                    hidden=column.hidden,
+                    kind=column.kind,
                 )
             )
         return (res, columns)
@@ -85,18 +161,125 @@ def resolve_ResTarget(
     ):
         alias = static.name_in_pg_catalog(res_target.val.name)
 
-    col = context.Column(name=alias, reference_as=alias)
-    new_target = pgast.ResTarget(
-        val=val,
-        name=alias,
-        context=res_target.context)
+    if alias in existing_names:
+        # duplicate name
+
+        if res_target.name:
+            # explicit duplicate name: error out
+            if ctx.options.disambiguate_column_names:
+                raise errors.QueryError(
+                    f'duplicate column name: `{alias}`',
+                    span=res_target.span,
+                    pgext_code=pgerror.ERROR_UNDEFINED_COLUMN,
+                )
+        else:
+            # inferred duplicate name: use generated alias instead
+
+            # this behavior is technically different than Postgres, but it is
+            # also not documented and users should not be relying on it.
+            # It does help us in some cases
+            # (passing `SELECT a.id, b.id` into DML).
+            alias = None
+
+    name: str = alias or ctx.alias_generator.get('col')
+    existing_names.add(name)
+
+    col = context.Column(
+        name=name, kind=context.ColumnByName(reference_as=name)
+    )
+    new_target = pgast.ResTarget(val=val, name=name, span=res_target.span)
     return (new_target,), (col,)
+
+
+def resolve_column_kind(
+    table: context.Table, column: context.ColumnKind, *, ctx: Context
+) -> pgast.BaseExpr:
+    match column:
+        case context.ColumnByName(reference_as=reference_as):
+            if table.reference_as:
+                return pgast.ColumnRef(name=(table.reference_as, reference_as))
+            else:
+                # In some cases tables might not have an assigned alias
+                # because that is not syntactically possible (COPY), or because
+                # the table being referenced is currently being assembled
+                # (e.g. ORDER BY refers to a newly defined column).
+
+                # So we make an assumption that in such cases, this will not
+                # be ambiguous. I think this is not strictly correct.
+                return pgast.ColumnRef(name=(reference_as,))
+
+        case context.ColumnStaticVal(val=val):
+            # special case: __type__ static value
+            return _uuid_const(val)
+        case context.ColumnPgExpr(expr=e):
+            return e
+        case context.ColumnComputable(pointer=pointer):
+
+            expr = pointer.get_expr(ctx.schema)
+            assert expr
+
+            source = pointer.get_source(ctx.schema)
+
+            subject_id: irast.PathId
+            source_id: irast.PathId
+            if isinstance(source, s_types.Type):
+                subject_id = irast.PathId.from_type(
+                    ctx.schema, source, env=None
+                )
+                source_id = subject_id
+            else:
+                assert isinstance(source, s_pointers.Pointer)
+                subject_id = irast.PathId.from_pointer(
+                    ctx.schema, source, env=None
+                )
+                s = source.get_source(ctx.schema)
+                assert isinstance(s, s_types.Type)
+                source_id = irast.PathId.from_type(ctx.schema, s, env=None)
+
+            singletons = [source]
+            options = qlcompiler.CompilerOptions(
+                modaliases={None: 'default'},
+                anchors={'__source__': source},
+                path_prefix_anchor='__source__',
+                singletons=singletons,
+                make_globals_empty=False,
+                apply_user_access_policies=ctx.options.apply_access_policies,
+            )
+            compiled = expr.compiled(ctx.schema, options=options, context=None)
+
+            subject_rel = pgast.Relation(name=table.reference_as)
+            subject_rel.path_outputs = {
+                (source_id, pgce.PathAspect.IDENTITY): pgast.ColumnRef(
+                    name=('source',)
+                )
+            }
+            subject_rel_var = pgast.RelRangeVar(
+                alias=pgast.Alias(aliasname=table.reference_as),
+                relation=subject_rel,
+            )
+
+            sql_tree = pgcompiler.compile_ir_to_sql_tree(
+                compiled.irast,
+                external_rvars={
+                    (subject_id, pgce.PathAspect.SOURCE): subject_rel_var,
+                    (subject_id, pgce.PathAspect.VALUE): subject_rel_var,
+                    (source_id, pgce.PathAspect.IDENTITY): subject_rel_var
+                },
+                output_format=pgcompiler.OutputFormat.NATIVE_INTERNAL,
+                alias_generator=ctx.alias_generator,
+            )
+            command.merge_params(sql_tree, compiled.irast, ctx)
+
+            assert isinstance(sql_tree.ast, pgast.BaseExpr)
+            return sql_tree.ast
+        case _:
+            raise NotImplementedError(column)
 
 
 @dispatch._resolve.register
 def resolve_ColumnRef(
     column_ref: pgast.ColumnRef, *, ctx: Context
-) -> pgast.ColumnRef:
+) -> pgast.BaseExpr:
     res = _lookup_column(column_ref, ctx)
     table, column = res[0]
 
@@ -105,14 +288,14 @@ def resolve_ColumnRef(
         assert table.reference_as
         return pgast.ColumnRef(name=(table.reference_as, pgast.Star()))
 
-    assert column.reference_as
+    return resolve_column_kind(table, column.kind, ctx=ctx)
 
-    if table.name:
-        assert table.reference_as
-        return pgast.ColumnRef(name=(table.reference_as, column.reference_as))
-    else:
-        # this is a reference to a local column, so it doesn't need table name
-        return pgast.ColumnRef(name=(column.reference_as,))
+
+def _uuid_const(val: uuid.UUID):
+    return pgast.TypeCast(
+        arg=pgast.StringConstant(val=str(val)),
+        type_name=pgast.TypeName(name=('uuid',)),
+    )
 
 
 def _lookup_column(
@@ -132,18 +315,27 @@ def _lookup_column(
             return [
                 (t, c)
                 for t in ctx.scope.tables
+                # Only look at the highest precedence level for
+                # *. That is, we take everything in our local FROM
+                # clauses but not stuff in enclosing queries, if we
+                # are a subquery.
+                if t.precedence == 0
                 for c in t.columns
                 if not c.hidden
             ]
-        else:
-            for table in ctx.scope.tables:
-                matched_columns.extend(_lookup_in_table(col_name, table))
+
+        for table in ctx.scope.tables:
+            matched_columns.extend(_lookup_in_table(col_name, table))
 
         if not matched_columns:
             # is it a reference to a rel var?
             try:
                 tab = _lookup_table(col_name, ctx)
-                col = context.Column(reference_as=tab.reference_as)
+                assert tab.reference_as
+                col = context.Column(
+                    name=tab.reference_as,
+                    kind=context.ColumnByName(reference_as=tab.reference_as),
+                )
                 return [(context.Table(), col)]
             except errors.QueryError:
                 pass
@@ -155,7 +347,7 @@ def _lookup_column(
         try:
             table = _lookup_table(cast(str, tab_name), ctx)
         except errors.QueryError as e:
-            e.set_source_context(column_ref.context)
+            e.set_span(column_ref.span)
             raise
 
         if isinstance(col_name, pgast.Star):
@@ -165,29 +357,65 @@ def _lookup_column(
 
     if not matched_columns:
         raise errors.QueryError(
-            f'cannot find column `{col_name}`', context=column_ref.context
+            f'column {qi(col_name, force=True)} does not exist',
+            span=column_ref.span,
+            pgext_code=pgerror.ERROR_UNDEFINED_COLUMN,
         )
 
     # apply precedence
     if len(matched_columns) > 1:
         max_precedence = max(t.precedence for t, _ in matched_columns)
         matched_columns = [
-            (t, c)
-            for t, c in matched_columns
-            if t.precedence == max_precedence
+            (t, c) for t, c in matched_columns if t.precedence == max_precedence
         ]
 
+    # when ambiguous references have been used in USING clause,
+    # we resolve them to first or the second column or a COALESCE of the two.
+    if (
+        len(matched_columns) == 2
+        and matched_columns[0][1].name == matched_columns[1][1].name
+    ):
+        matched_name = matched_columns[0][1].name
+        matched_tables = [t for t, _c in matched_columns]
+
+        for c_name, t_left, t_right, join_type in ctx.scope.factored_columns:
+            if matched_name != c_name:
+                continue
+            if not (t_left in matched_tables and t_right in matched_tables):
+                continue
+
+            c_left = next(c for c in t_left.columns if c.name == c_name)
+            c_right = next(c for c in t_right.columns if c.name == c_name)
+
+            if join_type == 'INNER' or join_type == 'LEFT':
+                matched_columns = [(t_left, c_left)]
+            elif join_type == 'RIGHT':
+                matched_columns = [(t_right, c_right)]
+            elif join_type == 'FULL':
+                coalesce = pgast.CoalesceExpr(
+                    args=[
+                        resolve_column_kind(t_left, c_left.kind, ctx=ctx),
+                        resolve_column_kind(t_right, c_right.kind, ctx=ctx),
+                    ]
+                )
+                c_coalesce = context.Column(
+                    name=c_name,
+                    kind=context.ColumnPgExpr(expr=coalesce),
+                )
+                matched_columns = [(t_left, c_coalesce)]
+            else:
+                raise NotImplementedError()
+            break
+
     if len(matched_columns) > 1:
-        potential_tables = ', '.join(
-            [t.name or '' for t, _ in matched_columns]
-        )
+        potential_tables = ', '.join([t.name or '' for t, _ in matched_columns])
         raise errors.QueryError(
             f'ambiguous column `{col_name}` could belong to '
             f'following tables: {potential_tables}',
-            context=column_ref.context,
+            span=column_ref.span,
         )
 
-    return (matched_columns[0],)
+    return matched_columns
 
 
 def _lookup_in_table(
@@ -198,7 +426,7 @@ def _lookup_in_table(
             yield (table, column)
 
 
-def _lookup_table(tab_name: str, ctx: Context) -> context.Table:
+def _maybe_lookup_table(tab_name: str, ctx: Context) -> context.Table | None:
     matched_tables: List[context.Table] = []
     for t in ctx.scope.tables:
         t_name = t.alias or t.name
@@ -206,7 +434,7 @@ def _lookup_table(tab_name: str, ctx: Context) -> context.Table:
             matched_tables.append(t)
 
     if not matched_tables:
-        raise errors.QueryError(f'cannot find table `{tab_name}`')
+        return None
 
     # apply precedence
     if len(matched_tables) > 1:
@@ -219,6 +447,13 @@ def _lookup_table(tab_name: str, ctx: Context) -> context.Table:
         raise errors.QueryError(f'ambiguous table `{tab_name}`')
 
     table = matched_tables[0]
+    return table
+
+
+def _lookup_table(tab_name: str, ctx: Context) -> context.Table:
+    table = _maybe_lookup_table(tab_name, ctx=ctx)
+    if table is None:
+        raise errors.QueryError(f'cannot find table `{tab_name}`')
     return table
 
 
@@ -253,8 +488,11 @@ def resolve_TypeCast(
     *,
     ctx: Context,
 ) -> pgast.BaseExpr:
-    if res := static.eval_TypeCast(expr, ctx=ctx):
-        return res
+
+    pg_catalog_name = static.name_in_pg_catalog(expr.type_name.name)
+    if pg_catalog_name == 'regclass' and not expr.type_name.array_bounds:
+        return static.cast_to_regclass(expr.arg, ctx)
+
     return pgast.TypeCast(
         arg=dispatch.resolve(expr.arg, ctx=ctx),
         type_name=expr.type_name,
@@ -308,10 +546,66 @@ def resolve_SortBy(
     )
 
 
+@dispatch._resolve.register
+def resolve_LockingClause(
+    expr: pgast.LockingClause,
+    *,
+    ctx: Context,
+) -> pgast.LockingClause:
+
+    tables: List[context.Table] = []
+    if expr.locked_rels is not None:
+        for rvar in expr.locked_rels:
+            assert rvar.relation.name
+            table = _lookup_table(rvar.relation.name, ctx=ctx)
+            tables.append(table)
+    else:
+        tables.extend(ctx.scope.tables)
+
+    # validate that the locking clause can be used on these tables
+    for table in tables:
+        if table.schema_id and not table.is_direct_relation:
+            raise errors.QueryError(
+                f'locking clause not supported: `{table.name or table.alias}` '
+                'must not have child types or access policies',
+                pgext_code=pgerror.ERROR_FEATURE_NOT_SUPPORTED,
+            )
+
+    return pgast.LockingClause(
+        strength=expr.strength,
+        locked_rels=[
+            pgast.RelRangeVar(relation=pgast.Relation(name=table.reference_as))
+            for table in tables
+        ],
+        wait_policy=expr.wait_policy,
+    )
+
+
 func_calls_remapping: Dict[Tuple[str, ...], Tuple[str, ...]] = {
-    ('information_schema', '_pg_truetypid'): ('edgedbsql', '_pg_truetypid'),
-    ('information_schema', '_pg_truetypmod'): ('edgedbsql', '_pg_truetypmod'),
-    ('pg_catalog', 'format_type'): ('edgedb', '_format_type'),
+    ('information_schema', '_pg_truetypid'): (
+        common.versioned_schema('edgedbsql'),
+        '_pg_truetypid',
+    ),
+    ('information_schema', '_pg_truetypmod'): (
+        common.versioned_schema('edgedbsql'),
+        '_pg_truetypmod',
+    ),
+    ('pg_catalog', 'format_type'): (
+        common.versioned_schema('edgedbsql'),
+        '_format_type',
+    ),
+    ('format_type',): (
+        common.versioned_schema('edgedbsql'),
+        '_format_type',
+    ),
+    ('pg_catalog', 'pg_get_constraintdef'): (
+        common.versioned_schema('edgedbsql'),
+        'pg_get_constraintdef',
+    ),
+    ('pg_get_constraintdef',): (
+        common.versioned_schema('edgedbsql'),
+        'pg_get_constraintdef',
+    ),
 }
 
 
@@ -321,7 +615,6 @@ def resolve_FuncCall(
     *,
     ctx: Context,
 ) -> pgast.BaseExpr:
-
     # Special case: some function calls (mostly from pg_catalog) are
     # intercepted and statically evaluated.
     if res := static.eval_FuncCall(call, ctx=ctx):
@@ -331,7 +624,7 @@ def resolve_FuncCall(
     # Effectively, this exposes all non-remapped functions.
     name = func_calls_remapping.get(call.name, call.name)
 
-    return pgast.FuncCall(
+    res = pgast.FuncCall(
         name=name,
         args=dispatch.resolve_list(call.args, ctx=ctx),
         agg_order=dispatch.resolve_opt_list(call.agg_order, ctx=ctx),
@@ -341,6 +634,8 @@ def resolve_FuncCall(
         over=dispatch.resolve_opt(call.over, ctx=ctx),
         with_ordinality=call.with_ordinality,
     )
+
+    return res
 
 
 @dispatch._resolve.register
@@ -409,9 +704,34 @@ def resolve_RowExpr(
     *,
     ctx: Context,
 ) -> pgast.RowExpr:
-    return pgast.RowExpr(
-        args=dispatch.resolve_list(expr.args, ctx=ctx),
+    return construct_row_expr(
+        dispatch.resolve_list(expr.args, ctx=ctx),
+        ctx=ctx,
     )
+
+
+def construct_row_expr(
+    args: Iterable[pgast.BaseExpr], *, ctx: Context
+) -> pgast.RowExpr:
+    # Constructs a ROW and maybe injects type casts for params.
+
+    return pgast.RowExpr(args=[maybe_annotate_param(a, ctx=ctx) for a in args])
+
+
+def maybe_annotate_param(expr: pgast.BaseExpr, *, ctx: Context):
+    # If the expression is a param whose type is `unknown` we inject a type cast
+    # saying it is actually text.
+
+    if isinstance(expr, pgast.ParamRef):
+        param = ctx.query_params[expr.number - 1]
+        if (
+            isinstance(param, dbstate.SQLParamExtractedConst)
+            and param.type_oid == pg_parser.PgLiteralTypeOID.UNKNOWN
+        ):
+            return pgast.TypeCast(
+                arg=expr, type_name=pgast.TypeName(name=('text',))
+            )
+    return expr
 
 
 @dispatch._resolve.register
@@ -420,7 +740,18 @@ def resolve_ParamRef(
     *,
     ctx: Context,
 ) -> pgast.ParamRef:
-    return pgast.ParamRef(number=expr.number)
+    # external params map one-to-one to internal params
+    if expr.number < 1:
+        raise errors.QueryError(
+            f'param out of bounds: ${expr.number}',
+            pgext_code=pgerror.ERROR_UNDEFINED_PARAMETER,
+            hint='query parameters start with 1',
+        )
+
+    param = ctx.query_params[expr.number - 1]
+    param.used = True
+
+    return expr
 
 
 @dispatch._resolve.register

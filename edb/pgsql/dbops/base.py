@@ -18,7 +18,20 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Final,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
+from collections.abc import MutableSequence
 
 import collections
 import enum
@@ -72,11 +85,13 @@ class PLExpression(str):
 
 
 class SQLBlock:
-    def __init__(self):
+    commands: list[str | PLBlock]
+
+    def __init__(self) -> None:
         self.commands = []
         self._transactional = True
 
-    def add_block(self):
+    def add_block(self) -> PLBlock:
         block = PLTopBlock()
         self.add_command(block)
         return block
@@ -98,7 +113,7 @@ class SQLBlock:
         return [(cmd if isinstance(cmd, str) else cmd.to_string()).rstrip()
                 for cmd in self.commands]
 
-    def add_command(self, stmt) -> None:
+    def add_command(self, stmt: str | PLBlock) -> None:
         self.commands.append(stmt)
 
     def has_declarations(self) -> bool:
@@ -113,10 +128,13 @@ class SQLBlock:
 
 class PLBlock(SQLBlock):
 
+    varcounter: dict[str, int]
+    shared_vars: set[str]
+    declarations: list[tuple[str, str | tuple[str, str]]]
     conditions: Iterable[str | Condition]
     neg_conditions: Iterable[str | Condition]
 
-    def __init__(self, top_block, level):
+    def __init__(self, top_block: Optional[PLTopBlock], level: int) -> None:
         super().__init__()
         self.top_block = top_block
         self.varcounter = collections.defaultdict(int)
@@ -133,14 +151,14 @@ class PLBlock(SQLBlock):
         return bool(self.commands)
 
     def get_top_block(self) -> PLTopBlock:
-        return self.top_block
+        return typeutils.not_none(self.top_block)
 
     def add_block(self) -> PLBlock:
         block = PLBlock(top_block=self.top_block, level=self.level + 1)
         self.add_command(block)
         return block
 
-    def to_string(self):
+    def to_string(self) -> str:
         if self.declarations:
             vv = (f'    {qi(n)} {qt(t)};' for n, t in self.declarations)
             decls = 'DECLARE\n' + '\n'.join(vv) + '\n'
@@ -154,7 +172,7 @@ class PLBlock(SQLBlock):
             if self.conditions:
                 for cond in self.conditions:
                     if not isinstance(cond, str):
-                        cond_expr = f'EXISTS ({cond.code(self)})'
+                        cond_expr = f'EXISTS ({cond.code()})'
                     else:
                         cond_expr = cond
                     exprs.append(cond_expr)
@@ -162,7 +180,7 @@ class PLBlock(SQLBlock):
             if self.neg_conditions:
                 for cond in self.neg_conditions:
                     if not isinstance(cond, str):
-                        cond_expr = f'EXISTS ({cond.code(self)})'
+                        cond_expr = f'EXISTS ({cond.code()})'
                     else:
                         cond_expr = cond
                     exprs.append(f'NOT {cond_expr}')
@@ -184,13 +202,20 @@ class PLBlock(SQLBlock):
         else:
             return body
 
-    def add_command(self, cmd, *, conditions=None, neg_conditions=None):
+    def add_command(
+        self,
+        cmd: str | PLBlock,
+        *,
+        conditions: Optional[Iterable[str | Condition]] = None,
+        neg_conditions: Optional[Iterable[str | Condition]] = None
+    ) -> None:
+        stmt: str | PLBlock
         if conditions or neg_conditions:
             exprs = []
             if conditions:
                 for cond in conditions:
                     if not isinstance(cond, str):
-                        cond_expr = f'EXISTS ({cond.code(self)})'
+                        cond_expr = f'EXISTS ({cond.code()})'
                     else:
                         cond_expr = cond
                     exprs.append(cond_expr)
@@ -198,7 +223,7 @@ class PLBlock(SQLBlock):
             if neg_conditions:
                 for cond in neg_conditions:
                     if not isinstance(cond, str):
-                        cond_expr = f'EXISTS ({cond.code(self)})'
+                        cond_expr = f'EXISTS ({cond.code()})'
                     else:
                         cond_expr = cond
                     exprs.append(f'NOT {cond_expr}')
@@ -219,7 +244,7 @@ class PLBlock(SQLBlock):
 
         super().add_command(stmt)
 
-    def get_var_name(self, hint=None):
+    def get_var_name(self, hint: Optional[str] = None) -> str:
         if hint is None:
             hint = 'v'
         self.varcounter[hint] += 1
@@ -248,7 +273,7 @@ class PLBlock(SQLBlock):
 
 
 class PLTopBlock(PLBlock):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(top_block=None, level=0)
         self.declare_var('text', var_name='_dummy_text', shared=True)
 
@@ -257,7 +282,7 @@ class PLTopBlock(PLBlock):
         self.add_command(block)
         return block
 
-    def to_string(self):
+    def to_string(self) -> str:
         body = super().to_string()
         return f'DO LANGUAGE plpgsql $__$\n{body}\n$__$;'
 
@@ -266,14 +291,14 @@ class PLTopBlock(PLBlock):
 
 
 class BaseCommand(markup.MarkupCapableMixin):
-    def generate(self, block):
+    def generate(self, block: SQLBlock) -> None:
         raise NotImplementedError
 
     @classmethod
-    def as_markup(cls, self, *, ctx):
+    def as_markup(cls, self, *, ctx) -> markup.elements.lang.TreeNode:
         return markup.elements.lang.TreeNode(name=repr(self))
 
-    def dump(self):
+    def dump(self) -> str:
         return str(self)
 
 
@@ -287,12 +312,12 @@ class Command(BaseCommand):
         *,
         conditions: Optional[Iterable[str | Condition]] = None,
         neg_conditions: Optional[Iterable[str | Condition]] = None,
-    ):
+    ) -> None:
         self.opid = id(self)
         self.conditions = set(conditions) if conditions else set()
         self.neg_conditions = set(neg_conditions) if neg_conditions else set()
 
-    def generate(self, block) -> None:
+    def generate(self, block: SQLBlock) -> None:
         self_block = self.generate_self_block(block)
         if self_block is None:
             return
@@ -301,31 +326,41 @@ class Command(BaseCommand):
         self_block.conditions = self.conditions
         self_block.neg_conditions = self.neg_conditions
 
-    def generate_self_block(self, block: PLBlock) -> Optional[PLBlock]:
-        # Default implementation simply calls self.code()
+    def generate_self_block(self, block: SQLBlock) -> Optional[PLBlock]:
+        # Default implementation simply calls self.code_with_block()
         self_block = block.add_block()
-        self_block.add_command(self.code(self_block))
+        self_block.add_command(self.code_with_block(self_block))
         return self_block
 
     def generate_extra(self, block: PLBlock) -> None:
         pass
 
-    def code(self, block: PLBlock) -> str:
+    def code(self) -> str:
         raise NotImplementedError
+
+    def code_with_block(self, block: PLBlock) -> str:
+        return self.code()
 
 
 class CommandGroup(Command):
-    def __init__(self, *, conditions=None, neg_conditions=None):
+    commands: MutableSequence[Command]
+
+    def __init__(
+        self,
+        *,
+        conditions: Optional[Iterable[str | Condition]] = None,
+        neg_conditions: Optional[Iterable[str | Condition]] = None,
+    ) -> None:
         super().__init__(conditions=conditions, neg_conditions=neg_conditions)
         self.commands = []
 
-    def add_command(self, cmd: Command):
+    def add_command(self, cmd: Command) -> None:
         self.commands.append(cmd)
 
-    def add_commands(self, cmds: Sequence[Command]):
+    def add_commands(self, cmds: Sequence[Command]) -> None:
         self.commands.extend(cmds)
 
-    def generate_self_block(self, block: PLBlock) -> Optional[PLBlock]:
+    def generate_self_block(self, block: SQLBlock) -> Optional[PLBlock]:
         if not self.commands:
             return None
 
@@ -337,7 +372,7 @@ class CommandGroup(Command):
         return self_block
 
     @classmethod
-    def as_markup(cls, self, *, ctx):
+    def as_markup(cls, self, *, ctx) -> markup.elements.lang.TreeNode:
         node = markup.elements.lang.TreeNode(name=repr(self))
 
         for op in self.commands:
@@ -345,15 +380,40 @@ class CommandGroup(Command):
 
         return node
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Command]:
         return iter(self.commands)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.commands)
 
 
-class CompositeCommandGroup(CommandGroup):
-    def generate_self_block(self, block: PLBlock) -> Optional[PLBlock]:
+class CompositeCommand(Command):
+
+    def generate_extra_composite(
+        self, block: PLBlock, group: CompositeCommandGroup
+    ) -> None:
+        pass
+
+
+class CompositeCommandGroup(Command):
+    commands: MutableSequence[CompositeCommand]
+
+    def __init__(
+        self,
+        *,
+        conditions: Optional[Iterable[str | Condition]] = None,
+        neg_conditions: Optional[Iterable[str | Condition]] = None,
+    ) -> None:
+        super().__init__(conditions=conditions, neg_conditions=neg_conditions)
+        self.commands = []
+
+    def add_command(self, cmd: CompositeCommand) -> None:
+        self.commands.append(cmd)
+
+    def add_commands(self, cmds: Sequence[CompositeCommand]) -> None:
+        self.commands.extend(cmds)
+
+    def generate_self_block(self, block: SQLBlock) -> Optional[PLBlock]:
         if not self.commands:
             return None
 
@@ -364,7 +424,7 @@ class CompositeCommandGroup(CommandGroup):
 
         for cmd in self.commands:
             if isinstance(cmd, tuple) and (cmd[1] or cmd[2]):
-                action = cmd[0].code(self_block)
+                action = cmd[0].code_with_block(self_block)
                 if isinstance(action, PLExpression):
                     subcommand = \
                         f"EXECUTE {ql(prefix_code)} || ' ' || {action}"
@@ -373,7 +433,7 @@ class CompositeCommandGroup(CommandGroup):
                 self_block.add_command(
                     subcommand, conditions=cmd[1], neg_conditions=cmd[2])
             else:
-                action = cmd.code(self_block)
+                action = cmd.code_with_block(self_block)
                 if isinstance(action, PLExpression):
                     subcommand = \
                         f"EXECUTE {ql(prefix_code)} || ' ' || {action}"
@@ -393,39 +453,59 @@ class CompositeCommandGroup(CommandGroup):
 
         for cmd in self.commands:
             if isinstance(cmd, tuple) and (cmd[1] or cmd[2]):
-                cmd[0].generate_extra(extra_block, self)
+                cmd[0].generate_extra_composite(extra_block, self)
             else:
-                cmd.generate_extra(extra_block, self)
+                cmd.generate_extra_composite(extra_block, self)
 
         return self_block
 
     def prefix_code(self) -> str:
         raise NotImplementedError
 
+    def __iter__(self) -> Iterator[CompositeCommand]:
+        return iter(self.commands)
+
+    def __len__(self) -> int:
+        return len(self.commands)
+
 
 class Condition(BaseCommand):
-    pass
+
+    def code(self) -> str:
+        raise NotImplementedError()
 
 
 class Query(Command):
     def __init__(
-        self, text: str, *, type: Optional[str | Tuple[str, str]] = None
-    ):
+        self,
+        text: str,
+        *,
+        type: Optional[str | Tuple[str, str]] = None,
+        trampoline_fixup: bool = True,
+    ) -> None:
+        from ..import trampoline
+
         super().__init__()
+        if trampoline_fixup:
+            text = trampoline.fixup_query(text)
         self.text = text
         self.type = type
 
-    def to_sql_expr(self):
+    def to_sql_expr(self) -> str:
         if self.type:
             return f'({self.text})::{qn(*self.type)}'
         else:
             return self.text
 
-    def code(self, block: PLBlock) -> str:
+    def code(self) -> str:
         return self.text
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f'<Query {self.text!r}>'
+
+
+class PLQuery(Query):
+    pass
 
 
 class DefaultMeta(type):
@@ -443,10 +523,14 @@ class Default(metaclass=DefaultMeta):
 
 
 class DBObject:
-    def __init__(self, *, metadata: Optional[Mapping[str, Any]] = None):
+    def __init__(
+        self,
+        *,
+        metadata: Optional[Mapping[str, Any]] = None
+    ) -> None:
         self.metadata = dict(metadata) if metadata else None
 
-    def add_metadata(self, key: str, value: Any):
+    def add_metadata(self, key: str, value: Any) -> None:
         if self.metadata is None:
             self.metadata = {}
 
@@ -469,8 +553,13 @@ class DBObject:
 
 
 class InheritableDBObject(DBObject):
-    def __init__(self, *, inherit=False, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        *,
+        inherit: bool = False,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        super().__init__(metadata=metadata)
         if inherit:
             self.add_metadata('ddl:inherit', inherit)
 
@@ -480,5 +569,5 @@ class InheritableDBObject(DBObject):
 
 
 class NoOpCommand(Command):
-    def generate_self_block(self, block: PLBlock) -> Optional[PLBlock]:
+    def generate_self_block(self, block: SQLBlock) -> Optional[PLBlock]:
         return None

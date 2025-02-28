@@ -18,18 +18,44 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Mapping
 
 import textwrap
 
 from ..common import quote_ident as qi
 from ..common import quote_literal as ql
+from ..common import versioned_schema as V
 
 from . import base
 from . import ddl
 
 
-class Database(base.DBObject):
+class AbstractDatabase(base.DBObject):
+    def get_type(self):
+        return 'DATABASE'
+
+    def is_shared(self) -> bool:
+        return True
+
+    def _get_id_expr(self) -> str:
+        raise NotImplementedError()
+
+    def get_oid(self) -> base.Query:
+        qry = textwrap.dedent(f'''\
+            SELECT
+                'pg_database'::regclass::oid AS classoid,
+                pg_database.oid AS objectoid,
+                0
+            FROM
+                pg_database
+            WHERE
+                datname = {self._get_id_expr()}
+        ''')
+
+        return base.Query(text=qry)
+
+
+class Database(AbstractDatabase):
     def __init__(
         self,
         name: str,
@@ -49,35 +75,40 @@ class Database(base.DBObject):
         self.lc_collate = lc_collate
         self.lc_ctype = lc_ctype
 
-    def get_type(self):
-        return 'DATABASE'
-
     def get_id(self):
         return qi(self.name)
 
-    def is_shared(self) -> bool:
-        return True
+    def _get_id_expr(self) -> str:
+        return ql(self.name)
 
-    def get_oid(self) -> base.Query:
-        qry = textwrap.dedent(f'''\
-            SELECT
-                'pg_database'::regclass::oid AS classoid,
-                pg_database.oid AS objectoid,
-                0
-            FROM
-                pg_database
-            WHERE
-                datname = {ql(self.name)}
-        ''')
 
-        return base.Query(text=qry)
+class DatabaseWithTenant(Database):
+    def __init__(
+        self,
+        name: str,
+    ) -> None:
+        super().__init__(name=name)
+
+    def get_id(self) -> str:
+        return f"' || quote_ident({self._get_id_expr()}) || '"
+
+    def _get_id_expr(self) -> str:
+        return f'{V("edgedb")}.get_database_backend_name({ql(self.name)})'
+
+
+class CurrentDatabase(AbstractDatabase):
+    def get_id(self) -> str:
+        return f"' || quote_ident({self._get_id_expr()}) || '"
+
+    def _get_id_expr(self) -> str:
+        return 'current_database()'
 
 
 class DatabaseExists(base.Condition):
     def __init__(self, name):
         self.name = name
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return textwrap.dedent(f'''\
             SELECT
                 typname
@@ -90,11 +121,11 @@ class DatabaseExists(base.Condition):
 
 class CreateDatabase(ddl.CreateObject, ddl.NonTransactionalDDLOperation):
 
-    def __init__(self, object, *, template: str, **kwargs):
+    def __init__(self, object, *, template: str | None, **kwargs):
         super().__init__(object, **kwargs)
         self.template = template
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         extra = ''
 
         if self.object.owner:
@@ -116,5 +147,18 @@ class CreateDatabase(ddl.CreateObject, ddl.NonTransactionalDDLOperation):
 class DropDatabase(ddl.SchemaObjectOperation,
                    ddl.NonTransactionalDDLOperation):
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return f'DROP DATABASE {qi(self.name)}'
+
+
+class RenameDatabase(ddl.AlterObject,
+                     ddl.NonTransactionalDDLOperation):
+    def __init__(self, object, *, old_name: str, **kwargs):
+        super().__init__(object, **kwargs)
+        self.old_name = old_name
+
+    def code(self) -> str:
+        return (
+            f'ALTER DATABASE {qi(self.old_name)} '
+            f'RENAME TO {self.object.get_id()}'
+        )

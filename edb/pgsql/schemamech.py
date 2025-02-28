@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Optional, Tuple, Sequence, Collection, Dict, List, Set
 
 import itertools
 import dataclasses
@@ -42,11 +42,13 @@ from edb.schema import types as s_types
 from edb.schema import constraints as s_constraints
 from edb.schema import schema as s_schema
 from edb.schema import sources as s_sources
+from edb.schema import expr as s_expr
+from edb.schema import objects as s_obj
 
 from edb.common import ast
 from edb.common import parsing
 
-from . import ast as pg_ast
+from . import ast as pgast
 from . import dbops
 from . import deltadbops
 from . import common
@@ -60,28 +62,16 @@ def _get_exclusive_refs(tree: irast.Statement) -> Sequence[irast.Base] | None:
     # Check if the expression is
     #   std::_is_exclusive(<arg>) [and std::_is_exclusive(<arg>)...]
 
-    assert isinstance(tree.expr.expr, irast.SelectStmt)
-    expr = tree.expr.expr.result
+    expr = tree.expr.expr
 
-    astexpr = irastexpr.DistinctConjunctionExpr()  # type: ignore
-    refs = astexpr.match(expr)
-
-    if refs is None:
-        return refs
-    else:
-        all_refs = []
-        for ref in refs:
-            # Unnest sequences in refs
-            all_refs.append(ref)
-
-        return all_refs
+    return irastexpr.get_constraint_references(expr)
 
 
 @dataclasses.dataclass(kw_only=True, repr=False, eq=False, slots=True)
 class PGConstrData:
     subject_db_name: Optional[Tuple[str, str]]
-    expressions: List[ExprData]
-    origin_expressions: List[ExprData]
+    expressions: list[ExprData]
+    relative_expressions: list[ExprData]
     table_type: str
     except_data: Optional[ExprDataSources]
 
@@ -94,8 +84,8 @@ class ExprData:
     exprdata: ExprDataSources
     is_multicol: bool
     is_trivial: bool
-    origin_subject_db_name: Optional[Tuple[str, str]] = None
-    origin_except_data: Optional[ExprDataSources] = None
+    subject_db_name: Optional[Tuple[str, str]] = None
+    except_data: Optional[ExprDataSources] = None
 
 
 @dataclasses.dataclass(kw_only=True, repr=False, eq=False, slots=True)
@@ -106,26 +96,29 @@ class ExprDataSources:
     plain_chunks: Sequence[str]
 
 
-def _to_source(sql_expr: pg_ast.Base) -> str:
+def _to_source(sql_expr: pgast.Base) -> str:
     src = codegen.generate_source(sql_expr)
     # ColumnRefs are the most common thing, and they should be safe to
     # skip parenthesizing, for deuglification purposes. anything else
     # we put parens around, to be sure.
-    if not isinstance(sql_expr, pg_ast.ColumnRef):
+    if not isinstance(sql_expr, pgast.ColumnRef):
         src = f'({src})'
     return src
 
 
 def _edgeql_tree_to_expr_data(
-    sql_expr: pg_ast.Base, refs: Optional[Set[pg_ast.ColumnRef]] = None
+    sql_expr: pgast.Base, refs: Optional[Set[pgast.ColumnRef]] = None
 ) -> ExprDataSources:
     if refs is None:
-        refs = set(ast.find_children(
-            sql_expr, pg_ast.ColumnRef, lambda n: len(n.name) == 1))
+        refs = set(
+            ast.find_children(
+                sql_expr, pgast.ColumnRef, lambda n: len(n.name) == 1
+            )
+        )
 
     plain_expr = _to_source(sql_expr)
 
-    if isinstance(sql_expr, (pg_ast.RowExpr, pg_ast.ImplicitRowExpr)):
+    if isinstance(sql_expr, (pgast.RowExpr, pgast.ImplicitRowExpr)):
         chunks = []
 
         for elem in sql_expr.args:
@@ -133,7 +126,7 @@ def _edgeql_tree_to_expr_data(
     else:
         chunks = [plain_expr]
 
-    if isinstance(sql_expr, pg_ast.ColumnRef):
+    if isinstance(sql_expr, pgast.ColumnRef):
         refs.add(sql_expr)
 
     for ref in refs:
@@ -158,12 +151,12 @@ def _edgeql_ref_to_pg_constr(
 ) -> ExprData:
     sql_res = compiler.compile_ir_to_sql_tree(tree, singleton_mode=True)
 
-    sql_expr: pg_ast.Base
-    if isinstance(sql_res.ast, pg_ast.SelectStmt):
+    sql_expr: pgast.Base
+    if isinstance(sql_res.ast, pgast.SelectStmt):
         # XXX: use ast pattern matcher for this
         from_clause = sql_res.ast.from_clause[0]
-        assert isinstance(from_clause, pg_ast.RelRangeVar)
-        assert isinstance(from_clause.relation, pg_ast.CommonTableExpr)
+        assert isinstance(from_clause, pgast.RelRangeVar)
+        assert isinstance(from_clause.relation, pgast.CommonTableExpr)
         sql_expr = from_clause.relation.query.target_list[0].val
     else:
         sql_expr = sql_res.ast
@@ -174,22 +167,20 @@ def _edgeql_ref_to_pg_constr(
     if isinstance(tree, irast.Set) and isinstance(tree.expr, irast.SelectStmt):
         tree = tree.expr.result
 
-    is_multicol = isinstance(sql_expr, (pg_ast.RowExpr, pg_ast.ImplicitRowExpr))
+    is_multicol = isinstance(sql_expr, (pgast.RowExpr, pgast.ImplicitRowExpr))
 
     # Determine if the sequence of references are all simple refs, not
     # expressions.  This influences the type of Postgres constraint used.
     #
-    is_trivial = isinstance(sql_expr, pg_ast.ColumnRef) or (
-        isinstance(sql_expr, (pg_ast.RowExpr, pg_ast.ImplicitRowExpr))
-        and all(isinstance(el, pg_ast.ColumnRef) for el in sql_expr.args)
+    is_trivial = isinstance(sql_expr, pgast.ColumnRef) or (
+        isinstance(sql_expr, (pgast.RowExpr, pgast.ImplicitRowExpr))
+        and all(isinstance(el, pgast.ColumnRef) for el in sql_expr.args)
     )
 
     # Find all field references
     #
     refs = set(
-        ast.find_children(
-            sql_expr, pg_ast.ColumnRef, lambda n: len(n.name) == 1
-        )
+        ast.find_children(sql_expr, pgast.ColumnRef, lambda n: len(n.name) == 1)
     )
 
     if isinstance(subject, s_scalars.ScalarType):
@@ -220,14 +211,159 @@ def _edgeql_ref_to_pg_constr(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class CompiledConstraintData:
+    subject: s_types.Type | s_pointers.Pointer
+    exclusive_expr_refs: Optional[Sequence[irast.Base]]
+    subject_db_name: Optional[Tuple[str, str]]
+    except_data: Optional[ExprDataSources]
+    ir: irast.Statement
+    subject_table_type: str
+
+
+def _compile_constraint_data(
+    constraint: s_constraints.Constraint,
+    schema: s_schema.Schema,
+    is_optional: bool,
+    *,
+    span: Optional[parsing.Span] = None,
+    type_remaps: Optional[dict[s_obj.Object, s_obj.Object]] = None,
+) -> CompiledConstraintData:
+    sub = constraint.get_subject(schema)
+    assert isinstance(
+        sub, (s_types.Type, s_pointers.Pointer, s_scalars.ScalarType)
+    )
+    subject: s_types.Type | s_pointers.Pointer = sub
+
+    path_prefix_anchor = '__subject__'
+    singletons = frozenset({(subject, is_optional)})
+
+    options = qlcompiler.CompilerOptions(
+        anchors={'__subject__': subject},
+        path_prefix_anchor=path_prefix_anchor,
+        apply_query_rewrites=False,
+        singletons=singletons,
+        schema_object_context=type(constraint),
+        type_remaps=type_remaps if type_remaps is not None else {},
+    )
+
+    final_expr: Optional[s_expr.Expression] = constraint.get_finalexpr(schema)
+    assert final_expr is not None and final_expr.parse() is not None
+    ir = qlcompiler.compile_ast_to_ir(
+        final_expr.parse(),
+        schema,
+        options=options,
+    )
+    assert isinstance(ir, irast.Statement)
+
+    except_ir: Optional[irast.Statement] = None
+    except_data = None
+    if except_expr := constraint.get_except_expr(schema):
+        assert isinstance(except_expr, s_expr.Expression)
+        except_ir = qlcompiler.compile_ast_to_ir(
+            except_expr.parse(),
+            schema,
+            options=options,
+        )
+        except_sql = compiler.compile_ir_to_sql_tree(
+            except_ir, singleton_mode=True
+        )
+        except_data = _edgeql_tree_to_expr_data(except_sql.ast)
+
+    terminal_refs: set[irast.Set] = (
+        ir_utils.get_longest_paths(ir.expr.expr)
+    )
+    if except_ir is not None:
+        terminal_refs.update(
+            ir_utils.get_longest_paths(except_ir.expr)
+        )
+    ref_tables = get_ref_storage_info(ir.schema, terminal_refs)
+
+    if len(ref_tables) > 1:
+        raise errors.InvalidConstraintDefinitionError(
+            f'Constraint {constraint.get_displayname(schema)} on '
+            f'{subject.get_displayname(schema)} is not supported '
+            f'because it would depend on multiple objects',
+            span=span,
+        )
+    elif ref_tables:
+        subject_db_name, info = next(iter(ref_tables.items()))
+        subject_table_type = info[0][3].table_type
+    else:
+        # the expression does don't have any refs: default to the subject table
+
+        subject_table: Optional[s_obj.InheritingObject] | s_types.Type
+        if isinstance(subject, s_pointers.Pointer):
+            subject_table = subject.get_source(schema)
+        else:
+            subject_table = subject
+
+        assert subject_table
+        subject_db_name = common.get_backend_name(
+            schema, subject_table, catenate=False,
+        )
+        subject_table_type = 'ObjectType'
+
+    exclusive_expr_refs = _get_exclusive_refs(ir)
+
+    return CompiledConstraintData(
+        subject,
+        exclusive_expr_refs,
+        subject_db_name,
+        except_data,
+        ir,
+        subject_table_type,
+    )
+
+
+def _get_compiled_constraint_expr_data(
+    primary_subject: s_constraints.ConsistencySubject,
+    constraint_data: CompiledConstraintData,
+) -> list[ExprData]:
+    exprdatas: list[ExprData] = []
+
+    constraint_subject = (
+        constraint_data.subject
+        if constraint_data.subject != primary_subject else
+        None
+    )
+
+    assert constraint_data.exclusive_expr_refs is not None
+    for ref in constraint_data.exclusive_expr_refs:
+        exprdata = _edgeql_ref_to_pg_constr(
+            primary_subject, constraint_subject, ref
+        )
+        exprdata.subject_db_name = constraint_data.subject_db_name
+        exprdata.except_data = constraint_data.except_data
+        exprdatas.append(exprdata)
+
+    return exprdatas
+
+
+def table_constraint_requires_triggers(
+    constraint: s_constraints.Constraint,
+    schema: s_schema.Schema,
+    constraint_type: str,
+):
+    subject = constraint.get_subject(schema)
+    cname = constraint.get_shortname(schema)
+    if (
+        isinstance(subject, s_pointers.Pointer)
+        and subject.is_id_pointer(schema)
+        and cname == s_name.QualName('std', 'exclusive')
+    ):
+        return False
+    else:
+        return constraint_type != 'check'
+
+
 def compile_constraint(
     subject: s_constraints.ConsistencySubject,
     constraint: s_constraints.Constraint,
     schema: s_schema.Schema,
-    source_context: Optional[parsing.ParserContext],
+    span: Optional[parsing.Span],
 ) -> SchemaDomainConstraint | SchemaTableConstraint:
     assert constraint.get_subject(schema) is not None
-    TypeOrPointer = s_types.Type | s_pointers.Pointer
     assert isinstance(
         subject, (s_types.Type, s_pointers.Pointer, s_scalars.ScalarType)
     )
@@ -238,15 +374,12 @@ def compile_constraint(
     is_optional = isinstance(
         first_subject, s_pointers.Pointer
     ) and not first_subject.get_required(schema)
-    singletons: Collection[Tuple[TypeOrPointer, bool]] = frozenset(
-        {(subject, is_optional)}
-    )
-    options = qlcompiler.CompilerOptions(
-        anchors={qlast.Subject().name: subject},
-        path_prefix_anchor=qlast.Subject().name,
-        apply_query_rewrites=False,
-        singletons=singletons,
-        schema_object_context=type(constraint),
+
+    constraint_data = _compile_constraint_data(
+        constraint,
+        schema,
+        is_optional,
+        span=span,
         # Remap the constraint origin to the subject, so that if
         # we have B <: A, and the constraint references A.foo, it
         # gets rewritten in the subtype to B.foo. It's OK to only
@@ -256,191 +389,104 @@ def compile_constraint(
         type_remaps={first_subject: subject},
     )
 
-    final_expr = constraint.get_finalexpr(schema)
-    assert final_expr is not None and final_expr.qlast is not None
-    ir = qlcompiler.compile_ast_to_ir(
-        final_expr.qlast,
-        schema,
-        options=options,
-    )
-    assert isinstance(ir, irast.Statement)
-    assert isinstance(ir.expr.expr, irast.SelectStmt)
-
-    except_data = None
-    if except_expr := constraint.get_except_expr(schema):
-        except_ir = qlcompiler.compile_ast_to_ir(
-            except_expr.qlast,
-            schema,
-            options=options,
-        )
-        except_sql = compiler.compile_ir_to_sql_tree(
-            except_ir, singleton_mode=True
-        )
-        except_data = _edgeql_tree_to_expr_data(except_sql.ast)
-
-    terminal_refs = ir_utils.get_longest_paths(ir.expr.expr.result)
-    ref_tables = get_ref_storage_info(ir.schema, terminal_refs)
-
-    if len(ref_tables) > 1:
-        raise errors.InvalidConstraintDefinitionError(
-            f'Constraint {constraint.get_displayname(schema)} on '
-            f'{subject.get_displayname(schema)} is not supported '
-            f'because it would depend on multiple objects',
-            context=source_context,
-        )
-    elif ref_tables:
-        subject_db_name, info = next(iter(ref_tables.items()))
-        table_type = info[0][3].table_type
-    else:
-        # the expression does don't have any refs: default to the subject table
-
-        if isinstance(subject, s_pointers.Pointer):
-            subject_table = subject.get_source(schema)
-        else:
-            subject_table = subject
-
-        assert subject_table
-        subject_db_name = common.get_backend_name(
-            schema, subject_table, catenate=False
-        )
-        table_type = 'ObjectType'
-
-    exclusive_expr_refs = _get_exclusive_refs(ir)
-
     pg_constr_data = PGConstrData(
-        subject_db_name=subject_db_name,
+        subject_db_name=constraint_data.subject_db_name,
         expressions=[],
-        origin_expressions=[],
-        table_type=table_type,
-        except_data=except_data,
+        relative_expressions=[],
+        table_type=constraint_data.subject_table_type,
+        except_data=constraint_data.except_data,
     )
 
-    different_origins = [
-        origin for origin in constraint_origins if origin != constraint
-    ]
+    if constraint_data.exclusive_expr_refs:
+        origin_expr_datas: dict[
+            s_constraints.Constraint, list[ExprData]
+        ] = {}
+        for origin in constraint_origins:
+            if origin == constraint:
+                origin_data = constraint_data
 
-    per_origin_parts = []
-    for constraint_origin in different_origins:
-        sub = constraint_origin.get_subject(schema)
-        assert isinstance(sub, (s_types.Type, s_pointers.Pointer))
-        origin_subject: s_types.Type | s_pointers.Pointer = sub
+            else:
+                origin_data = _compile_constraint_data(
+                    origin,
+                    schema,
+                    is_optional,
+                )
 
-        origin_path_prefix_anchor = (
-            qlast.Subject().name
-            if isinstance(origin_subject, s_types.Type)
-            else None
-        )
-        singletons = frozenset({(origin_subject, is_optional)})
+            origin_expr_datas[origin] = _get_compiled_constraint_expr_data(
+                subject, origin_data
+            )
 
-        origin_options = qlcompiler.CompilerOptions(
-            anchors={qlast.Subject().name: origin_subject},
-            path_prefix_anchor=origin_path_prefix_anchor,
-            apply_query_rewrites=False,
-            singletons=singletons,
-            schema_object_context=type(constraint),
-        )
-
-        final_expr = constraint_origin.get_finalexpr(schema)
-        assert final_expr is not None and final_expr.qlast is not None
-        origin_ir = qlcompiler.compile_ast_to_ir(
-            final_expr.qlast,
-            schema,
-            options=origin_options,
-        )
-
-        assert origin_ir.expr.expr
-        origin_terminal_refs = ir_utils.get_longest_paths(
-            origin_ir.expr.expr
-        )
-        origin_ref_tables = get_ref_storage_info(
-            origin_ir.schema, origin_terminal_refs
-        )
-
-        if origin_ref_tables:
-            origin_subject_db_name, _ = next(iter(origin_ref_tables.items()))
+        # Set constraint expressions
+        expressions: list[ExprData]
+        if constraint in origin_expr_datas:
+            expressions = origin_expr_datas[constraint]
         else:
-            origin_subject_db_name = common.get_backend_name(
-                schema,
-                origin_subject,
-                catenate=False,
+            expressions = _get_compiled_constraint_expr_data(
+                subject, constraint_data
             )
 
-        origin_except_data = None
-        if except_expr := constraint_origin.get_except_expr(schema):
-            except_ir = qlcompiler.compile_ast_to_ir(
-                except_expr.qlast,
-                schema,
-                options=origin_options,
+        pg_constr_data.expressions.extend(expressions)
+
+        # Set relative expressions
+        # These are only needed for constraint triggers.
+        if (
+            not isinstance(constraint.get_subject(schema), s_scalars.ScalarType)
+            and table_constraint_requires_triggers(
+                constraint, schema, 'unique'
             )
-            except_sql = compiler.compile_ir_to_sql_tree(
-                except_ir, singleton_mode=True)
-            origin_except_data = _edgeql_tree_to_expr_data(except_sql.ast)
+        ):
+            relatives = list(set(
+                descendant
+                for origin in constraint_origins
+                for descendant in itertools.chain(
+                    [origin], origin.descendants(schema)
+                )
+            ))
 
-        origin_exclusive_expr_refs = _get_exclusive_refs(origin_ir)
-        per_origin_parts.append(
-            (
-                origin_subject,
-                origin_exclusive_expr_refs,
-                origin_subject_db_name,
-                origin_except_data,
-            )
-        )
+            relative_expressions: list[ExprData] = []
+            for relative in relatives:
+                if relative == constraint:
+                    relative_expressions.extend(expressions)
 
-    if not per_origin_parts:
-        origin_subject = subject
-        origin_subject_db_name = subject_db_name
-        origin_except_data = except_data
-        per_origin_parts.append(
-            (
-                origin_subject,
-                None,
-                origin_subject_db_name,
-                origin_except_data,
-            )
-        )
+                elif relative in origin_expr_datas:
+                    relative_expressions.extend(origin_expr_datas[relative])
 
-    if exclusive_expr_refs:
-        exprdatas: List[ExprData] = []
-        for ref in exclusive_expr_refs:
-            exprdata = _edgeql_ref_to_pg_constr(subject, None, ref)
-            exprdata.origin_subject_db_name = subject_db_name
-            exprdata.origin_except_data = except_data
-            exprdatas.append(exprdata)
+                else:
+                    relative_data = _compile_constraint_data(
+                        relative,
+                        schema,
+                        is_optional,
+                    )
+                    relative_expressions.extend(
+                        _get_compiled_constraint_expr_data(
+                            subject, relative_data
+                        )
+                    )
 
-        pg_constr_data.expressions.extend(exprdatas)
+            pg_constr_data.relative_expressions.extend(relative_expressions)
+
+        pg_constr_data.scope = 'relation'
+        pg_constr_data.type = 'unique'
 
     else:
         assert len(constraint_origins) == 1
-        exprdata = _edgeql_ref_to_pg_constr(subject, origin_subject, ir)
-        exprdata.origin_subject_db_name = origin_subject_db_name
-        exprdata.origin_except_data = origin_except_data
+        origin_data = (
+            _compile_constraint_data(
+                constraint_origins[0],
+                schema,
+                is_optional,
+            )
+            if constraint_origins[0] != constraint else
+            constraint_data
+        )
+        exprdata = _edgeql_ref_to_pg_constr(
+            subject, origin_data.subject, constraint_data.ir
+        )
+        exprdata.subject_db_name = origin_data.subject_db_name
+        exprdata.except_data = origin_data.except_data
 
         pg_constr_data.expressions.append(exprdata)
 
-    for (
-        origin_subject,
-        origin_exclusive_expr_refs,
-        origin_subject_db_name,
-        origin_except_data,
-    ) in per_origin_parts:
-        if not exclusive_expr_refs:
-            continue
-
-        if origin_exclusive_expr_refs:
-            for ref in origin_exclusive_expr_refs:
-                exprdata = _edgeql_ref_to_pg_constr(
-                    subject, origin_subject, ref
-                )
-                exprdata.origin_subject_db_name = origin_subject_db_name
-                exprdata.origin_except_data = origin_except_data
-                pg_constr_data.origin_expressions.append(exprdata)
-        else:
-            pg_constr_data.origin_expressions.extend(exprdatas)
-
-    if exclusive_expr_refs:
-        pg_constr_data.scope = 'relation'
-        pg_constr_data.type = 'unique'
-    else:
         pg_constr_data.scope = 'row'
         pg_constr_data.type = 'check'
 
@@ -487,7 +533,7 @@ class SchemaDomainConstraint:
         return ops
 
     def alter_ops(
-        self, orig_constr: SchemaConstraint, only_modify_enabled: bool = False
+        self, orig_constr: SchemaConstraint
     ):
         ops = dbops.CommandGroup()
         return ops
@@ -507,6 +553,10 @@ class SchemaDomainConstraint:
         ops = dbops.CommandGroup()
         return ops
 
+    def update_trigger_ops(self) -> dbops.CommandGroup:
+        ops = dbops.CommandGroup()
+        return ops
+
 
 @dataclasses.dataclass(kw_only=True, repr=False, eq=False, slots=True)
 class SchemaTableConstraint:
@@ -522,16 +572,18 @@ class SchemaTableConstraint:
 
         table_name = pg_c.subject_db_name
         expressions = pg_c.expressions
-        origin_expressions = pg_c.origin_expressions
+        relative_expressions = pg_c.relative_expressions
+        assert table_name
 
         return deltadbops.SchemaConstraintTableConstraint(
             table_name,
             constraint=constr.constraint,
             exprdata=expressions,
-            origin_exprdata=origin_expressions,
+            relative_exprdata=relative_expressions,
             except_data=pg_c.except_data,
             scope=pg_c.scope,
             type=pg_c.type,
+            table_type=pg_c.table_type,
             schema=constr.schema,
         )
 
@@ -540,14 +592,16 @@ class SchemaTableConstraint:
 
         tabconstr = self._table_constraint(self)
         add_constr = deltadbops.AlterTableAddConstraint(
-            name=tabconstr.get_subject_name(quote=False), constraint=tabconstr)
+            name=tabconstr.get_subject_name(quote=False),
+            constraint=tabconstr,
+        )
 
         ops.add_command(add_constr)
 
         return ops
 
     def alter_ops(
-        self, orig_constr: SchemaConstraint, only_modify_enabled=False
+        self, orig_constr: SchemaConstraint
     ):
         ops = dbops.CommandGroup()
 
@@ -556,8 +610,9 @@ class SchemaTableConstraint:
 
         alter_constr = deltadbops.AlterTableAlterConstraint(
             name=tabconstr.get_subject_name(quote=False),
-            constraint=orig_tabconstr, new_constraint=tabconstr,
-            only_modify_enabled=only_modify_enabled)
+            constraint=orig_tabconstr,
+            new_constraint=tabconstr,
+        )
 
         ops.add_command(alter_constr)
 
@@ -568,7 +623,9 @@ class SchemaTableConstraint:
 
         tabconstr = self._table_constraint(self)
         add_constr = deltadbops.AlterTableDropConstraint(
-            name=tabconstr.get_subject_name(quote=False), constraint=tabconstr)
+            name=tabconstr.get_subject_name(quote=False),
+            constraint=tabconstr,
+        )
 
         ops.add_command(add_constr)
 
@@ -582,23 +639,23 @@ class SchemaTableConstraint:
         constr_name = tabconstr.constraint_name()
         raw_constr_name = tabconstr.constraint_name(quote=False)
 
-        for expr, origin_expr in zip(
+        for expr, relative_expr in zip(
             itertools.cycle(tabconstr._exprdata),
-            tabconstr._origin_exprdata
+            tabconstr._relative_exprdata
         ):
             exprdata = expr.exprdata
-            origin_exprdata = origin_expr.exprdata
-            old_expr = origin_exprdata.old
+            relative_exprdata = relative_expr.exprdata
+            old_expr = relative_exprdata.old
             new_expr = exprdata.new
 
-            assert origin_expr.origin_subject_db_name
-            schemaname, tablename = origin_expr.origin_subject_db_name
+            assert relative_expr.subject_db_name
+            schemaname, tablename = relative_expr.subject_db_name
             real_tablename = tabconstr.get_subject_name(quote=False)
 
             errmsg = 'duplicate key value violates unique ' \
                      'constraint {constr}'.format(constr=constr_name)
             detail = common.quote_literal(
-                f"Key ({origin_exprdata.plain}) already exists."
+                f"Key ({relative_exprdata.plain}) already exists."
             )
 
             if (
@@ -610,12 +667,12 @@ class SchemaTableConstraint:
                 key = "id"
 
             except_data = tabconstr._except_data
-            origin_except_data = origin_expr.origin_except_data
+            relative_except_data = relative_expr.except_data
 
             if except_data:
-                assert origin_except_data
+                assert relative_except_data
                 except_part = f'''
-                    AND ({origin_except_data.old} is not true)
+                    AND ({relative_except_data.old} is not true)
                     AND ({except_data.new} is not true)
                 '''
             else:
@@ -624,7 +681,7 @@ class SchemaTableConstraint:
             check = dbops.Query(
                 f'''
                 SELECT
-                    edgedb.raise(
+                    edgedb_VER.raise(
                         NULL::text,
                         'unique_violation',
                         msg => '{errmsg}',
@@ -633,7 +690,7 @@ class SchemaTableConstraint:
                         "schema" => '{schemaname}',
                         detail => {detail}
                     )
-                FROM {common.qname(schemaname, tablename+"_t")} AS OLD
+                FROM {common.qname(schemaname, tablename)} AS OLD
                 CROSS JOIN {common.qname(*real_tablename)} AS NEW
                 WHERE {old_expr} = {new_expr} and OLD.{key} != NEW.{key}
                 {except_part}
@@ -641,6 +698,19 @@ class SchemaTableConstraint:
                 '''
             )
             ops.add_command(check)
+
+        return ops
+
+    def update_trigger_ops(self) -> dbops.CommandGroup:
+        ops = dbops.CommandGroup()
+
+        tabconstr = self._table_constraint(self)
+        add_constr = deltadbops.AlterTableUpdateConstraintTrigger(
+            name=tabconstr.get_subject_name(quote=False),
+            constraint=tabconstr,
+        )
+
+        ops.add_command(add_constr)
 
         return ops
 
@@ -669,6 +739,8 @@ def ptr_default_to_col_default(schema, ptr, expr):
         return None
 
     if not ir_utils.is_const(ir):
+        return None
+    if ast.find_children(ir, irast.TupleIndirectionPointer):
         return None
 
     try:
@@ -707,21 +779,26 @@ def get_ref_storage_info(
     for ref in refs:
         ptr: s_pointers.PointerLike
         src: s_types.Type | s_pointers.PointerLike
-        if ref.rptr is None:
+
+        rptr = ref.expr if isinstance(ref.expr, irast.Pointer) else None
+        if rptr is None:
             source_typeref = ref.typeref
             if not irtyputils.is_object(source_typeref):
+                continue
+            if irtyputils.is_free_object(source_typeref):
                 continue
             schema, t = irtyputils.ir_typeref_to_type(schema, ref.typeref)
             assert isinstance(t, s_sources.Source)
             ptr = t.getptr(schema, s_name.UnqualName('id'))
         else:
-            ptrref = ref.rptr.ptrref
+            ptrref = rptr.ptrref
             schema, ptr = irtyputils.ptrcls_from_ptrref(ptrref, schema=schema)
-            source_typeref = ref.rptr.source.typeref
+            source_typeref = rptr.source.typeref
 
         if ptr.is_link_property(schema):
-            assert ref.rptr and ref.rptr.source and ref.rptr.source.rptr
-            srcref = ref.rptr.source.rptr.ptrref
+            assert rptr and rptr.source
+            assert isinstance(rptr.source.expr, irast.Pointer)
+            srcref = rptr.source.expr.ptrref
             schema, src = irtyputils.ptrcls_from_ptrref(
                 srcref, schema=schema)
             if src.get_is_derived(schema):
@@ -729,12 +806,12 @@ def get_ref_storage_info(
                 # for the purposes of constraint expr compilation.
                 src = src.get_bases(schema).first(schema)
         elif ptr.is_tuple_indirection():
-            assert ref.rptr
-            refs.append(ref.rptr.source)
+            assert rptr
+            refs.append(rptr.source)  # noqa: B909
             continue
         elif ptr.is_type_intersection():
-            assert ref.rptr
-            refs.append(ref.rptr.source)
+            assert rptr
+            refs.append(rptr.source)  # noqa: B909
             continue
         else:
             schema, src = irtyputils.ir_typeref_to_type(schema, source_typeref)

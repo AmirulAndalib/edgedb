@@ -16,10 +16,12 @@
 # limitations under the License.
 #
 
-from typing import *
+from typing import Any
 
 import enum
 import uuid
+
+from edb.ir import statypes
 
 
 class ToJson:
@@ -36,4 +38,6 @@ def json_hook(value: Any) -> Any:
         return value.value
     elif isinstance(value, (frozenset, set)):
         return list(value)
+    elif isinstance(value, statypes.ScalarType):
+        return value.to_json()
     raise TypeError(f"Cannot serialize {value!r}")

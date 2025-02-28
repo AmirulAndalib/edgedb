@@ -21,10 +21,10 @@ import asyncio
 import re
 import time
 
-from edgedb import con_utils
-from edgedb import enums
-from edgedb.protocol.asyncio_proto cimport AsyncIOProtocol
-from edgedb.protocol.protocol cimport ReadBuffer, WriteBuffer
+from gel import con_utils
+from gel import enums
+from gel.protocol.asyncio_proto cimport AsyncIOProtocol
+from gel.protocol.protocol cimport ReadBuffer, WriteBuffer
 
 from . import messages
 
@@ -63,6 +63,7 @@ cdef class Connection:
             messages.Execute(
                 annotations=[],
                 command_text=query,
+                input_language=messages.InputLanguage.EDGEQL,
                 output_format=messages.OutputFormat.NONE,
                 expected_cardinality=messages.Cardinality.MANY,
                 allowed_capabilities=messages.Capability.ALL,
@@ -148,6 +149,7 @@ async def new_connection(
     user: str = None,
     password: str = None,
     secret_key: str = None,
+    branch: str = None,
     database: str = None,
     timeout: float = 60,
     tls_ca: str = None,
@@ -165,12 +167,14 @@ async def new_connection(
         password=password,
         secret_key=secret_key,
         database=database,
+        branch=branch,
         timeout=timeout,
         command_timeout=None,
         server_settings=None,
         tls_ca=tls_ca,
         tls_ca_file=tls_ca_file,
         tls_security=tls_security,
+        tls_server_name=None,
         wait_until_available=timeout,
         credentials=credentials,
         credentials_file=credentials_file,

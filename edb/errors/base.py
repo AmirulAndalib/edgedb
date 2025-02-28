@@ -19,16 +19,16 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Optional, Type, Iterator, Dict
 
-from edb.common import context as pctx
+from edb.common import span as edb_span
 from edb.common import exceptions as ex
 
 import contextlib
 
 
 __all__ = (
-    'EdgeDBError', 'EdgeDBMessage', 'ensure_context',
+    'EdgeDBError', 'EdgeDBMessage', 'ensure_span',
 )
 
 
@@ -89,22 +89,20 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
         *,
         hint: Optional[str] = None,
         details: Optional[str] = None,
-        context=None,
+        span: Optional[edb_span.Span] = None,
         position: Optional[tuple[int, int, int, int | None]] = None,
         filename: Optional[str] = None,
-        token=None,
         pgext_code: Optional[str] = None,
     ):
         if type(self) is EdgeDBError:
             raise RuntimeError(
                 'EdgeDBError is not supposed to be instantiated directly')
 
-        self.token = token
         self._attrs = {}
         self._pgext_code = pgext_code
 
-        if isinstance(context, pctx.ParserContext):
-            self.set_source_context(context)
+        if span:
+            self.set_span(span)
         elif position:
             self.set_position(*position)
 
@@ -119,8 +117,23 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
     def get_code(cls):
         if cls._code is None:
             raise RuntimeError(
-                f'EdgeDB message code is not set (type: {cls.__name__})')
+                f'Gel message code is not set (type: {cls.__name__})')
         return cls._code
+
+    def to_json(self):
+        err_dct = {
+            'message': str(self),
+            'type': str(type(self).__name__),
+            'code': self.get_code(),
+        }
+        for name, field in _JSON_FIELDS.items():
+            if field in self._attrs:
+                val = self._attrs[field]
+                if field in _INT_FIELDS:
+                    val = int(val)
+                err_dct[name] = val
+
+        return err_dct
 
     def set_filename(self, filename):
         self._attrs[FIELD_FILENAME] = filename
@@ -140,16 +153,16 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
         if details is not None:
             self._attrs[FIELD_DETAILS] = details
 
-    def has_source_context(self):
-        return FIELD_DETAILS in self._attrs
+    def has_span(self):
+        return FIELD_POSITION_START in self._attrs
 
-    def set_source_context(self, context: Optional[pctx.ParserContext]):
-        if not context:
+    def set_span(self, span: Optional[edb_span.Span]):
+        if not span:
             return
 
-        start = context.start_point
-        end = context.end_point
-        ex.replace_context(self, context)
+        start = span.start_point
+        end = span.end_point
+        ex.replace_context(self, span)
 
         self._attrs[FIELD_POSITION_START] = str(start.offset)
         self._attrs[FIELD_POSITION_END] = str(end.offset)
@@ -161,8 +174,8 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
         self._attrs[FIELD_LINE_END] = str(end.line)
         self._attrs[FIELD_COLUMN_END] = str(end.column)
         self._attrs[FIELD_UTF16_COLUMN_END] = str(end.utf16column)
-        if context.name and context.name != '<string>':
-            self._attrs[FIELD_FILENAME] = context.name
+        if span.name and span.name != '<string>':
+            self._attrs[FIELD_FILENAME] = span.name
 
     def set_position(
         self,
@@ -184,6 +197,14 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
         return int(self._attrs.get(FIELD_COLUMN_START, -1))
 
     @property
+    def line_end(self):
+        return int(self._attrs.get(FIELD_LINE_END, -1))
+
+    @property
+    def col_end(self):
+        return int(self._attrs.get(FIELD_COLUMN_END, -1))
+
+    @property
     def position(self):
         return int(self._attrs.get(FIELD_POSITION_START, -1))
 
@@ -199,14 +220,18 @@ class EdgeDBError(Exception, metaclass=EdgeDBErrorMeta):
     def pgext_code(self):
         return self._pgext_code
 
+    @property
+    def filename(self):
+        return self._attrs.get(FIELD_FILENAME, None)
+
 
 @contextlib.contextmanager
-def ensure_context(context: Any) -> Iterator[None]:
+def ensure_span(span: Optional[edb_span.Span]) -> Iterator[None]:
     try:
         yield
     except EdgeDBError as e:
-        if not e.has_source_context():
-            e.set_source_context(context)
+        if span and not e.has_span():
+            e.set_span(span)
         raise
 
 
@@ -226,3 +251,27 @@ FIELD_UTF16_COLUMN_END = 0x_FF_F8
 FIELD_CHARACTER_START = 0x_FF_F9
 FIELD_CHARACTER_END = 0x_FF_FA
 FIELD_FILENAME = 0x_FF_FB
+
+_INT_FIELDS = {
+    FIELD_POSITION_START,
+    FIELD_POSITION_END,
+    FIELD_LINE_START,
+    FIELD_COLUMN_START,
+    FIELD_UTF16_COLUMN_START,
+    FIELD_LINE_END,
+    FIELD_COLUMN_END,
+    FIELD_UTF16_COLUMN_END,
+    FIELD_CHARACTER_START,
+    FIELD_CHARACTER_END,
+}
+
+# Fields to include in the json dump of the type
+_JSON_FIELDS = {
+    'filename': FIELD_FILENAME,
+    'hint': FIELD_HINT,
+    'details': FIELD_DETAILS,
+    'start': FIELD_CHARACTER_START,
+    'end': FIELD_CHARACTER_END,
+    'line': FIELD_LINE_START,
+    'col': FIELD_COLUMN_START,
+}

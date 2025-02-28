@@ -22,7 +22,18 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    Type,
+    Union,
+    Iterable,
+    Sequence,
+    Dict,
+    NamedTuple,
+    cast,
+)
 
 from edb import errors
 
@@ -54,12 +65,12 @@ def get_schema_object(
     condition: Optional[Callable[[s_obj.Object], bool]]=None,
     label: Optional[str]=None,
     ctx: context.ContextLevel,
-    srcctx: Optional[parsing.ParserContext] = None,
+    span: Optional[parsing.Span] = None,
 ) -> s_obj.Object:
 
     if isinstance(ref, qlast.ObjectRef):
-        if srcctx is None:
-            srcctx = ref.context
+        if span is None:
+            span = ref.span
         module = ref.module
         lname = ref.name
     elif isinstance(ref, qlast.PseudoObjectRef):
@@ -72,10 +83,6 @@ def get_schema_object(
         name = sn.QualName(module=module, name=lname)
     else:
         name = sn.UnqualName(name=lname)
-
-    view = _get_type_variant(name, ctx)
-    if view is not None:
-        return view
 
     try:
         stype = ctx.env.get_schema_object_and_track(
@@ -96,21 +103,18 @@ def get_schema_object(
             item_type=item_type,
             pointer_parent=_get_partial_path_prefix_type(ctx),
             condition=condition,
-            context=srcctx,
+            span=span,
         )
         raise
 
-    view = _get_type_variant(stype.get_name(ctx.env.schema), ctx)
-    if view is not None:
-        return view
-    elif stype == ctx.defining_view:
+    if stype == ctx.defining_view:
         # stype is the view in process of being defined and as such is
         # not yet a valid schema object
         raise errors.SchemaDefinitionError(
             f'illegal self-reference in definition of {str(name)!r}',
-            context=srcctx)
-    else:
-        return stype
+            span=span)
+
+    return stype
 
 
 def _get_partial_path_prefix_type(
@@ -126,17 +130,6 @@ def _get_partial_path_prefix_type(
     return type
 
 
-def _get_type_variant(
-    name: sn.Name,
-    ctx: context.ContextLevel,
-) -> Optional[s_obj.Object]:
-    type_variant = ctx.aliased_views.get(name)
-    if type_variant is not None:
-        return type_variant
-    else:
-        return None
-
-
 def get_schema_type(
     name: qlast.BaseObjectRef,
     module: Optional[str] = None,
@@ -145,20 +138,20 @@ def get_schema_type(
     label: Optional[str] = None,
     condition: Optional[Callable[[s_obj.Object], bool]] = None,
     item_type: Optional[Type[s_obj.Object]] = None,
-    srcctx: Optional[parsing.ParserContext] = None,
+    span: Optional[parsing.Span] = None,
 ) -> s_types.Type:
     if item_type is None:
         item_type = s_types.Type
     obj = get_schema_object(name, module, item_type=item_type,
                             condition=condition, label=label,
-                            ctx=ctx, srcctx=srcctx)
+                            ctx=ctx, span=span)
     assert isinstance(obj, s_types.Type)
     return obj
 
 
 def resolve_schema_name(
-        name: str, module: str, *,
-        ctx: context.ContextLevel) -> Optional[sn.QualName]:
+    name: str, module: str, *, ctx: context.ContextLevel
+) -> Optional[sn.QualName]:
     schema_module = ctx.modaliases.get(module)
     if schema_module is None:
         return None
@@ -248,13 +241,18 @@ def derive_view(
                 inheritance_refdicts={'pointers'},
                 mark_derived=True,
                 transient=True,
+                # When compiling aliases, we can't elide
+                # @source/@target pointers, which normally we would
+                # when creating a view.
+                preserve_endpoint_ptrs=ctx.env.options.schema_view_mode,
                 attrs=attrs,
+                stdmode=ctx.env.options.bootstrap_mode,
             )
 
         if (
             stype.is_view(ctx.env.schema)
             # XXX: Previously, the main check here was just for
-            # (not stype.generic(...)). generic isn't really the
+            # (not stype.is_non_concrete(...)). is_non_concrete isn't really the
             # right way to figure out if something is a view, since
             # some aliases will be generic. On changing it to is_view
             # instead, though, two GROUP BY tests that grouped
@@ -266,7 +264,7 @@ def derive_view(
             # a way that they count as being generic, but for now
             # preserve that behavior.
             and not (
-                stype.generic(ctx.env.schema)
+                stype.is_non_concrete(ctx.env.schema)
                 and (view_ir := ctx.view_sets.get(stype))
                 and (scope_info := ctx.env.path_scope_map.get(view_ir))
                 and scope_info.binding_kind
@@ -297,8 +295,6 @@ def derive_view(
     if preserve_shape and stype in ctx.env.view_shapes:
         preserve_view_shape(stype, derived, ctx=ctx)
 
-    ctx.env.created_schema_objects.add(derived)
-
     return derived
 
 
@@ -327,10 +323,8 @@ def derive_ptr(
     # actually deriving from it.
     if derive_backlink:
         attrs = attrs.copy() if attrs else {}
-        attrs['computed_backlink'] = ptr
-        ntarget = ptr.get_source(ctx.env.schema)
-        assert isinstance(ntarget, s_types.Type)
-        target = ntarget
+        attrs['computed_link_alias'] = ptr
+        attrs['computed_link_alias_is_backward'] = True
         ptr = ctx.env.schema.get('std::link', type=s_pointers.Pointer)
 
     ctx.env.schema, derived = ptr.derive_ref(
@@ -343,9 +337,14 @@ def derive_ptr(
         inheritance_refdicts={'pointers'},
         mark_derived=True,
         transient=True,
-        attrs=attrs)
+        # When compiling aliases, we can't elide
+        # @source/@target pointers, which normally we would
+        # when creating a view.
+        preserve_endpoint_ptrs=ctx.env.options.schema_view_mode,
+        attrs=attrs,
+    )
 
-    if not ptr.generic(ctx.env.schema):
+    if not ptr.is_non_concrete(ctx.env.schema):
         if isinstance(derived, s_sources.Source):
             ptr = cast(s_links.Link, ptr)
             scls_pointers = ptr.get_pointers(ctx.env.schema)
@@ -364,8 +363,6 @@ def derive_ptr(
 
     if preserve_shape and ptr in ctx.env.view_shapes:
         preserve_view_shape(ptr, derived, ctx=ctx)
-
-    ctx.env.created_schema_objects.add(derived)
 
     return derived
 
@@ -395,25 +392,45 @@ def derive_view_name(
 
 
 def get_union_type(
-    types: Iterable[s_types.TypeT],
+    types: Sequence[s_types.TypeT],
     *,
     opaque: bool = False,
     preserve_derived: bool = False,
     ctx: context.ContextLevel,
+    span: Optional[parsing.Span] = None,
 ) -> s_types.TypeT:
 
-    ctx.env.schema, union, created = s_utils.ensure_union_type(
-        ctx.env.schema, types,
-        opaque=opaque, preserve_derived=preserve_derived, transient=True)
-
-    if created:
-        ctx.env.created_schema_objects.add(union)
-    elif (
-        union not in ctx.env.created_schema_objects
-        and (
-            not isinstance(union, s_obj.QualifiedObject)
-            or union.get_name(ctx.env.schema).module != '__derived__'
+    targets: Sequence[s_types.Type]
+    if preserve_derived:
+        targets = s_utils.simplify_union_types_preserve_derived(
+            ctx.env.schema, types
         )
+    else:
+        targets = s_utils.simplify_union_types(
+            ctx.env.schema, types
+        )
+
+    try:
+        ctx.env.schema, union, _ = s_utils.ensure_union_type(
+            ctx.env.schema, targets,
+            opaque=opaque, transient=True)
+    except errors.SchemaError as e:
+        union_name = (
+            '(' + ' | '.join(sorted(
+            t.get_displayname(ctx.env.schema)
+            for t in types
+            )) + ')'
+        )
+        e.args = (
+            (f'cannot create union {union_name} {e.args[0]}',)
+            + e.args[1:]
+        )
+        e.set_span(span)
+        raise e
+
+    if (
+        not isinstance(union, s_obj.QualifiedObject)
+        or union.get_name(ctx.env.schema).module != '__derived__'
     ):
         ctx.env.add_schema_ref(union, expr=None)
 
@@ -421,22 +438,20 @@ def get_union_type(
 
 
 def get_intersection_type(
-    types: Iterable[s_types.TypeT],
+    types: Sequence[s_types.TypeT],
     *,
     ctx: context.ContextLevel,
 ) -> s_types.TypeT:
 
-    ctx.env.schema, intersection, created = s_utils.ensure_intersection_type(
-        ctx.env.schema, types, transient=True)
+    targets: Sequence[s_types.Type]
+    targets = s_utils.simplify_intersection_types(ctx.env.schema, types)
+    ctx.env.schema, intersection = s_utils.ensure_intersection_type(
+        ctx.env.schema, targets, transient=True
+    )
 
-    if created:
-        ctx.env.created_schema_objects.add(intersection)
-    elif (
-        intersection not in ctx.env.created_schema_objects
-        and (
-            not isinstance(intersection, s_obj.QualifiedObject)
-            or intersection.get_name(ctx.env.schema).module != '__derived__'
-        )
+    if (
+        not isinstance(intersection, s_obj.QualifiedObject)
+        or intersection.get_name(ctx.env.schema).module != '__derived__'
     ):
         ctx.env.add_schema_ref(intersection, expr=None)
 
@@ -470,26 +485,24 @@ def concretify(
         return get_union_type(ts, ctx=ctx)
     if els := t.get_intersection_of(ctx.env.schema):
         ts = [concretify(e, ctx=ctx) for e in els.objects(ctx.env.schema)]
-        return get_intersection_type(ts , ctx=ctx)
+        return get_intersection_type(ts, ctx=ctx)
     return t
 
 
 def get_all_concrete(
     stype: s_objtypes.ObjectType, *, ctx: context.ContextLevel
 ) -> set[s_objtypes.ObjectType]:
-    if stype.get_intersection_of(ctx.env.schema):
-        # TODO: We should enumerate all object types in the intersection
-        # maybe in concretify, though?
-        raise errors.UnsupportedFeatureError(
-            'DML statements on intersections are not implemented yet',
-        )
-
     if union := stype.get_union_of(ctx.env.schema):
         return {
             x
             for t in union.objects(ctx.env.schema)
             for x in get_all_concrete(t, ctx=ctx)
         }
+    elif intersection := stype.get_intersection_of(ctx.env.schema):
+        return set.intersection(*(
+            get_all_concrete(t, ctx=ctx)
+            for t in intersection.objects(ctx.env.schema)
+        ))
     return {stype} | {
         x for x in stype.descendants(ctx.env.schema)
         if x.is_material_object_type(ctx.env.schema)
@@ -504,16 +517,9 @@ class TypeIntersectionResult(NamedTuple):
 
 
 def apply_intersection(
-    left: s_types.Type,
-    right: s_types.Type,
-    *,
-    ctx: context.ContextLevel
+    left: s_types.Type, right: s_types.Type, *, ctx: context.ContextLevel
 ) -> TypeIntersectionResult:
     """Compute an intersection of two types: *left* and *right*.
-
-    In theory, this should handle all combinations of unions and intersections
-    recursively, but currently this handles only the common case of
-    intersecting a regular type or a union type with a regular type.
 
     Returns:
         A :class:`~TypeIntersectionResult` named tuple containing the
@@ -527,40 +533,34 @@ def apply_intersection(
         # of the argument, then this is, effectively, a NOP.
         return TypeIntersectionResult(stype=left)
 
-    is_subtype = False
-    empty_intersection = False
-    union = left.get_union_of(ctx.env.schema)
-    if union:
-        # If the argument type is a union type, then we
-        # narrow it by the intersection type.
-        narrowed_union = []
-        for component_type in union.objects(ctx.env.schema):
-            if component_type.issubclass(ctx.env.schema, right):
-                narrowed_union.append(component_type)
-            elif right.issubclass(ctx.env.schema, component_type):
-                narrowed_union.append(right)
+    if right.issubclass(ctx.env.schema, left):
+        # The intersection type is a proper *subclass* and can be directly
+        # narrowed.
+        return TypeIntersectionResult(
+            stype=right,
+            is_empty=False,
+            is_subtype=True,
+        )
 
-        if len(narrowed_union) == 0:
-            int_type = get_intersection_type((left, right), ctx=ctx)
-            is_subtype = int_type.issubclass(ctx.env.schema, left)
-            assert isinstance(right, s_obj.InheritingObject)
-            empty_intersection = not any(
-                c.issubclass(ctx.env.schema, left)
-                for c in right.descendants(ctx.env.schema)
-            )
-        elif len(narrowed_union) == 1:
-            int_type = narrowed_union[0]
-            is_subtype = int_type.issubclass(ctx.env.schema, left)
-        else:
-            int_type = get_union_type(narrowed_union, ctx=ctx)
-    else:
-        is_subtype = right.issubclass(ctx.env.schema, left)
-        empty_intersection = not is_subtype
-        int_type = get_intersection_type((left, right), ctx=ctx)
+    if (
+        left.get_is_opaque_union(ctx.env.schema)
+        and (left_union := left.get_union_of(ctx.env.schema))
+    ):
+        # Expose any opaque union types before continuing with the intersection.
+        # The schema does not yet fully implement type intersections since there
+        # is no `IntersectionTypeShell`. As a result, some intersections
+        # produced while compiling the standard library cannot be resolved.
+        left = get_union_type(left_union.objects(ctx.env.schema), ctx=ctx)
+
+    int_type: s_types.Type = get_intersection_type([left, right], ctx=ctx)
+    is_empty: bool = (
+        not s_utils.expand_type_expr_descendants(int_type, ctx.env.schema)
+    )
+    is_subtype: bool = int_type.issubclass(ctx.env.schema, left)
 
     return TypeIntersectionResult(
         stype=int_type,
-        is_empty=empty_intersection,
+        is_empty=is_empty,
         is_subtype=is_subtype,
     )
 
@@ -578,7 +578,6 @@ def derive_dummy_ptr(
     if derived_obj is None:
         ctx.env.schema, derived_obj = stdobj.derive_subtype(
             ctx.env.schema, name=derived_obj_name)
-        ctx.env.created_schema_objects.add(derived_obj)
 
     derived_name = ptr.get_derived_name(
         ctx.env.schema, derived_obj)
@@ -595,9 +594,7 @@ def derive_dummy_ptr(
             },
             name=derived_name,
             mark_derived=True,
-            transient=True,
         )
-        ctx.env.created_schema_objects.add(derived)
 
     return derived
 
@@ -623,7 +620,4 @@ def get_union_pointer(
         modname=modname,
         transient=True,
     )
-
-    ctx.env.created_schema_objects.add(ptr)
-
     return ptr

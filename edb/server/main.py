@@ -18,11 +18,25 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Optional,
+    Tuple,
+    Union,
+    Iterator,
+    Mapping,
+    Dict,
+    NoReturn,
+    TYPE_CHECKING,
+)
+
+from edb.common.log import early_setup
+# ruff: noqa: E402
+early_setup()
 
 import asyncio
 import contextlib
-import dataclasses
+import json
 import logging
 import os
 import os.path
@@ -38,10 +52,8 @@ import click
 import setproctitle
 import uvloop
 
-from . import logsetup
-logsetup.early_setup()
-
 from edb import buildmeta
+from edb import errors
 from edb.ir import statypes
 from edb.common import exceptions
 from edb.common import devmode
@@ -53,13 +65,14 @@ from . import args as srvargs
 from . import compiler as edbcompiler
 from . import daemon
 from . import defines
-from . import pgconnparams
+from . import logsetup
 from . import pgcluster
 from . import service_manager
 
 
 if TYPE_CHECKING:
     from . import server
+    from edb.server import bootstrap
 else:
     # Import server lazily to make sure that most of imports happen
     # under coverage (if we're testing with it).  Otherwise
@@ -103,14 +116,8 @@ def _ensure_runstate_dir(
     runstate_dir = pathlib.Path(runstate_dir)
 
     if not runstate_dir.exists():
-        if not runstate_dir.parent.exists():
-            abort(
-                f'cannot create the runstate directory: '
-                f'{str(runstate_dir.parent)!r} does not exist; please use '
-                f'--runstate-dir to specify the correct location')
-
         try:
-            runstate_dir.mkdir()
+            runstate_dir.mkdir(parents=True)
         except PermissionError as ex:
             abort(
                 f'cannot create the runstate directory: '
@@ -167,7 +174,7 @@ def _internal_state_dir(
 
 async def _init_cluster(
     cluster, args: srvargs.ServerConfig
-) -> tuple[bool, edbcompiler.CompilerState]:
+) -> tuple[bool, edbcompiler.Compiler]:
     from edb.server import bootstrap
 
     new_instance = await bootstrap.ensure_bootstrapped(cluster, args)
@@ -181,7 +188,7 @@ def _init_parsers():
     # Initialize parsers that are used in the server process.
     from edb.edgeql import parser as ql_parser
 
-    ql_parser.preload(allow_rebuild=devmode.is_in_dev_mode())
+    ql_parser.preload_spec()
 
 
 async def _run_server(
@@ -192,7 +199,8 @@ async def _run_server(
     *,
     do_setproctitle: bool,
     new_instance: bool,
-    compiler_state: edbcompiler.CompilerState,
+    compiler: edbcompiler.Compiler,
+    init_con_data: list[config.ConState],
 ):
 
     sockets = service_manager.get_activation_listen_sockets()
@@ -210,9 +218,14 @@ async def _run_server(
             instance_name=args.instance_name,
             max_backend_connections=args.max_backend_connections,
             backend_adaptive_ha=args.backend_adaptive_ha,
+            extensions_dir=args.extensions_dir,
+        )
+        tenant.set_init_con_data(init_con_data)
+        tenant.set_reloadable_files(
             readiness_state_file=args.readiness_state_file,
             jwt_sub_allowlist_file=args.jwt_sub_allowlist_file,
             jwt_revocation_list_file=args.jwt_revocation_list_file,
+            config_file=args.config_file,
         )
         ss = server.Server(
             runstate_dir=runstate_dir,
@@ -235,14 +248,27 @@ async def _run_server(
             pidfile_dir=args.pidfile_dir,
             new_instance=new_instance,
             admin_ui=args.admin_ui,
+            cors_always_allowed_origins=args.cors_always_allowed_origins,
             disable_dynamic_system_config=args.disable_dynamic_system_config,
-            compiler_state=compiler_state,
+            compiler_state=compiler.state,
             tenant=tenant,
+            use_monitor_fs=args.reload_config_files in [
+                srvargs.ReloadTrigger.Default,
+                srvargs.ReloadTrigger.FileSystemEvent,
+            ],
+            net_worker_mode=args.net_worker_mode,
         )
+        magic_smtp = os.getenv('EDGEDB_MAGIC_SMTP_CONFIG')
+        if magic_smtp:
+            await tenant.load_sidechannel_configs(
+                json.loads(magic_smtp), compiler=compiler
+            )
+        if args.config_file:
+            await tenant.load_config_file(compiler)
         # This coroutine runs as long as the server,
-        # and compiler_state is *heavy*, so make sure we don't
+        # and compiler(.state) is *heavy*, so make sure we don't
         # keep a reference to it.
-        del compiler_state
+        del compiler
         await sc.wait_for(ss.init())
 
         (
@@ -255,17 +281,36 @@ async def _run_server(
             return
 
         ss.init_tls(
-            args.tls_cert_file, args.tls_key_file, tls_cert_newly_generated)
+            args.tls_cert_file,
+            args.tls_key_file,
+            tls_cert_newly_generated,
+            args.tls_client_ca_file,
+        )
 
         ss.init_jwcrypto(args.jws_key_file, jws_keys_newly_generated)
+        ss.start_watching_files()
 
         def load_configuration(_signum):
+            if args.reload_config_files not in [
+                srvargs.ReloadTrigger.Default,
+                srvargs.ReloadTrigger.Signal,
+            ]:
+                logger.info(
+                    "SIGHUP received, but reload on signal is disabled"
+                )
+                return
+
             logger.info("reloading configuration")
             try:
                 if args.readiness_state_file:
                     tenant.reload_readiness_state()
-                ss.reload_tls(args.tls_cert_file, args.tls_key_file)
+                ss.reload_tls(
+                    args.tls_cert_file,
+                    args.tls_key_file,
+                    args.tls_client_ca_file,
+                )
                 ss.load_jwcrypto(args.jws_key_file)
+                tenant.reload_config_file.schedule()
             except Exception:
                 logger.critical(
                     "Unexpected error occurred during reload configuration; "
@@ -326,14 +371,12 @@ async def _get_local_pgcluster(
         tenant_id=tenant_id,
         log_level=args.log_level,
     )
-    cluster.set_connection_params(
-        pgconnparams.ConnectionParameters(
-            user='postgres',
-            database='template1',
-            server_settings={
-                "application_name": f'edgedb_instance_{args.instance_name}',
-            }
-        ),
+    cluster.update_connection_params(
+        user='postgres',
+        database='template1',
+        server_settings={
+            "application_name": f'edgedb_instance_{args.instance_name}',
+        }
     )
     return cluster, args
 
@@ -364,17 +407,55 @@ async def _get_remote_pgcluster(
         abort(f'--max-backend-connections is too large for this backend; '
               f'detected maximum available NUM: {max_conns}')
 
-    conn_params = cluster.get_connection_params()
-    conn_params = dataclasses.replace(
-        conn_params,
-        server_settings=dict(
-            conn_params.server_settings,
-            application_name=f'edgedb_instance_{args.instance_name}',
-        ),
-    )
-    cluster.set_connection_params(conn_params)
+    cluster.update_connection_params(server_settings={
+        'application_name': f'edgedb_instance_{args.instance_name}'
+    })
 
     return cluster, args
+
+
+def _patch_stdlib_testmode(
+    stdlib: bootstrap.StdlibBits
+) -> bootstrap.StdlibBits:
+    from edb import edgeql
+    from edb.pgsql import delta as delta_cmds
+    from edb.pgsql import params as pg_params
+    from edb.edgeql import ast as qlast
+    from edb.schema import ddl as s_ddl
+    from edb.schema import delta as sd
+    from edb.schema import schema as s_schema
+    from edb.schema import std as s_std
+
+    schema: s_schema.Schema = s_schema.ChainedSchema(
+        s_schema.EMPTY_SCHEMA,
+        stdlib.stdschema,
+        stdlib.global_schema,
+    )
+    reflschema = stdlib.reflschema
+    ctx = sd.CommandContext(
+        stdmode=True,
+        backend_runtime_params=pg_params.get_default_runtime_params(),
+    )
+
+    for modname in s_schema.TESTMODE_SOURCES:
+        ddl_text = s_std.get_std_module_text(modname)
+        for ddl_cmd in edgeql.parse_block(ddl_text):
+            assert isinstance(ddl_cmd, qlast.DDLCommand)
+            delta = s_ddl.delta_from_ddl(
+                ddl_cmd, modaliases={}, schema=schema, stdmode=True
+            )
+            if not delta.canonical:
+                sd.apply(delta, schema=schema)
+            delta = delta_cmds.CommandMeta.adapt(delta)
+            schema = sd.apply(delta, schema=schema, context=ctx)
+            reflschema = delta.apply(reflschema, ctx)
+
+    assert isinstance(schema, s_schema.ChainedSchema)
+    return stdlib._replace(
+        stdschema=schema.get_top_schema(),
+        global_schema=schema.get_global_schema(),
+        reflschema=reflschema,
+    )
 
 
 async def run_server(
@@ -389,7 +470,7 @@ async def run_server(
 
     logsetup.setup_logging(args.log_level, args.log_to)
 
-    logger.info(f"starting EdgeDB server {buildmeta.get_version_line()}")
+    logger.info(f"starting Gel server {buildmeta.get_version_line()}")
     if args.multitenant_config_file:
         logger.info("configured as a multitenant instance")
     else:
@@ -402,6 +483,13 @@ async def run_server(
             fd = int(fd_str)
         except ValueError:
             logger.info("Invalid EDGEDB_SERVER_EXTERNAL_LOCK_FD")
+        else:
+            os.set_inheritable(fd, False)
+    if fd_str := os.environ.get("GEL_SERVER_EXTERNAL_LOCK_FD"):
+        try:
+            fd = int(fd_str)
+        except ValueError:
+            logger.info("Invalid GEL_SERVER_EXTERNAL_LOCK_FD")
         else:
             os.set_inheritable(fd, False)
 
@@ -455,6 +543,19 @@ async def run_server(
                     "Cannot run multi-tenant server "
                     "without pre-compiled standard library"
                 )
+            if args.testmode:
+                # In multitenant mode, the server/compiler is started without a
+                # backend and will be connected to many backends. That means we
+                # cannot load the stdlib from a certain backend; instead, the
+                # pre-compiled stdlib is always in use. This means that we need
+                # to explicitly enable --testmode starting a multitenant server
+                # in order to handle backends with test-mode schema properly.
+                try:
+                    stdlib = _patch_stdlib_testmode(stdlib)
+                except errors.SchemaError:
+                    # The pre-compiled standard library already has test-mode
+                    # schema; ignore the patching error.
+                    pass
 
             compiler = edbcompiler.new_compiler(
                 stdlib.stdschema,
@@ -472,6 +573,7 @@ async def run_server(
                 user_schema=stdlib.reflschema,
                 reflection=reflection,
             )
+            del reflection
             compiler_state = edbcompiler.CompilerState(
                 std_schema=compiler.state.std_schema,
                 refl_schema=compiler.state.refl_schema,
@@ -483,6 +585,7 @@ async def run_server(
                 local_intro_query=local_intro_sql,
                 global_intro_query=global_intro_sql,
             )
+            del local_intro_sql, global_intro_sql
             (
                 sys_queries,
                 report_configs_typedesc_1_0,
@@ -493,11 +596,19 @@ async def run_server(
                 compiler_state.config_spec,
             )
 
-            sys_config, backend_settings = initialize_static_cfg(
-                args,
-                is_remote_cluster=True,
-                config_spec=compiler_state.config_spec,
+            sys_config, backend_settings, init_con_data = (
+                initialize_static_cfg(
+                    args,
+                    is_remote_cluster=True,
+                    compiler=compiler,
+                )
             )
+            del compiler
+            if backend_settings:
+                abort(
+                    'Static backend settings for remote backend are '
+                    'not supported'
+                )
             with _internal_state_dir(runstate_dir, args) as (
                 int_runstate_dir,
                 args,
@@ -505,7 +616,6 @@ async def run_server(
                 return await multitenant.run_server(
                     args,
                     sys_config=sys_config,
-                    backend_settings=backend_settings,
                     sys_queries={
                         key: sql.encode("utf-8")
                         for key, sql in sys_queries.items()
@@ -518,6 +628,7 @@ async def run_server(
                     internal_runstate_dir=int_runstate_dir,
                     do_setproctitle=do_setproctitle,
                     compiler_state=compiler_state,
+                    init_con_data=init_con_data,
                 )
         except server.StartupError as e:
             abort(str(e))
@@ -566,19 +677,33 @@ async def run_server(
 
         logger.info("postgres cluster is running")
 
-        new_instance, compiler_state = await _init_cluster(cluster, args)
+        if (
+            args.inplace_upgrade_prepare
+            or args.inplace_upgrade_finalize
+            or args.inplace_upgrade_rollback
+        ):
+            from . import inplace_upgrade
+            await inplace_upgrade.inplace_upgrade(cluster, args)
+            return
 
-        _, backend_settings = initialize_static_cfg(
+        new_instance, compiler = await _init_cluster(cluster, args)
+
+        _, backend_settings, init_con_data = initialize_static_cfg(
             args,
             is_remote_cluster=not is_local_cluster,
-            config_spec=compiler_state.config_spec,
+            compiler=compiler,
         )
 
-        if is_local_cluster and (new_instance or backend_settings):
-            logger.info('Restarting server to reload configuration...')
-            await cluster.stop()
-            await cluster.start(server_settings=backend_settings)
-            backend_settings = {}
+        if is_local_cluster:
+            if new_instance or backend_settings:
+                logger.info('Restarting server to reload configuration...')
+                await cluster.stop()
+                await cluster.start(server_settings=backend_settings)
+        elif backend_settings:
+            abort(
+                'Static backend settings for remote backend are not supported'
+            )
+        del backend_settings
 
         if (
             not args.bootstrap_only
@@ -593,25 +718,25 @@ async def run_server(
                 is srvargs.JOSEKeyMode.Generate
             )
         ):
-            conn_params = cluster.get_connection_params()
             instance_name = args.instance_name
-            conn_params = dataclasses.replace(
-                conn_params,
-                server_settings={
-                    **conn_params.server_settings,
-                    **backend_settings,
-                    'application_name': f'edgedb_instance_{instance_name}',
-                    'edgedb.instance_name': instance_name,
-                    'edgedb.server_version': buildmeta.get_version_json(),
-                },
-            )
-            if args.data_dir:
-                conn_params.database = pgcluster.get_database_backend_name(
-                    defines.EDGEDB_TEMPLATE_DB,
-                    tenant_id=tenant_id,
+            database = pgcluster.get_database_backend_name(
+                defines.EDGEDB_TEMPLATE_DB,
+                tenant_id=tenant_id,
+            ) if args.data_dir else None
+            server_settings = {
+                'application_name': f'edgedb_instance_{instance_name}',
+                'edgedb.instance_name': instance_name,
+                'edgedb.server_version': buildmeta.get_version_json(),
+            }
+            if database:
+                cluster.update_connection_params(
+                    database=database,
+                    server_settings=server_settings
                 )
-
-            cluster.set_connection_params(conn_params)
+            else:
+                cluster.update_connection_params(
+                    server_settings=server_settings
+                )
 
             with _internal_state_dir(runstate_dir, args) as (
                 int_runstate_dir,
@@ -624,7 +749,8 @@ async def run_server(
                     int_runstate_dir,
                     do_setproctitle=do_setproctitle,
                     new_instance=new_instance,
-                    compiler_state=compiler_state,
+                    compiler=compiler,
+                    init_con_data=init_con_data,
                 )
 
     except server.StartupError as e:
@@ -724,19 +850,23 @@ def server_main(**kwargs: Any) -> None:
 
 
 @click.group(
-    'EdgeDB Server',
+    'Gel Server',
     invoke_without_command=True,
     context_settings=dict(help_option_names=['-h', '--help'])
 )
 @srvargs.server_options
 @click.pass_context
 def main(ctx, version=False, **kwargs):
-    if kwargs.get('testmode') and 'EDGEDB_TEST_CATALOG_VERSION' in os.environ:
+    if kwargs.get('testmode') and 'GEL_TEST_CATALOG_VERSION' in os.environ:
+        buildmeta.EDGEDB_CATALOG_VERSION = int(
+            os.environ['GEL_TEST_CATALOG_VERSION']
+        )
+    elif kwargs.get('testmode') and 'EDGEDB_TEST_CATALOG_VERSION' in os.environ:
         buildmeta.EDGEDB_CATALOG_VERSION = int(
             os.environ['EDGEDB_TEST_CATALOG_VERSION']
         )
     if version:
-        print(f"edgedb-server, version {buildmeta.get_version()}")
+        print(f"gel-server, version {buildmeta.get_version()}")
         sys.exit(0)
     if ctx.invoked_subcommand is None:
         server_main(**kwargs)
@@ -755,106 +885,81 @@ def main_dev():
     main()
 
 
-def _coerce_cfg_value(setting: config.Setting, value):
-    if setting.set_of:
-        return frozenset(
-            config.coerce_single_value(setting, v) for v in value
-        )
-    else:
-        return config.coerce_single_value(setting, value)
-
-
 def initialize_static_cfg(
     args: srvargs.ServerConfig,
     is_remote_cluster: bool,
-    config_spec: config.Spec
-) -> Tuple[Mapping[str, config.SettingValue], Dict[str, str]]:
+    compiler: edbcompiler.Compiler,
+) -> Tuple[
+    Mapping[str, config.SettingValue], Dict[str, str], list[config.ConState]
+]:
     result = {}
-    init_con_script_data = []
+    init_con_script_data: list[config.ConState] = []
     backend_settings = {}
-    command_line_argument = "A"
-    environment_variable = "E"
+    config_spec = compiler.state.config_spec
     sources = {
-        command_line_argument: "command line argument",
-        environment_variable: "environment variable",
+        config.ConStateType.command_line_argument: "command line argument",
+        config.ConStateType.environment_variable: "environment variable",
     }
 
-    def add_config(name, value, type_):
-        setting = config_spec[name]
-        if is_remote_cluster:
-            if setting.backend_setting and setting.requires_restart:
-                if type_ == command_line_argument:
-                    where = "on command line"
-                else:
-                    where = "as an environment variable"
-                raise server.StartupError(
-                    f"Can't set config {name!r} {where} when using "
-                    f"a remote Postgres cluster"
-                )
-        value = _coerce_cfg_value(setting, value)
-        init_con_script_data.append({
-            "name": name,
-            "value": config.value_to_json_value(setting, value),
-            "type": type_,
-        })
-        result[name] = config.SettingValue(
-            name=name,
-            value=value,
-            source=sources[type_],
-            scope=config.ConfigScope.INSTANCE,
-        )
-        if setting.backend_setting:
-            if isinstance(value, statypes.ScalarType):
-                value = value.to_backend_str()
-            backend_settings[setting.backend_setting] = str(value)
+    def add_config_values(obj: dict[str, Any], source: config.ConStateType):
+        settings = compiler.compile_structured_config(
+            {"cfg::Config": obj}, source=sources[source]
+        )["cfg::Config"]
+        for name, value in settings.items():
+            setting = config_spec[name]
 
-    def iter_environ():
-        translate_env = {
-            "EDGEDB_SERVER_BIND_ADDRESS": "listen_addresses",
-            "EDGEDB_SERVER_PORT": "listen_port"
-        }
-        for name, value in os.environ.items():
-            if cfg := translate_env.get(name):
-                yield name, value, cfg
+            if is_remote_cluster:
+                if setting.backend_setting and setting.requires_restart:
+                    if source == config.ConStateType.command_line_argument:
+                        where = "on command line"
+                    else:
+                        where = "as an environment variable"
+                    raise server.StartupError(
+                        f"Can't set config {name!r} {where} when using "
+                        f"a remote Postgres cluster"
+                    )
+            init_con_script_data.append({
+                "name": name,
+                "value": config.value_to_json_value(setting, value.value),
+                "type": source,
+            })
+            result[name] = value
+            if setting.backend_setting:
+                backend_val = value.value
+                if isinstance(backend_val, statypes.ScalarType):
+                    backend_val = backend_val.to_backend_str()
+                backend_settings[setting.backend_setting] = str(backend_val)
+
+    values: dict[str, Any] = {}
+    translate_env = {
+        "EDGEDB_SERVER_BIND_ADDRESS": "listen_addresses",
+        "EDGEDB_SERVER_PORT": "listen_port",
+        "GEL_SERVER_BIND_ADDRESS": "listen_addresses",
+        "GEL_SERVER_PORT": "listen_port",
+    }
+    for name, value in os.environ.items():
+        if cfg := translate_env.get(name):
+            values[cfg] = value
+        else:
+            cfg = name.removeprefix("EDGEDB_SERVER_CONFIG_cfg::")
+            if cfg != name:
+                values[cfg] = value
             else:
-                cfg = name.removeprefix("EDGEDB_SERVER_CONFIG_cfg::")
+                cfg = name.removeprefix("GEL_SERVER_CONFIG_cfg::")
                 if cfg != name:
-                    yield name, value, cfg
+                    values[cfg] = value
+    if values:
+        add_config_values(values, config.ConStateType.environment_variable)
 
-    env_value: Any
-    setting: config.Setting
-    for env_name, env_value, cfg_name in iter_environ():
-        try:
-            setting = config_spec[cfg_name]
-        except KeyError:
-            continue
-        choices = setting.enum_values
-        if setting.type == bool:
-            choices = ['true', 'false']
-        env_value = env_value.lower()
-        if choices is not None and env_value not in choices:
-            raise server.StartupError(
-                f"Environment variable {env_name!r} can only be one of: " +
-                ", ".join(choices)
-            )
-        if setting.type == bool:
-            env_value = env_value == 'true'
-        elif not issubclass(setting.type, statypes.ScalarType):  # type: ignore
-            env_value = setting.type(env_value)  # type: ignore
-        add_config(cfg_name, env_value, environment_variable)
-
+    values = {}
     if args.bind_addresses:
-        add_config(
-            "listen_addresses", args.bind_addresses, command_line_argument
-        )
+        values["listen_addresses"] = args.bind_addresses
     if args.port:
-        add_config("listen_port", args.port, command_line_argument)
+        values["listen_port"] = args.port
+    if values:
+        add_config_values(values, config.ConStateType.command_line_argument)
 
-    if init_con_script_data:
-        from . import pgcon
-        pgcon.set_init_con_script_data(init_con_script_data)
-
-    return immutables.Map(result), backend_settings
+    return immutables.Map(result), backend_settings, init_con_script_data
 
 
 if __name__ == '__main__':

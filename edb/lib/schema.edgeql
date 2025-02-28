@@ -35,7 +35,7 @@ CREATE SCALAR TYPE schema::OperatorKind
     EXTENDING enum<Infix, Postfix, Prefix, Ternary>;
 
 CREATE SCALAR TYPE schema::Volatility
-    EXTENDING enum<Immutable, Stable, Volatile>;
+    EXTENDING enum<Immutable, Stable, Volatile, Modifying>;
 
 CREATE SCALAR TYPE schema::ParameterKind
     EXTENDING enum<VariadicParam, NamedOnlyParam, PositionalParam>;
@@ -63,6 +63,9 @@ CREATE SCALAR TYPE schema::RewriteKind
 
 CREATE SCALAR TYPE schema::MigrationGeneratedBy
     EXTENDING enum<DevMode, DDLStatement>;
+
+CREATE SCALAR TYPE schema::IndexDeferrability
+    EXTENDING enum<Prohibited, Permitted, `Required`>;
 
 # Base type for all schema entities.
 CREATE ABSTRACT TYPE schema::Object EXTENDING std::BaseObject {
@@ -267,6 +270,8 @@ CREATE TYPE schema::Index
 {
     CREATE PROPERTY expr -> std::str;
     CREATE PROPERTY except_expr -> std::str;
+    CREATE PROPERTY deferrability -> schema::IndexDeferrability;
+    CREATE PROPERTY deferred -> std::bool;
     CREATE MULTI LINK params EXTENDING schema::ordered -> schema::Parameter {
         ON TARGET DELETE ALLOW;
     };
@@ -292,6 +297,7 @@ CREATE ABSTRACT TYPE schema::Pointer
     CREATE PROPERTY readonly -> std::bool;
     CREATE PROPERTY default -> std::str;
     CREATE PROPERTY expr -> std::str;
+    CREATE PROPERTY secret -> std::bool;
 };
 
 
@@ -357,7 +363,7 @@ CREATE FUNCTION std::sequence_reset(
                 true
             )
         FROM
-            ROWS FROM (edgedb.get_user_sequence_backend_name("seq"))
+            ROWS FROM (edgedb_VER.get_user_sequence_backend_name("seq"))
                 AS sn(schema text, name text)
     $$;
 };
@@ -377,7 +383,7 @@ CREATE FUNCTION std::sequence_reset(
                 false
             )
         FROM
-            ROWS FROM (edgedb.get_user_sequence_backend_name("seq"))
+            ROWS FROM (edgedb_VER.get_user_sequence_backend_name("seq"))
                 AS sn(schema text, name text),
             LATERAL (
                 SELECT start_value
@@ -400,7 +406,7 @@ CREATE FUNCTION std::sequence_next(
                     || '.' || pg_catalog.quote_ident(sn.name)
             )
         FROM
-            ROWS FROM (edgedb.get_user_sequence_backend_name("seq"))
+            ROWS FROM (edgedb_VER.get_user_sequence_backend_name("seq"))
                 AS sn(schema text, name text)
     $$;
 };
@@ -560,6 +566,7 @@ CREATE TYPE schema::Migration
 {
     CREATE MULTI LINK parents -> schema::Migration;
     CREATE REQUIRED PROPERTY script -> str;
+    CREATE PROPERTY sdl -> str;
     CREATE PROPERTY message -> str;
     CREATE PROPERTY generated_by -> schema::MigrationGeneratedBy;
 };

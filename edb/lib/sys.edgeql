@@ -24,8 +24,24 @@ CREATE SCALAR TYPE sys::TransactionIsolation
     EXTENDING enum<RepeatableRead, Serializable>;
 
 
+CREATE SCALAR TYPE sys::TransactionAccessMode
+    EXTENDING enum<ReadOnly, ReadWrite>;
+
+
+CREATE SCALAR TYPE sys::TransactionDeferrability
+    EXTENDING enum<Deferrable, NotDeferrable>;
+
+
 CREATE SCALAR TYPE sys::VersionStage
     EXTENDING enum<dev, alpha, beta, rc, final>;
+
+
+CREATE SCALAR TYPE sys::QueryType
+    EXTENDING enum<EdgeQL, SQL>;
+
+
+CREATE SCALAR TYPE sys::OutputFormat
+    EXTENDING enum<BINARY, JSON, JSON_ELEMENTS, NONE>;
 
 
 CREATE ABSTRACT TYPE sys::SystemObject EXTENDING schema::Object;
@@ -33,26 +49,52 @@ CREATE ABSTRACT TYPE sys::SystemObject EXTENDING schema::Object;
 CREATE ABSTRACT TYPE sys::ExternalObject EXTENDING sys::SystemObject;
 
 
-CREATE TYPE sys::Database EXTENDING
+CREATE TYPE sys::Branch EXTENDING
         sys::ExternalObject,
         schema::AnnotationSubject {
     ALTER PROPERTY name {
         CREATE CONSTRAINT std::exclusive;
     };
+    CREATE PROPERTY last_migration-> std::str;
 };
+
+CREATE ALIAS sys::Database := sys::Branch;
 
 
 CREATE TYPE sys::ExtensionPackage EXTENDING
         sys::SystemObject,
         schema::AnnotationSubject {
     CREATE REQUIRED PROPERTY script -> str;
-    CREATE REQUIRED PROPERTY version -> tuple<
-                                            major: std::int64,
-                                            minor: std::int64,
-                                            stage: sys::VersionStage,
-                                            stage_no: std::int64,
-                                            local: array<std::str>,
-                                        >;
+    CREATE REQUIRED PROPERTY version ->
+        tuple<
+             major: std::int64,
+             minor: std::int64,
+             stage: sys::VersionStage,
+             stage_no: std::int64,
+             local: array<std::str>,
+         >;
+};
+
+CREATE TYPE sys::ExtensionPackageMigration EXTENDING
+        sys::SystemObject,
+        schema::AnnotationSubject {
+    CREATE REQUIRED PROPERTY script -> str;
+    CREATE REQUIRED PROPERTY from_version ->
+        tuple<
+             major: std::int64,
+             minor: std::int64,
+             stage: sys::VersionStage,
+             stage_no: std::int64,
+             local: array<std::str>,
+         >;
+    CREATE REQUIRED PROPERTY to_version ->
+        tuple<
+             major: std::int64,
+             minor: std::int64,
+             stage: sys::VersionStage,
+             stage_no: std::int64,
+             local: array<std::str>,
+         >;
 };
 
 
@@ -80,6 +122,145 @@ CREATE TYPE sys::Role EXTENDING
 
 ALTER TYPE sys::Role {
     CREATE MULTI LINK member_of -> sys::Role;
+};
+
+
+CREATE TYPE sys::QueryStats EXTENDING sys::ExternalObject {
+    CREATE LINK branch -> sys::Branch {
+        CREATE ANNOTATION std::description :=
+            "The branch this statistics entry was collected in.";
+    };
+    CREATE PROPERTY query -> std::str {
+        CREATE ANNOTATION std::description :=
+            "Text string of a representative query.";
+    };
+    CREATE PROPERTY query_type -> sys::QueryType {
+        CREATE ANNOTATION std::description :=
+            "Type of the query.";
+    };
+    CREATE PROPERTY tag -> std::str {
+        CREATE ANNOTATION std::description :=
+            "Query tag, commonly specifies the origin of the query, e.g 'gel/cli' for queries originating from the CLI.  Clients can specify a tag for easier query identification.";
+    };
+
+    CREATE PROPERTY compilation_config -> std::json;
+    CREATE PROPERTY protocol_version -> tuple<major: std::int16,
+                                              minor: std::int16>;
+    CREATE PROPERTY default_namespace -> std::str;
+    CREATE OPTIONAL PROPERTY namespace_aliases -> std::json;
+    CREATE OPTIONAL PROPERTY output_format -> sys::OutputFormat;
+    CREATE OPTIONAL PROPERTY expect_one -> std::bool;
+    CREATE OPTIONAL PROPERTY implicit_limit -> std::int64;
+    CREATE OPTIONAL PROPERTY inline_typeids -> std::bool;
+    CREATE OPTIONAL PROPERTY inline_typenames -> std::bool;
+    CREATE OPTIONAL PROPERTY inline_objectids -> std::bool;
+
+    CREATE PROPERTY plans -> std::int64 {
+        CREATE ANNOTATION std::description :=
+            "Number of times the query was planned in the backend.";
+    };
+    CREATE PROPERTY total_plan_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Total time spent planning the query in the backend.";
+    };
+    CREATE PROPERTY min_plan_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Minimum time spent planning the query in the backend. "
+            ++ "This field will be zero if the counter has been reset "
+            ++ "using the `sys::reset_query_stats` function "
+            ++ "with the `minmax_only` parameter set to `true` "
+            ++ "and never been planned since.";
+    };
+    CREATE PROPERTY max_plan_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Maximum time spent planning the query in the backend. "
+            ++ "This field will be zero if the counter has been reset "
+            ++ "using the `sys::reset_query_stats` function "
+            ++ "with the `minmax_only` parameter set to `true` "
+            ++ "and never been planned since.";
+    };
+    CREATE PROPERTY mean_plan_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Mean time spent planning the query in the backend.";
+    };
+    CREATE PROPERTY stddev_plan_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Population standard deviation of time spent "
+            ++ "planning the query in the backend.";
+    };
+
+    CREATE PROPERTY calls -> std::int64 {
+        CREATE ANNOTATION std::description :=
+            "Number of times the query was executed.";
+    };
+    CREATE PROPERTY total_exec_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Total time spent executing the query in the backend.";
+    };
+    CREATE PROPERTY min_exec_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Minimum time spent executing the query in the backend, "
+            ++ "this field will be zero until this query is executed "
+            ++ "first time after reset performed by the "
+            ++ "`sys::reset_query_stats` function with the "
+            ++ "`minmax_only` parameter set to `true`";
+    };
+    CREATE PROPERTY max_exec_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Maximum time spent executing the query in the backend, "
+            ++ "this field will be zero until this query is executed "
+            ++ "first time after reset performed by the "
+            ++ "`sys::reset_query_stats` function with the "
+            ++ "`minmax_only` parameter set to `true`";
+    };
+    CREATE PROPERTY mean_exec_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Mean time spent executing the query in the backend.";
+    };
+    CREATE PROPERTY stddev_exec_time -> std::duration {
+        CREATE ANNOTATION std::description :=
+            "Population standard deviation of time spent "
+            ++ "executing the query in the backend.";
+    };
+
+    CREATE PROPERTY rows -> std::int64 {
+        CREATE ANNOTATION std::description :=
+            "Total number of rows retrieved or affected by the query.";
+    };
+    CREATE PROPERTY stats_since -> std::datetime {
+        CREATE ANNOTATION std::description :=
+            "Time at which statistics gathering started for this query.";
+    };
+    CREATE PROPERTY minmax_stats_since -> std::datetime {
+        CREATE ANNOTATION std::description :=
+            "Time at which min/max statistics gathering started "
+            ++ "for this query (fields `min_plan_time`, `max_plan_time`, "
+            ++ "`min_exec_time` and `max_exec_time`).";
+    };
+};
+
+
+CREATE FUNCTION
+sys::reset_query_stats(
+    named only branch_name: OPTIONAL std::str = {},
+    named only id: OPTIONAL std::uuid = {},
+    named only minmax_only: OPTIONAL std::bool = false,
+) -> OPTIONAL std::datetime {
+    CREATE ANNOTATION std::description :=
+        'Discard query statistics gathered so far corresponding to the '
+        ++ 'specified `branch_name` and `id`. If either of the '
+        ++ 'parameters is not specified, the statistics that match with the '
+        ++ 'other parameter will be reset. If no parameter is specified, '
+        ++ 'it will discard all statistics. When `minmax_only` is `true`, '
+        ++ 'only the values of minimum and maximum planning and execution '
+        ++ 'time will be reset (i.e. `min_plan_time`, `max_plan_time`, '
+        ++ '`min_exec_time` and `max_exec_time` fields). The default value '
+        ++ 'for `minmax_only` parameter is `false`. This function returns '
+        ++ 'the time of a reset. This time is saved to `stats_reset` or '
+        ++ '`minmax_stats_since` field of `sys::QueryStats` if the '
+        ++ 'corresponding reset was actually performed.';
+    SET volatility := 'Volatile';
+    USING SQL FUNCTION 'edgedb.reset_query_stats';
 };
 
 
@@ -176,7 +357,18 @@ CREATE FUNCTION
 sys::get_current_database() -> str
 {
     CREATE ANNOTATION std::description :=
-        'Return the name of the current database as a string.';
+        'Return the name of the current database branch as a string.';
+    # The results won't change within a single statement.
+    SET volatility := 'Stable';
+    USING SQL FUNCTION 'edgedb.get_current_database';
+};
+
+
+CREATE FUNCTION
+sys::get_current_branch() -> str
+{
+    CREATE ANNOTATION std::description :=
+        'Return the name of the current database branch as a string.';
     # The results won't change within a single statement.
     SET volatility := 'Stable';
     USING SQL FUNCTION 'edgedb.get_current_database';

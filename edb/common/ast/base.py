@@ -24,7 +24,19 @@ import collections.abc
 import functools
 import re
 import sys
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    TypeVar,
+    Dict,
+    List,
+    Set,
+    FrozenSet,
+    cast,
+    get_type_hints,
+    TYPE_CHECKING,
+    AbstractSet  # NoQA
+)
 
 from edb.common import debug
 from edb.common import markup
@@ -40,8 +52,14 @@ class ASTError(Exception):
 
 class _Field:
     def __init__(
-            self, name, type_, default, factory,
-            field_hidden=False, field_meta=False):
+        self,
+        name,
+        type_,
+        default,
+        factory,
+        field_hidden=False,
+        field_meta=False,
+    ):
         self.name = name
         self.type = type_
         self.default = default
@@ -139,7 +157,7 @@ class AST:
                     # there's a cycle it's better to have correct
                     # static type analysis even though the runtime
                     # validation infrastructure does not support
-                    # cyclic rerefences.
+                    # cyclic references.
                     # XXX: This is a horrible hack, need to find
                     # a better way.
                     m = re.match(r"name '(\w+)' is not defined", e.args[0])
@@ -243,8 +261,8 @@ class AST:
         self.__dict__ = kwargs
 
     def __copy__(self):
-        copied = self.__class__()
-        for field, value in iter_fields(self, include_meta=False):
+        copied = self._init_copy()
+        for field, value in iter_fields(self, include_meta=True):
             try:
                 object.__setattr__(copied, field, value)
             except AttributeError:
@@ -253,10 +271,13 @@ class AST:
         return copied
 
     def __deepcopy__(self, memo):
-        copied = self.__class__()
-        for field, value in iter_fields(self, include_meta=False):
+        copied = self._init_copy()
+        for field, value in iter_fields(self, include_meta=True):
             object.__setattr__(copied, field, copy.deepcopy(value, memo))
         return copied
+
+    def _init_copy(self):
+        return self.__class__()
 
     def replace(self: T, **changes) -> T:
         copied = copy.copy(self)
@@ -301,6 +322,7 @@ class ImmutableASTMixin:
     # mypy gets mad about this if there isn't a __setattr__ in AST.
     # I don't know why.
     if not TYPE_CHECKING:
+
         def __setattr__(self, name, value):
             if self.__frozen and name not in self.__ast_mutable_fields__:
                 raise TypeError(f'cannot set {name} on immutable {self!r}')

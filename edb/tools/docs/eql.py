@@ -208,7 +208,7 @@ import lxml.etree
 import pygments.lexers
 import pygments.lexers.special
 
-from typing import *
+from typing import Any, Dict
 
 from edb.common import debug
 
@@ -235,8 +235,15 @@ from . import shared
 
 class EQLField(s_docfields.Field):
 
-    def __init__(self, name, names=(), label=None, has_arg=False,
-                 rolename=None, bodyrolename=None):
+    def __init__(
+        self,
+        name,
+        names=(),
+        label=None,
+        has_arg=False,
+        rolename=None,
+        bodyrolename=None,
+    ):
         super().__init__(name, names, label, has_arg, rolename, bodyrolename)
 
     def make_field(self, *args, **kwargs):
@@ -244,9 +251,17 @@ class EQLField(s_docfields.Field):
         node['eql-name'] = self.name
         return node
 
-    def make_xref(self, rolename, domain, target,
-                  innernode=d_nodes.emphasis, contnode=None, env=None,
-                  inliner=None, location=None):
+    def make_xref(
+        self,
+        rolename,
+        domain,
+        target,
+        innernode=d_nodes.emphasis,
+        contnode=None,
+        env=None,
+        inliner=None,
+        location=None,
+    ):
 
         if not rolename:
             return contnode or innernode(target, target)
@@ -268,8 +283,17 @@ class EQLField(s_docfields.Field):
         refnode['eql-auto-link'] = True
         return refnode
 
-    def make_xrefs(self, rolename, domain, target, innernode=d_nodes.emphasis,
-                   contnode=None, env=None, inliner=None, location=None):
+    def make_xrefs(
+        self,
+        rolename,
+        domain,
+        target,
+        innernode=d_nodes.emphasis,
+        contnode=None,
+        env=None,
+        inliner=None,
+        location=None,
+    ):
         delims = r'''(?x)
         (
             \s* [\[\]\(\)<>,] \s* | \s+or\s+ |
@@ -312,13 +336,22 @@ class EQLTypedField(EQLField):
         'type'
     }
 
-    def __init__(self, name, names=(), label=None, rolename=None,
-                 *, typerolename, has_arg=True):
+    def __init__(
+        self,
+        name,
+        names=(),
+        label=None,
+        rolename=None,
+        *,
+        typerolename,
+        has_arg=True,
+    ):
         super().__init__(name, names, label, has_arg, rolename, None)
         self.typerolename = typerolename
 
-    def make_field(self, types, domain, item, env=None, inliner=None,
-                   location=None):
+    def make_field(
+        self, types, domain, item, env=None, inliner=None, location=None
+    ):
         fieldarg, fieldtype = item
 
         body = d_nodes.paragraph()
@@ -350,8 +383,17 @@ class EQLTypedParamField(EQLField):
 
     is_typed = True
 
-    def __init__(self, name, names=(), label=None, rolename=None,
-                 *, has_arg=True, typerolename, typenames):
+    def __init__(
+        self,
+        name,
+        names=(),
+        label=None,
+        rolename=None,
+        *,
+        has_arg=True,
+        typerolename,
+        typenames,
+    ):
         super().__init__(name, names, label, has_arg, rolename)
         self.typenames = typenames
         self.typerolename = typerolename
@@ -552,7 +594,7 @@ class EQLTypeDirective(BaseEQLDirective):
 
     def handle_signature(self, sig, signode):
         if '::' in sig:
-            mod, name = sig.strip().split('::')
+            mod, name = sig.strip().rsplit('::', 1)
         else:
             name = sig.strip()
             mod = 'std'
@@ -712,7 +754,7 @@ class EQLFunctionDirective(BaseEQLDirective):
         if debug.flags.disable_docs_edgeql_validation:
             signode['eql-fullname'] = fullname = sig.split('(')[0]
             signode['eql-signature'] = sig
-            mod, name = fullname.split('::')
+            mod, name = fullname.rsplit('::', 1)
             signode['eql-module'] = mod
             signode['eql-name'] = name
 
@@ -730,7 +772,9 @@ class EQLFunctionDirective(BaseEQLDirective):
                 f'create function {sig} using SQL function "xxx";')[0]
         except Exception as ex:
             raise self.error(
-                f'could not parse function signature {sig!r}') from ex
+                f'could not parse function signature {sig!r}: '
+                f'{ex.__class__.__name__}({ex.args[0]!r})'
+            ) from ex
 
         if (not isinstance(astnode, ql_ast.CreateFunction) or
                 not isinstance(astnode.name, ql_ast.ObjectRef)):
@@ -915,8 +959,9 @@ class GitHubLinkRole:
         ''',
         re.X)
 
-    def __call__(self, role, rawtext, text, lineno, inliner,
-                 options=None, content=None):
+    def __call__(
+        self, role, rawtext, text, lineno, inliner, options=None, content=None
+    ):
         if options is None:
             options = {}
         if content is None:
@@ -1020,8 +1065,9 @@ class EdgeQLDomain(s_domains.Domain):
         'objects': {}  # fullname -> docname, objtype, description
     }
 
-    def resolve_xref(self, env, fromdocname, builder,
-                     type, target, node, contnode):
+    def resolve_xref(
+        self, env, fromdocname, builder, type, target, node, contnode
+    ):
 
         objects = self.data['objects']
         expected_type = self._role_to_object_type[type]
@@ -1108,8 +1154,9 @@ class EdgeQLDomain(s_domains.Domain):
 
         return node
 
-    def resolve_any_xref(self, env, fromdocname, builder,
-                         target, node, contnode):
+    def resolve_any_xref(
+        self, env, fromdocname, builder, target, node, contnode
+    ):
         # 'myst-parser' resolves all markdown links as :any: xrefs, so return
         # empty list to prevent sphinx trying to resolve these as :eql: refs
         return []

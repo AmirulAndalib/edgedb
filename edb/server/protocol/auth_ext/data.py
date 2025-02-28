@@ -19,7 +19,9 @@
 
 import dataclasses
 import datetime
-from typing import Optional, NamedTuple
+import base64
+
+from typing import Any, Optional
 
 
 @dataclasses.dataclass
@@ -49,6 +51,7 @@ class UserInfo:
     phone_number_verified: Optional[bool] = None
     address: Optional[dict[str, str]] = None
     updated_at: Optional[float] = None
+    source_id_token: Optional[str] = None
 
     def __str__(self) -> str:
         return self.sub
@@ -94,7 +97,7 @@ class OpenIDConfig:
     token_endpoint: str
     jwks_uri: str
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any):
         for field in dataclasses.fields(self):
             setattr(self, field.name, kwargs.get(field.name))
 
@@ -114,7 +117,7 @@ class OAuthAccessTokenResponse:
     expires_in: int
     refresh_token: str | None
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any):
         for field in dataclasses.fields(self):
             if field.name in kwargs:
                 setattr(self, field.name, kwargs.pop(field.name))
@@ -132,11 +135,97 @@ class OpenIDConnectAccessTokenResponse(OAuthAccessTokenResponse):
 
     id_token: str
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
 
 
-class ProviderConfig(NamedTuple):
-    client_id: str
-    secret: str
-    additional_scope: Optional[str]
+@dataclasses.dataclass
+class EmailFactor:
+    id: str
+    created_at: datetime.datetime
+    modified_at: datetime.datetime
+    identity: LocalIdentity
+    email: str
+    verified_at: Optional[datetime.datetime]
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        created_at: datetime.datetime,
+        modified_at: datetime.datetime,
+        identity: LocalIdentity,
+        email: str,
+        verified_at: Optional[datetime.datetime],
+    ):
+        self.id = id
+        self.created_at = created_at
+        self.modified_at = modified_at
+        self.identity = (
+            LocalIdentity(**identity)
+            if isinstance(identity, dict)
+            else identity
+        )
+        self.email = email
+        self.verified_at = verified_at
+
+
+@dataclasses.dataclass
+class WebAuthnFactor(EmailFactor):
+    user_handle: bytes
+    credential_id: bytes
+    public_key: bytes
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        created_at: datetime.datetime,
+        modified_at: datetime.datetime,
+        identity: LocalIdentity,
+        email: str,
+        verified_at: Optional[datetime.datetime],
+        user_handle: bytes,
+        credential_id: bytes,
+        public_key: bytes,
+    ):
+        self.id = id
+        self.created_at = created_at
+        self.modified_at = modified_at
+        self.identity = (
+            LocalIdentity(**identity)
+            if isinstance(identity, dict)
+            else identity
+        )
+        self.email = email
+        self.verified_at = verified_at
+        self.user_handle = base64.b64decode(user_handle)
+        self.credential_id = base64.b64decode(credential_id)
+        self.public_key = base64.b64decode(public_key)
+
+
+@dataclasses.dataclass
+class WebAuthnAuthenticationChallenge:
+    id: str
+    created_at: datetime.datetime
+    modified_at: datetime.datetime
+    challenge: bytes
+    factors: list[WebAuthnFactor]
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        created_at: datetime.datetime,
+        modified_at: datetime.datetime,
+        challenge: bytes,
+        factors: list[WebAuthnFactor],
+    ):
+        self.id = id
+        self.created_at = created_at
+        self.modified_at = modified_at
+        self.challenge = base64.b64decode(challenge)
+        self.factors = [
+            WebAuthnFactor(**factor) if isinstance(factor, dict) else factor
+            for factor in factors
+        ]

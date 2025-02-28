@@ -1,39 +1,35 @@
-use cpython::{Python, ObjectProtocol, PyResult, PyString, PyList, PyObject};
+use pyo3::{prelude::*, types::PyFrozenSet};
 
 use edgeql_parser::keywords;
 
 pub struct AllKeywords {
-    pub current: PyObject,
-    pub future: PyObject,
-    pub unreserved: PyObject,
-    pub partial: PyObject,
+    pub current: Py<PyFrozenSet>,
+    pub future: Py<PyFrozenSet>,
+    pub unreserved: Py<PyFrozenSet>,
+    pub partial: Py<PyFrozenSet>,
 }
 
-
 pub fn get_keywords(py: Python) -> PyResult<AllKeywords> {
-    let py_intern = py.import("sys")?.get(py, "intern")?;
-    let py_frozenset = py.import("builtins")?.get(py, "frozenset")?;
-    let intern = |s: &str| -> PyResult<PyObject> {
-        let py_str = PyString::new(py, s);
-        py_intern.call(py, (py_str,), None)
-    };
-    let current = keywords::CURRENT_RESERVED_KEYWORDS
-        .iter().copied().map(&intern)
-        .collect::<Result<Vec<_>,_>>()?;
-    let unreserved = keywords::UNRESERVED_KEYWORDS
-        .iter().copied().map(&intern)
-        .collect::<Result<Vec<_>,_>>()?;
-    let future = keywords::FUTURE_RESERVED_KEYWORDS
-        .iter().copied().map(&intern)
-        .collect::<Result<Vec<_>,_>>()?;
-    let partial = keywords::PARTIAL_RESERVED_KEYWORDS
-        .iter().copied().map(&intern)
-        .collect::<Result<Vec<_>,_>>()?;
+    let intern = py.import("sys")?.getattr("intern")?;
+
     Ok(AllKeywords {
-        current: py_frozenset.call(py, (PyList::new(py, &current),), None)?,
-        unreserved: py_frozenset.call(py, (PyList::new(py, &unreserved),), None)?,
-        future: py_frozenset.call(py, (PyList::new(py, &future),), None)?,
-        partial: py_frozenset.call(py, (PyList::new(py, &partial),), None)?,
+        current: prepare_keywords(py, &keywords::CURRENT_RESERVED_KEYWORDS, &intern)?,
+        unreserved: prepare_keywords(py, &keywords::UNRESERVED_KEYWORDS, &intern)?,
+        future: prepare_keywords(py, &keywords::FUTURE_RESERVED_KEYWORDS, &intern)?,
+        partial: prepare_keywords(py, &keywords::PARTIAL_RESERVED_KEYWORDS, &intern)?,
     })
 }
 
+fn prepare_keywords<'a, 'py, I: IntoIterator<Item = &'a &'static str>>(
+    py: Python<'py>,
+    keyword_set: I,
+    intern: &Bound<'py, PyAny>,
+) -> PyResult<Py<PyFrozenSet>> {
+    PyFrozenSet::new(
+        py,
+        keyword_set
+            .into_iter()
+            .map(|s| intern.call((&s,), None).unwrap()),
+    )
+    .map(|o| o.unbind())
+}

@@ -20,7 +20,6 @@
 
 
 from __future__ import annotations
-from typing import *
 
 import logging
 import multiprocessing.pool
@@ -29,6 +28,7 @@ import multiprocessing.util
 
 
 _orig_pool_worker_handler = None
+_orig_pool_join_exited_workers = None
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,9 @@ class WorkerScope:
         return self.initializer(*args, **kwargs)
 
 
-def multiprocessing_pool_worker(inqueue, outqueue, initializer=None,
-                                *args, **kwargs):
+def multiprocessing_pool_worker(
+    inqueue, outqueue, initializer=None, *args, **kwargs
+):
     destructor = None
     if isinstance(initializer, WorkerScope):
         destructor = initializer.destructor
@@ -53,8 +54,12 @@ def multiprocessing_pool_worker(inqueue, outqueue, initializer=None,
     # This function is executed in the context of a spawned
     # worker process, so the pool.worker() function is the
     # original unpatched version.
-    multiprocessing.pool.worker(
-        inqueue, outqueue, initializer, *args, **kwargs)
+    try:
+        multiprocessing.pool.worker(
+            inqueue, outqueue, initializer, *args, **kwargs)
+    except KeyboardInterrupt:
+        # Try to exit with less noise when ctrl+c is pressed
+        return
 
     if destructor is not None:
         destructor()
@@ -88,9 +93,17 @@ def multiprocessing_worker_handler(*args):
         worker_process.join(timeout=10)
 
 
+def join_exited_workers(pool):
+    # Our use case shouldn't have workers exiting really, so we skip
+    # doing the joins so that we can detect crashes ourselves in the
+    # test runner.x
+    pass
+
+
 def patch_multiprocessing(debug: bool):
     global _orig_pool_worker
     global _orig_pool_worker_handler
+    global _orig_pool_join_exited_workers
 
     if debug:
         multiprocessing.util.log_to_stderr(logging.DEBUG)
@@ -107,3 +120,7 @@ def patch_multiprocessing(debug: bool):
     # Allow workers some time to shut down gracefully.
     _orig_pool_worker_handler = multiprocessing.pool.Pool._handle_workers
     multiprocessing.pool.Pool._handle_workers = multiprocessing_worker_handler
+
+    _orig_pool_join_exited_workers = (
+        multiprocessing.pool.Pool._join_exited_workers)
+    multiprocessing.pool.Pool._join_exited_workers = join_exited_workers

@@ -18,7 +18,14 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Iterable,
+    Mapping,
+    Optional,
+    Union,
+    TypeAlias,
+)
 
 import json
 import textwrap
@@ -26,14 +33,18 @@ import textwrap
 from ..common import quote_ident as qi
 from ..common import quote_literal as ql
 
+
 from . import base
 from . import ddl
+
+
+RoleName: TypeAlias = str
 
 
 class Role(base.DBObject):
     def __init__(
         self,
-        name: str,
+        name: RoleName,
         *,
         allow_login: Union[bool, base.NotSpecifiedT] = base.NotSpecified,
         allow_createdb: Union[bool, base.NotSpecifiedT] = base.NotSpecified,
@@ -54,10 +65,10 @@ class Role(base.DBObject):
         self.membership = membership
         self.members = members
 
-    def get_type(self):
+    def get_type(self) -> str:
         return 'ROLE'
 
-    def get_id(self):
+    def get_id(self) -> str:
         return qi(self.name)
 
 
@@ -71,15 +82,15 @@ class SingleRole(Role):
         super().__init__('current_user', password=password)
         self.single_role_metadata = metadata
 
-    def get_id(self):
+    def get_id(self) -> str:
         return self.name
 
 
 class RoleExists(base.Condition):
-    def __init__(self, name):
+    def __init__(self, name: RoleName):
         self.name = name
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return textwrap.dedent(f'''\
             SELECT
                 rolname
@@ -92,10 +103,12 @@ class RoleExists(base.Condition):
 
 class RoleCommand:
 
-    def _role(self):
+    object: Role
+
+    def _role(self) -> str:
         return f'ROLE {self.object.get_id()}'
 
-    def _attrs(self):
+    def _attrs(self) -> str:
         attrs = []
 
         attrmap = {
@@ -124,7 +137,7 @@ class RoleCommand:
 
 class CreateRole(ddl.CreateObject, RoleCommand):
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         if self.object.membership:
             roles = ', '.join(qi(str(m)) for m in self.object.membership)
             membership = f'IN ROLE {roles}'
@@ -140,7 +153,7 @@ class CreateRole(ddl.CreateObject, RoleCommand):
 
 class AlterRole(ddl.AlterObject, RoleCommand):
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         attrs = self._attrs()
         if attrs:
             return f'ALTER {self._role()} {attrs}'
@@ -148,57 +161,80 @@ class AlterRole(ddl.AlterObject, RoleCommand):
             return ''
 
     def generate_extra(self, block: base.PLBlock) -> None:
+        from .. import trampoline
+
         super().generate_extra(block)
         if getattr(self.object, 'single_role_metadata', None):
             value = json.dumps(self.object.single_role_metadata)
-            query = base.Query(
+            query = base.Query(trampoline.fixup_query(
                 f'''
-                UPDATE edgedbinstdata.instdata
+                UPDATE edgedbinstdata_VER.instdata
                 SET json = {ql(value)}::jsonb
                 WHERE key = 'single_role_metadata'
                 '''
-            )
-            block.add_command(query.code(block))
+            ))
+            block.add_command(query.code_with_block(block))
 
 
 class DropRole(ddl.SchemaObjectOperation):
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return f'DROP ROLE {qi(self.name)}'
 
 
 class AlterRoleAddMember(ddl.SchemaObjectOperation):
 
     def __init__(
-            self, name, member, *, conditions=None,
-            neg_conditions=None):
-        super().__init__(name, conditions=conditions,
-                         neg_conditions=neg_conditions)
+        self,
+        name: RoleName,
+        member: str,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ):
+        super().__init__(
+            name, conditions=conditions, neg_conditions=neg_conditions
+        )
         self.member = member
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return f'GRANT {qi(self.name)} TO {qi(self.member)}'
 
 
 class AlterRoleDropMember(ddl.SchemaObjectOperation):
 
-    def __init__(self, name, member, *, conditions=None, neg_conditions=None):
+    def __init__(
+        self,
+        name: RoleName,
+        member: str,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         super().__init__(
-            name, conditions=conditions, neg_conditions=neg_conditions)
+            name, conditions=conditions, neg_conditions=neg_conditions
+        )
         self.member = member
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return f'REVOKE {qi(self.name)} FROM {qi(self.member)}'
 
 
 class AlterRoleAddMembership(ddl.SchemaObjectOperation):
 
     def __init__(
-            self, name, membership, *, conditions=None, neg_conditions=None):
+        self,
+        name: RoleName,
+        membership: Iterable[str],
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ):
         super().__init__(
-            name, conditions=conditions, neg_conditions=neg_conditions)
+            name, conditions=conditions, neg_conditions=neg_conditions
+        )
         self.membership = membership
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         roles = ', '.join(qi(m) for m in self.membership)
         return f'GRANT {roles} TO {qi(self.name)}'

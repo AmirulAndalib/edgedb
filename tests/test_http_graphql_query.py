@@ -56,7 +56,12 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
                         }
                     '''
                 }
-                data, headers, status = self.http_con_request(con, req1_data)
+                data, headers, status = self.http_con_request(
+                    con, req1_data,
+                    headers={
+                        'Authorization': self.make_auth_header(),
+                    },
+                )
                 self.assertEqual(status, 200)
                 self.assertNotIn('connection', headers)
                 self.assertEqual(
@@ -76,7 +81,12 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
                         }
                     '''
                 }
-                data, headers, status = self.http_con_request(con, req2_data)
+                data, headers, status = self.http_con_request(
+                    con, req2_data,
+                    headers={
+                        'Authorization': self.make_auth_header(),
+                    },
+                )
                 self.assertEqual(status, 200)
                 self.assertNotIn('connection', headers)
                 self.assertEqual(
@@ -89,7 +99,11 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
     def test_graphql_http_errors_01(self):
         with self.http_con() as con:
             data, headers, status = self.http_con_request(
-                con, {}, path='non-existant')
+                con, {}, path='non-existant',
+                headers={
+                    'Authorization': self.make_auth_header(),
+                },
+            )
 
             self.assertEqual(status, 404)
             self.assertEqual(headers['connection'], 'close')
@@ -100,7 +114,12 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
 
     def test_graphql_http_errors_02(self):
         with self.http_con() as con:
-            data, headers, status = self.http_con_request(con, {})
+            data, headers, status = self.http_con_request(
+                con, {},
+                headers={
+                    'Authorization': self.make_auth_header(),
+                },
+            )
 
             self.assertEqual(status, 400)
             self.assertEqual(headers['connection'], 'close')
@@ -112,7 +131,11 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
     def test_graphql_http_errors_03(self):
         with self.http_con() as con:
             data, headers, status = self.http_con_request(
-                con, {'query': 'blah', 'variables': 'bazz'})
+                con, {'query': 'blah', 'variables': 'bazz'},
+                headers={
+                    'Authorization': self.make_auth_header(),
+                },
+            )
 
             self.assertEqual(status, 400)
             self.assertEqual(headers['connection'], 'close')
@@ -125,7 +148,11 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
         with self.http_con() as con:
             con.send(b'blah\r\n\r\n\r\n\r\n')
             data, headers, status = self.http_con_request(
-                con, {'query': 'blah', 'variables': 'bazz'})
+                con, {'query': 'blah', 'variables': 'bazz'},
+                headers={
+                    'Authorization': self.make_auth_header(),
+                },
+            )
 
             self.assertEqual(status, 400)
             self.assertEqual(headers['connection'], 'close')
@@ -439,7 +466,7 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
                 edgedb.QueryError,
                 r"Cannot query field 'gibberish' on type 'Query'\. "
                 r"There's no corresponding type or alias \"gibberish\" "
-                r"exposed in EdgeDB\. Please check the configuration settings "
+                r"exposed in Gel\. Please check the configuration settings "
                 r"for this port to make sure that you're connecting to the "
                 r"right database\.",
                 _line=3, _col=21):
@@ -455,7 +482,7 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
                 edgedb.QueryError,
                 r"Cannot query field 'more__gibberish' on type 'Query'\. "
                 r"There's no corresponding type or alias \"more::gibberish\" "
-                r"exposed in EdgeDB\. Please check the configuration settings "
+                r"exposed in Gel\. Please check the configuration settings "
                 r"for this port to make sure that you're connecting to the "
                 r"right database\.",
                 _line=3, _col=21):
@@ -4587,6 +4614,39 @@ class TestGraphQLFunctional(tb.GraphQLTestCase):
                 },
                 use_http_post=use_http_post,
             )
+
+    async def test_graphql_cors(self):
+        req = urllib.request.Request(self.http_addr, method='OPTIONS')
+        req.add_header('Origin', 'https://example.edgedb.com')
+        response = urllib.request.urlopen(
+            req, context=self.tls_context
+        )
+
+        self.assertNotIn('Access-Control-Allow-Origin', response.headers)
+
+        await self.con.execute(
+            'configure current database '
+            'set cors_allow_origins := {"https://example.edgedb.com"}')
+        await self._wait_for_db_config('cors_allow_origins')
+
+        req = urllib.request.Request(self.http_addr, method='OPTIONS')
+        req.add_header('Origin', 'https://example.edgedb.com')
+        response = urllib.request.urlopen(
+            req, context=self.tls_context
+        )
+
+        headers = response.headers
+
+        self.assertIn('Access-Control-Allow-Origin', headers)
+        self.assertEqual(
+            headers['Access-Control-Allow-Origin'],
+            'https://example.edgedb.com'
+        )
+        self.assertIn('POST', headers['Access-Control-Allow-Methods'])
+        self.assertIn('GET', headers['Access-Control-Allow-Methods'])
+        self.assertIn('Authorization', headers['Access-Control-Allow-Headers'])
+        self.assertIn('X-EdgeDB-User', headers['Access-Control-Allow-Headers'])
+        self.assertEqual(headers['Access-Control-Allow-Credentials'], 'true')
 
 
 class TestGraphQLInit(tb.GraphQLTestCase):

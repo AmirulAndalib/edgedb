@@ -16,7 +16,6 @@
 # limitations under the License.
 #
 
-from typing import *
 
 from edb.edgeql import ast as qlast
 from edb.edgeql import tokenizer
@@ -30,15 +29,17 @@ from edb.tools.edb import edbcommands
 
 @edbcommands.command("parser-demo")
 def main():
-    for q in QUERIES[-10:]:
+    qlparser.preload_spec()
+
+    for q in QUERIES[-8:]:
         sdl = q.startswith('sdl')
         if sdl:
             q = q[3:]
 
         try:
-            # s = tokenizer.NormalizedSource.from_string(q)
-            source = tokenizer.Source.from_string(q)
-        except BaseException as e:
+            source = tokenizer.NormalizedSource.from_string(q)
+            # source = tokenizer.Source.from_string(q)
+        except Exception as e:
             print('Error during tokenization:')
             print(e)
             continue
@@ -51,11 +52,11 @@ def main():
         print('-' * 30)
         print()
 
-        for index, error in enumerate(result.errors()):
+        for index, error in enumerate(result.errors):
             message, span, hint, details = error
             (start, end) = tokenizer.inflate_span(source.text(), span)
 
-            print(f'Error [{index+1}/{len(result.errors())}]:')
+            print(f'Error [{index + 1}/{len(result.errors)}]:')
             print(
                 '\n'.join(
                     source.text().splitlines()[(start.line - 1) : end.line]
@@ -63,7 +64,7 @@ def main():
             )
             print(
                 ' ' * (start.column - 1)
-                + '^' * (end.column - start.column)
+                + '^' * (max(1, end.column - start.column))
                 + ' '
                 + message
             )
@@ -73,18 +74,26 @@ def main():
                 print(f'  Hint: {hint}')
             print()
 
-        if result.out():
+        if result.out:
             try:
-                ast = qlparser._cst_to_ast(result.out(), productions).val
-            except BaseException:
+                ast = qlparser._cst_to_ast(
+                    result.out, productions, source=source, filename=''
+                ).val
+            except Exception as e:
+                print(e)
                 ast = None
             if ast:
                 print('Recovered AST:')
                 if isinstance(ast, list):
                     for x in ast:
+                        assert isinstance(x, qlast.Base)
                         x.dump_edgeql()
+                        x.dump()
+                        print(x.span.start, x.span.end)
                 elif isinstance(ast, qlast.Base):
                     ast.dump_edgeql()
+                    ast.dump()
+                    print(ast.span.start, ast.span.end)
                 else:
                     print(ast)
 
@@ -317,4 +326,71 @@ QUERIES = [
     '''
     (SELECT User.name) OFFSET 2;
     ''',
+    '''
+    default::Movie.name;
+    ''',
+    '''
+    WITH MODULE welp
+    CREATE DATABASE sample;
+    ''',
+    '''
+    INSERT Foo FILTER Foo.bar = 42;
+    ''',
+    '''
+    start migration to {
+      module default {
+        type Hello extending MetaHello {
+          property platform_fee_percentage: int16 {
+            constrant exclusive {
+              errmessage := "asxasx";
+            }
+          }
+          required property blah := .bleh - .bloh - .blih;
+        }
+      }
+    }
+    ''',
+    '''
+    SELECT __type__;
+    ''',
+    '''
+    INSERT Foo GROUP BY Foo.bar;
+    ''',
+    '''
+    WITH MODULE welp
+    CREATE DATABASE sample;
+    ''',
+    '''
+    WITH MODULE welp
+    DROP DATABASE sample;
+    ''',
+    '''
+    SELECT (1, a := 2);
+    ''',
+    '''
+        SELECT Issue{
+            name,
+            related_to *$var,
+        };
+    ''',
+    '''
+        SELECT Issue{
+            name,
+            related_to *5,
+        };
+    ''',
+    '''
+        START MIGRATION TO BadLang $$type Foo$$;
+    ''',
+    '''
+        SELECT Issue{
+            name,
+            related_to *5,
+        };
+    ''',
+    '''sdl# comment
+    ''',
+    '''
+       CREATE BRANCH hello;
+    '''
 ]

@@ -24,11 +24,12 @@ from abc import abstractmethod
 import collections.abc
 import dataclasses
 import json
-from typing import *
+from typing import Any, Optional, Iterator, Sequence, Dict
 
 from edb.edgeql import compiler as qlcompiler
 from edb.ir import staeval
 from edb.ir import statypes
+from edb.schema import links as s_links
 from edb.schema import name as sn
 from edb.schema import objtypes as s_objtypes
 from edb.schema import scalars as s_scalars
@@ -39,7 +40,12 @@ from edb.common.typeutils import downcast
 from . import types
 
 
-SETTING_TYPES = {str, int, bool, statypes.Duration, statypes.ConfigMemory}
+SETTING_TYPES = {
+    str,
+    int,
+    bool,
+    float,
+}
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
@@ -59,14 +65,23 @@ class Setting:
     enum_values: Optional[Sequence[str]] = None
     required: bool = True
     secret: bool = False
+    protected: bool = False
 
     def __post_init__(self) -> None:
-        if (self.type not in SETTING_TYPES and
-                not isinstance(self.type, types.ConfigTypeSpec)):
+        if (
+            self.type not in SETTING_TYPES
+            and not isinstance(self.type, types.ConfigTypeSpec)
+            and not (
+                isinstance(self.type, type)
+                and issubclass(self.type, statypes.ScalarType)
+            )
+        ):
             raise ValueError(
                 f'invalid config setting {self.name!r}: '
-                f'type is expected to be either one of {{str, int, bool}} '
-                f'or an edb.server.config.types.ConfigType subclass')
+                f'type is expected to be either one of '
+                f'{{str, int, bool, float}} '
+                f'or an edb.server.config.types.ConfigType ',
+                f'or edb.ir.statypes.ScalarType subclass')
 
         if self.set_of:
             if not isinstance(self.default, frozenset):
@@ -194,7 +209,9 @@ class ChainedSpec(Spec):
 
 
 def load_spec_from_schema(
-    schema: s_schema.Schema, only_exts: bool=False
+    schema: s_schema.Schema,
+    only_exts: bool=False,
+    validate: bool=True,
 ) -> Spec:
     settings = []
     if not only_exts:
@@ -202,6 +219,18 @@ def load_spec_from_schema(
         settings.extend(_load_spec_from_type(schema, cfg))
 
     settings.extend(load_ext_settings_from_schema(schema))
+
+    # Make sure there aren't any dangling ConfigObject children
+    if validate:
+        cfg_object = schema.get('cfg::ConfigObject', type=s_objtypes.ObjectType)
+        for child in cfg_object.children(schema):
+            if not schema.get_referrers(
+                child, scls_type=s_links.Link, field_name='target'
+            ):
+                raise RuntimeError(
+                    f'cfg::ConfigObject child {child.get_name(schema)} has no '
+                    f'links pointing at it (did you mean cfg::ExtensionConfig?)'
+                )
 
     return FlatSpec(*settings)
 
@@ -251,14 +280,22 @@ def _load_spec_from_type(
                 ptype, schema,
                 spec_class=types.ConfigTypeSpec,
             )
-        else:
+        elif isinstance(ptype, s_scalars.ScalarType):
             pytype = staeval.scalar_type_to_python_type(ptype, schema)
+        else:
+            raise RuntimeError(f"unsupported config value type: {ptype}")
 
-        attributes = {
-            a: json.loads(v.get_value(schema))
-            for a, v in p.get_annotations(schema).items(schema)
-            if isinstance(a, sn.QualName) and a.module == 'cfg'
-        }
+        attributes = {}
+        for a, v in p.get_annotations(schema).items(schema):
+            if isinstance(a, sn.QualName) and a.module == 'cfg':
+                try:
+                    jv = json.loads(v.get_value(schema))
+                except json.JSONDecodeError:
+                    raise RuntimeError(
+                        f'Config annotation {a} on {p.get_name(schema)} '
+                        f'is not valid json'
+                    )
+                attributes[a] = jv
 
         ptr_card = p.get_cardinality(schema)
         set_of = ptr_card.is_multi()
@@ -305,6 +342,7 @@ def _load_spec_from_type(
             ),
             required=required,
             secret=p.get_secret(schema),
+            protected=p.get_protected(schema),
         )
 
         settings.append(setting)

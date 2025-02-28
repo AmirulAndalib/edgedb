@@ -75,11 +75,11 @@ std::range_unpack(
         SELECT
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 (
-                    edgedb.range_upper_validate(val) -
+                    edgedb_VER.range_upper_validate(val) -
                     (CASE WHEN upper_inc(val) THEN 0 ELSE 1 END)
                 )::int8
             )::int4
@@ -98,11 +98,11 @@ std::range_unpack(
         SELECT
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 (
-                    edgedb.range_upper_validate(val) -
+                    edgedb_VER.range_upper_validate(val) -
                     (CASE WHEN upper_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 step::int8
@@ -121,11 +121,11 @@ std::range_unpack(
         SELECT
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 (
-                    edgedb.range_upper_validate(val) -
+                    edgedb_VER.range_upper_validate(val) -
                     (CASE WHEN upper_inc(val) THEN 0 ELSE 1 END)
                 )::int8
             )
@@ -144,11 +144,11 @@ std::range_unpack(
         SELECT
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 (
-                    edgedb.range_upper_validate(val) -
+                    edgedb_VER.range_upper_validate(val) -
                     (CASE WHEN upper_inc(val) THEN 0 ELSE 1 END)
                 )::int8,
                 step
@@ -169,11 +169,11 @@ std::range_unpack(
         FROM
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE step END)
                 )::numeric,
                 (
-                    edgedb.range_upper_validate(val)
+                    edgedb_VER.range_upper_validate(val)
                 )::numeric,
                 step::numeric
             ) AS num
@@ -195,11 +195,11 @@ std::range_unpack(
         FROM
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) +
+                    edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE step END)
                 )::numeric,
                 (
-                    edgedb.range_upper_validate(val)
+                    edgedb_VER.range_upper_validate(val)
                 )::numeric,
                 step::numeric
             ) AS num
@@ -220,9 +220,9 @@ std::range_unpack(
         SELECT num
         FROM
             generate_series(
-                edgedb.range_lower_validate(val) +
+                edgedb_VER.range_lower_validate(val) +
                     (CASE WHEN lower_inc(val) THEN 0 ELSE step END),
-                edgedb.range_upper_validate(val),
+                edgedb_VER.range_upper_validate(val),
                 step
             ) AS num
         WHERE
@@ -239,11 +239,11 @@ std::range_unpack(
 {
     SET volatility := 'Immutable';
     USING SQL $$
-        SELECT d::edgedb.timestamptz_t
+        SELECT d::edgedbt.timestamptz_t
         FROM
             generate_series(
                 (
-                    edgedb.range_lower_validate(val) + (
+                    edgedb_VER.range_lower_validate(val) + (
                         CASE WHEN lower_inc(val)
                             THEN '0'::interval
                             ELSE step
@@ -251,12 +251,12 @@ std::range_unpack(
                     )
                 )::timestamptz,
                 (
-                    edgedb.range_upper_validate(val)
+                    edgedb_VER.range_upper_validate(val)
                 )::timestamptz,
                 step::interval
             ) AS d
         WHERE
-            upper_inc(val) OR d::edgedb.timestamptz_t < upper(val)
+            upper_inc(val) OR d::edgedbt.timestamptz_t < upper(val)
     $$;
 };
 
@@ -265,6 +265,7 @@ CREATE FUNCTION std::range_get_upper(r: range<anypoint>) -> optional anypoint
 {
     SET volatility := 'Immutable';
     USING SQL FUNCTION 'upper';
+    SET force_return_cast := true;
 };
 
 
@@ -272,6 +273,7 @@ CREATE FUNCTION std::range_get_lower(r: range<anypoint>) -> optional anypoint
 {
     SET volatility := 'Immutable';
     USING SQL FUNCTION 'lower';
+    SET force_return_cast := true;
 };
 
 
@@ -295,6 +297,7 @@ CREATE FUNCTION std::range_get_upper(
 {
     SET volatility := 'Immutable';
     USING SQL FUNCTION 'upper';
+    SET force_return_cast := true;
 };
 
 
@@ -304,6 +307,7 @@ CREATE FUNCTION std::range_get_lower(
 {
     SET volatility := 'Immutable';
     USING SQL FUNCTION 'lower';
+    SET force_return_cast := true;
 };
 
 
@@ -337,7 +341,7 @@ CREATE FUNCTION std::contains(
     # Needed to pick up the indexes when used in FILTER.
     set prefer_subquery_args := true;
     # Postgres only manages to inline this function if it isn't marked strict,
-    # and we want it to be inlined so that pg::gin indexes work with it.
+    # and we want it to be inlined so that std::pg::gin indexes work with it.
     set impl_is_strict := false;
 };
 

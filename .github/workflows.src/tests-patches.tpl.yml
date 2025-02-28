@@ -7,11 +7,11 @@ on:
     inputs: {}
   pull_request:
     branches:
-      - stable/*
+      - release/*
   push:
     branches:
       - patch-test*
-      - stable/*
+      - release/*
 
 jobs:
   build:
@@ -29,7 +29,7 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - id: set-matrix
       name: Compute versions to run on
       run: python3 .github/scripts/patches/compute-versions.py
@@ -47,19 +47,14 @@ jobs:
     # Run the test
 
     - name: Download an earlier database version and set up a instance
-      env:
-        EDGEDB_VERSION: ${{ matrix.edgedb-version }}
-        EDGEDB_URL: ${{ matrix.edgedb-url }}
       run: |
-        wget -q "$EDGEDB_URL"
-        tar xzf edgedb-server-$EDGEDB_VERSION.tar.gz
-        edgedb-server-$EDGEDB_VERSION/bin/edgedb-server -D test-dir --bootstrap-only --testmode
+        wget -q "${{ matrix.edgedb-url }}"
+        tar xzf ${{ matrix.edgedb-basename }}-${{ matrix.edgedb-version }}.tar.gz
+        ${{ matrix.edgedb-basename }}-${{ matrix.edgedb-version }}/bin/edgedb-server -D test-dir --bootstrap-only --testmode
 
     - name: Create databases on the older version
-      env:
-        EDGEDB_VERSION: ${{ matrix.edgedb-version }}
       if: ${{ matrix.make-dbs }}
-      run: python3 .github/scripts/patches/create-databases.py
+      run: python3 .github/scripts/patches/create-databases.py ${{ matrix.edgedb-basename }}-${{ matrix.edgedb-version }}/bin/edgedb-server
 
     - name: Run tests with instance created on an older version
       run: |
@@ -67,7 +62,7 @@ jobs:
         # has timeouts.
         edb server --bootstrap-only --data-dir test-dir
         # Should we run *all* the tests?
-        edb test -j2 -v --data-dir test-dir tests/test_edgeql_json.py tests/test_edgeql_casts.py tests/test_edgeql_functions.py tests/test_edgeql_expressions.py tests/test_edgeql_policies.py tests/test_edgeql_vector.py tests/test_edgeql_scope.py
+        edb test -j2 -v --data-dir test-dir tests/test_edgeql_json.py tests/test_edgeql_casts.py tests/test_edgeql_functions.py tests/test_edgeql_expressions.py tests/test_edgeql_policies.py tests/test_edgeql_vector.py tests/test_edgeql_scope.py tests/test_http_ext_auth.py
 
     - name: Test downgrading a database after an upgrade
       if: ${{ !contains(matrix.edgedb-version, '-rc') && !contains(matrix.edgedb-version, '-beta') }}

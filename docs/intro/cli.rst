@@ -6,131 +6,120 @@
 The CLI
 =======
 
-The ``edgedb`` command line tool is an integral part of the developer workflow
-of building with EdgeDB. Below are instructions for installing it.
+The |gelcmd| command line tool is an integral part of the developer workflow
+of building with Gel. Below are instructions for installing it.
 
 Installation
 ------------
 
-To get started with EdgeDB, the first step is install the ``edgedb`` CLI.
+To get started with Gel, the first step is install the |gelcmd| CLI.
 
 **Linux or macOS**
 
 .. code-block:: bash
 
-    $ curl --proto '=https' --tlsv1.2 -sSf https://sh.edgedb.com | sh
+    $ curl --proto '=https' --tlsv1.2 -sSf https://www.geldata.com/sh | sh
 
 **Windows Powershell**
 
 .. note::
 
-    EdgeDB on Windows requires WSL 2 because the EdgeDB server runs on Linux.
+    Gel on Windows requires WSL 2 because the Gel server runs on Linux.
 
 .. code-block:: powershell
 
-    PS> iwr https://ps1.edgedb.com -useb | iex
+    PS> iwr https://www.geldata.com/ps1 -useb | iex
 
 Follow the prompts on screen to complete the installation. The script will
-download the ``edgedb`` command built for your OS and add a path to it to your
+download the |gelcmd| command built for your OS and add a path to it to your
 shell environment. Then test the installation:
 
 .. code-block:: bash
 
-    $ edgedb --version
-    EdgeDB CLI 2.x+abcdefg
+    $ gel --version
+    Gel CLI x.x+abcdefg
 
 .. note::
 
   If you encounter a ``command not found`` error, you may need to open a fresh
   shell window.
 
-.. note::
-
-    To install the CLI with a package manager, refer to the "Additional
-    methods" section of the `Install <https://www.edgedb.com/install>`_ page
-    for instructions.
-
 
 See ``help`` commands
 ---------------------
 
-The entire CLI is self-documenting. Once it's installed, run ``edgedb --help``
+The entire CLI is self-documenting. Once it's installed, run :gelcmd:`--help`
 to see a breakdown of all the commands and options.
 
 .. code-block:: bash
 
-  $ edgedb --help
-  EdgeDB CLI
-  Use the edgedb command-line tool to spin up local instances, manage EdgeDB
-  projects, create and apply migrations, and more.
+  $ gel --help
+  Usage: gel [OPTIONS] [COMMAND]
 
-  Running edgedb without a subcommand opens an interactive shell.
+  Commands:
+    <list of commands>
 
-  USAGE:
-    edgedb [OPTIONS] [SUBCOMMAND]
-
-  OPTIONS:
+  Options:
     <list of options>
 
-  CONNECTION OPTIONS (edgedb --help-connect to see the full list):
+  Connection Options (gel --help-connect to see full list):
     <list of connection options>
 
-  SUBCOMMANDS:
-    <list of all major commands>
+  Cloud Connection Options:
+    <list of cloud connection options>
 
-The majority of CLI commands perform some action against a *particular* EdgeDB
+The majority of CLI commands perform some action against a *particular* Gel
 instance. As such, there are a standard set of flags that are used to specify
 *which instance* should be the target of the command, plus additional
 information like TLS certificates. The following command documents these flags.
 
 .. code-block:: bash
 
-  $ edgedb --help-connect
-  -I, --instance <instance>
-        Local instance name created with edgedb instance create to connect to
-        (overrides host and port)
-  --dsn <dsn>
-        DSN for EdgeDB to connect to (overrides all other options except
-        password)
-  --credentials-file <credentials_file>
-        Path to JSON file to read credentials from
-  -H, --host <host>
-        Host of the EdgeDB instance
-  -P, --port <port>
-        Port to connect to EdgeDB
-  --unix-path <unix_path>
-        Unix socket dir for the
-  -u, --user <user>
-        User name of the EdgeDB user
-  -d, --database <database>
-        Database name to connect to
-  --password
-        Ask for password on the terminal (TTY)
-  --no-password
-        Don't ask for password
+  $ gel --help-connect
+  Connection Options (full list):
 
-If you ever want to see documentation for a particular command (``edgedb
-migration create``) or group of commands (``edgedb instance``), just append
-the ``--help`` flag.
+    -I, --instance <INSTANCE>
+            Instance name (use `gel instance list` to list local, remote and
+            Cloud instances available to you)
+
+        --dsn <DSN>
+            DSN for Gel to connect to (overrides all other options except
+            password)
+
+        --credentials-file <CREDENTIALS_FILE>
+            Path to JSON file to read credentials from
+
+    -H, --host <HOST>
+            Gel instance host
+
+    -P, --port <PORT>
+            Port to connect to Gel
+
+        --unix-path <UNIX_PATH>
+            A path to a Unix socket for Gel connection
+
+            When the supplied path is a directory, the actual path will be
+            computed using the `--port` and `--admin` parameters.
+    ...
+
+If you ever want to see documentation for a particular command (
+:gelcmd:`migration create`) or group of commands (:gelcmd:`instance`),
+just append the ``--help`` flag.
 
 .. code-block:: bash
 
-  $ edgedb instance --help
-  Manage local EdgeDB instances
+  $ gel instance --help
+  Manage local Gel instances
 
-  USAGE:
-      edgedb instance <SUBCOMMAND>
+  Usage: gel instance <COMMAND>
 
-  OPTIONS:
-      -h, --help    Print help information
-
-  SUBCOMMANDS:
-      create            Initialize a new EdgeDB instance
-      credentials       Echo credentials to connect to the instance
-      destroy           Destroy an instance and remove the data
-      link              Link a remote instance
-      list              Show all instances
-      ...
+  Commands:
+    create          Initialize a new Gel instance
+    list            Show all instances
+    status          Show status of an instance
+    start           Start an instance
+    stop            Stop an instance
+    ...
 
 Upgrade the CLI
 ---------------
@@ -139,4 +128,4 @@ To upgrade to the latest version:
 
 .. code-block:: bash
 
-  $ edgedb cli upgrade
+  $ gel cli upgrade

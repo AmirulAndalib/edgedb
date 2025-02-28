@@ -87,16 +87,16 @@ class TestDumpBasics(tb.DatabaseTestCase, tb.CLITestCaseMixin):
         dbname = self.get_database_name()
         restored_dbname = f'{dbname}_restored'
 
-        with tempfile.NamedTemporaryFile() as f:
-            self.run_cli('-d', dbname, 'dump', f.name)
-
+        try:
             await self.con.execute(f'CREATE DATABASE {restored_dbname}')
-            try:
-                self.run_cli('-d', restored_dbname, 'restore', f.name)
-                con2 = await self.connect(database=restored_dbname)
-            except Exception:
-                await tb.drop_db(self.con, restored_dbname)
-                raise
+            with tempfile.TemporaryDirectory() as f:
+                fname = os.path.join(f, 'dump')
+                self.run_cli('-d', f"{dbname}", 'dump', fname)
+                self.run_cli('-d', restored_dbname, 'restore', fname)
+            con2 = await self.connect(database=restored_dbname)
+        except Exception:
+            await tb.drop_db(self.con, restored_dbname)
+            raise
 
         try:
             hasher = hashlib.sha1()

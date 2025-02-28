@@ -18,8 +18,20 @@
 
 
 from __future__ import annotations
-from typing import *
-from typing import overload
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Literal,
+    Optional,
+    Type,
+    Iterable,
+    Mapping,
+    Sequence,
+    Dict,
+    cast,
+    overload,
+)
 
 import collections.abc
 import dataclasses
@@ -33,8 +45,9 @@ import immutables
 
 from edb import errors
 from edb.common import binwrapper
-from edb.common import value_dispatch
+from edb.common import lru
 from edb.common import uuidgen
+from edb.common import value_dispatch
 
 from edb.protocol import enums as p_enums
 from edb.server import config
@@ -64,6 +77,7 @@ _uint32_packer = cast(Callable[[int], bytes], struct.Struct('!L').pack)
 _uint16_packer = cast(Callable[[int], bytes], struct.Struct('!H').pack)
 _uint8_packer = cast(Callable[[int], bytes], struct.Struct('!B').pack)
 _int64_struct = struct.Struct('!q')
+_float32_struct = struct.Struct('!f')
 
 
 EMPTY_TUPLE_ID = s_obj.get_known_type_id('empty-tuple')
@@ -90,6 +104,7 @@ class DescriptorTag(bytes, enum.Enum):
     OBJECT = b'\x0a'
     COMPOUND = b'\x0b'
     MULTIRANGE = b'\x0c'
+    SQL_ROW = b'\x0d'
 
     ANNO_TYPENAME = b'\xff'
 
@@ -130,6 +145,14 @@ def _encode_int64(data: int) -> bytes:
 
 def _decode_int64(data: bytes) -> int:
     return _int64_struct.unpack(data)[0]  # type: ignore [no-any-return]
+
+
+def _encode_float32(data: float) -> bytes:
+    return _float32_struct.pack(data)
+
+
+def _decode_float32(data: bytes) -> float:
+    return _float32_struct.unpack(data)[0]  # type: ignore [no-any-return]
 
 
 def _string_packer(s: str) -> bytes:
@@ -353,7 +376,7 @@ def _describe_tuple(t: s_types.Tuple, *, ctx: Context) -> uuid.UUID:
         # .name
         buf.append(_name_packer(t.get_name(ctx.schema)))
         # .schema_defined
-        buf.append(_bool_packer(True))
+        buf.append(_bool_packer(t.get_is_persistent(ctx.schema)))
         # .ancestors
         buf.append(_type_ref_seq_packer([], ctx=ctx))
 
@@ -399,7 +422,7 @@ def _describe_array(t: s_types.Array, *, ctx: Context) -> uuid.UUID:
         # .name
         buf.append(_name_packer(t.get_name(ctx.schema)))
         # .schema_defined
-        buf.append(_bool_packer(True))
+        buf.append(_bool_packer(t.get_is_persistent(ctx.schema)))
         # .ancestors
         buf.append(_type_ref_seq_packer([], ctx=ctx))
 
@@ -438,7 +461,7 @@ def _describe_range(t: s_types.Range, *, ctx: Context) -> uuid.UUID:
         # .name
         buf.append(_name_packer(t.get_name(ctx.schema)))
         # .schema_defined
-        buf.append(_bool_packer(True))
+        buf.append(_bool_packer(t.get_is_persistent(ctx.schema)))
         # .ancestors
         buf.append(_type_ref_seq_packer([], ctx=ctx))
 
@@ -473,7 +496,7 @@ def _describe_multirange(t: s_types.MultiRange, *, ctx: Context) -> uuid.UUID:
         # .name
         buf.append(_name_packer(t.get_name(ctx.schema)))
         # .schema_defined
-        buf.append(_bool_packer(True))
+        buf.append(_bool_packer(t.get_is_persistent(ctx.schema)))
         # .ancestors
         buf.append(_type_ref_seq_packer([], ctx=ctx))
 
@@ -530,7 +553,8 @@ def _describe_object_shape(
         link_props.append(False)
         links.append(not ptr.is_property(ctx.schema))
         cardinalities.append(cardinality_from_ptr(ptr, ctx.schema))
-        ptr_source = ptr.get_source(ctx.schema)
+        ctx.schema, material_ptr = ptr.material_type(ctx.schema)
+        ptr_source = material_ptr.get_source(ctx.schema)
         assert isinstance(ptr_source, s_objtypes.ObjectType)
         ctx.schema, ptr_source = ptr_source.material_type(ctx.schema)
         assert ptr_source is not None
@@ -1011,6 +1035,53 @@ def describe_params(
     return full_params, params_id
 
 
+def describe_sql_result(
+    *,
+    schema: s_schema.Schema,
+    row: dict[str, s_types.Type],
+    protocol_version: edbdef.ProtocolVersion,
+) -> tuple[bytes, uuid.UUID]:
+    ctx = Context(
+        schema=schema,
+        protocol_version=protocol_version,
+    )
+
+    params_buf = []
+
+    subtypes = []
+    element_names = []
+
+    for rel_name, rel_t in row.items():
+        rel_type_id = _describe_type(rel_t, ctx=ctx)
+        # SQLRecordElement.name
+        params_buf.append(_string_packer(rel_name))
+        element_names.append(rel_name)
+        # SQLRecordElement.type
+        params_buf.append(_type_ref_id_packer(rel_type_id, ctx=ctx))
+        subtypes.append(rel_type_id)
+
+    rec_id = _get_object_shape_id("SQLRow", subtypes, element_names)
+
+    record_body_bytes = [
+        DescriptorTag.SQL_ROW._value_,
+        rec_id.bytes,
+    ]
+
+    record_body_bytes.extend([
+        _uint16_packer(len(row)),
+        *params_buf,
+    ])
+
+    _finish_typedesc(rec_id, record_body_bytes, ctx=ctx)
+
+    record = b''.join([
+        *ctx.buffer,
+        *ctx.anno_buffer,
+    ])
+
+    return record, rec_id
+
+
 def describe(
     schema: s_schema.Schema,
     typ: s_types.Type,
@@ -1081,7 +1152,7 @@ def _parse(desc: binwrapper.BinWrapper, ctx: ParseContext) -> None:
             return
         else:
             raise NotImplementedError(
-                f'no codec implementation for EdgeDB data kind {hex(t[0])}')
+                f'no codec implementation for Gel data kind {hex(t[0])}')
     else:
         ctx.codecs_list.append(_parse_descriptor(tag, desc, ctx=ctx))
 
@@ -1147,7 +1218,7 @@ def _parse_descriptor(
     ctx: ParseContext,
 ) -> TypeDesc:
     raise AssertionError(
-        f'no codec implementation for EdgeDB data kind {tag._name_}')
+        f'no codec implementation for Gel data kind {tag._name_}')
 
 
 @_parse_descriptor.register(DescriptorTag.SET)
@@ -1609,7 +1680,6 @@ class StateSerializerFactory:
             config := cfg::Config {
                 session_idle_transaction_timeout: <duration>'0:05:00',
                 query_execution_timeout: <duration>'0:00:00',
-                allow_dml_in_functions: false,
                 allow_bare_ddl: AlwaysAllow,
                 apply_access_policies: true,
             },
@@ -1635,10 +1705,46 @@ class StateSerializerFactory:
         schema, config_type = derive_alias(
             schema, free_obj, 'state_config'
         )
-        config_shape: list[tuple[str, s_types.Type, enums.Cardinality]] = []
+        config_shape = self._make_config_shape(config_spec, schema)
+
+        # Build type descriptors and codecs for compiler RPC
+        # comp_config := cfg::Config { comp_cfg1, comp_cfg2, ... }
+        schema, self._comp_config_type = derive_alias(
+            schema, free_obj, 'comp_config'
+        )
+        self._comp_config_shape: tuple[InputShapeElement, ...] = (
+            self._make_config_shape(
+                config_spec,
+                schema,
+                lambda setting: setting.affects_compilation,
+            )
+        )
+
+        self._input_shapes: immutables.Map[
+            s_types.Type,
+            tuple[InputShapeElement, ...],
+        ] = immutables.Map([
+            (config_type, config_shape),
+            (self._state_type, (
+                ("module", str_type, enums.Cardinality.AT_MOST_ONE),
+                ("aliases", aliases_array, enums.Cardinality.AT_MOST_ONE),
+                ("config", config_type, enums.Cardinality.AT_MOST_ONE),
+            ))
+        ])
+        self.config_type = config_type
+        self._schema = schema
+        self._contexts: dict[edbdef.ProtocolVersion, Context] = {}
+
+    @staticmethod
+    def _make_config_shape(
+        config_spec: config.Spec,
+        schema: s_schema.Schema,
+        matches: Callable[[Any], bool] = lambda setting: not setting.system,
+    ) -> tuple[InputShapeElement, ...]:
+        config_shape: list[InputShapeElement] = []
 
         for setting in config_spec.values():
-            if not setting.system:
+            if matches(setting):
                 setting_type_name = setting.schema_type_name
                 setting_type = schema.get(setting_type_name, type=s_types.Type)
                 config_shape.append(
@@ -1649,20 +1755,7 @@ class StateSerializerFactory:
                         enums.Cardinality.AT_MOST_ONE,
                     )
                 )
-
-        self._input_shapes: immutables.Map[
-            s_types.Type,
-            tuple[InputShapeElement, ...],
-        ] = immutables.Map([
-            (config_type, tuple(sorted(config_shape))),
-            (self._state_type, (
-                ("module", str_type, enums.Cardinality.AT_MOST_ONE),
-                ("aliases", aliases_array, enums.Cardinality.AT_MOST_ONE),
-                ("config", config_type, enums.Cardinality.AT_MOST_ONE),
-            ))
-        ])
-        self._schema = schema
-        self._contexts: dict[edbdef.ProtocolVersion, Context] = {}
+        return tuple(sorted(config_shape))
 
     def make(
         self,
@@ -1688,6 +1781,12 @@ class StateSerializerFactory:
         ctx.schema = s_schema.ChainedSchema(
             self._schema, user_schema, global_schema)
 
+        # Update the config shape with any extension configs
+        ext_config_spec = config.load_ext_spec_from_schema(
+            user_schema, self._schema)
+        new_config = self._make_config_shape(ext_config_spec, ctx.schema)
+        full_config = self._input_shapes[self.config_type] + new_config
+
         globals_shape = []
         global_reps = {}
         for g in ctx.schema.get_objects(type=s_globals.Global):
@@ -1704,6 +1803,7 @@ class StateSerializerFactory:
             self._state_type,
             self._input_shapes.update({
                 self.globals_type: tuple(sorted(globals_shape)),
+                self.config_type: full_config,
                 self._state_type: self._input_shapes[self._state_type] + (
                     (
                         "globals",
@@ -1720,25 +1820,39 @@ class StateSerializerFactory:
             type_id, type_data, global_reps, protocol_version
         )
 
+    def make_compilation_config_serializer(self) -> CompilationConfigSerializer:
+        ctx = Context(
+            schema=self._schema,
+            protocol_version=edbdef.CURRENT_PROTOCOL,
+        )
+        type_id = describe_input_shape(
+            self._comp_config_type,
+            {self._comp_config_type: self._comp_config_shape},
+            ctx=ctx
+        )
+        type_data = b''.join(ctx.buffer)
+        return CompilationConfigSerializer(
+            type_id,
+            type_data,
+            edbdef.CURRENT_PROTOCOL
+        )
 
-class StateSerializer:
+
+class InputShapeSerializer:
     def __init__(
         self,
         type_id: uuid.UUID,
         type_data: bytes,
-        global_reps: dict[str, object],
         protocol_version: edbdef.ProtocolVersion,
     ) -> None:
         self._type_id = type_id
         self._type_data = type_data
-        self._global_reps = global_reps
         self._protocol_version = protocol_version
 
     @functools.cached_property
-    def _codec(self) -> TypeDesc:
+    def _codec(self) -> InputShapeDesc:
         codec = parse(self._type_data, self._protocol_version)
         assert isinstance(codec, InputShapeDesc)
-        codec.fields['globals'][1].__dict__['data_raw'] = True
         return codec
 
     @property
@@ -1754,11 +1868,48 @@ class StateSerializer:
     def decode(self, state: bytes) -> Any:
         return self._codec.decode(state)
 
+
+class StateSerializer(InputShapeSerializer):
+    def __init__(
+        self,
+        type_id: uuid.UUID,
+        type_data: bytes,
+        global_reps: dict[str, object],
+        protocol_version: edbdef.ProtocolVersion,
+    ) -> None:
+        super().__init__(type_id, type_data, protocol_version)
+        self._global_reps = global_reps
+
+    @functools.cached_property
+    def _codec(self) -> InputShapeDesc:
+        codec = super()._codec
+
+        # Global values are directly used in Postgres, so we don't need to
+        # encode/decode them in the I/O server. This feature doesn't worth a
+        # separate switch in the type desc, so we just hack it in here.
+        _, globals_type_desc = codec.fields['globals']
+        assert isinstance(globals_type_desc, InputShapeDesc)
+        globals_type_desc.__dict__['data_raw'] = True
+
+        return codec
+
     def get_global_type_rep(
         self,
         global_name: str,
     ) -> Optional[object]:
         return self._global_reps.get(global_name)
+
+
+class CompilationConfigSerializer(InputShapeSerializer):
+    @lru.lru_method_cache(64)
+    def encode_configs(
+        self, *configs: immutables.Map[str, config.SettingValue] | None
+    ) -> bytes:
+        state: dict[str, Any] = {}
+        for conf in configs:
+            if conf is not None:
+                state.update((k, v.value) for k, v in conf.items())
+        return self.encode(state)
 
 
 def derive_alias(
@@ -1889,6 +2040,10 @@ class BaseScalarDesc(SchemaTypeDesc):
             _encode_int64,
             _decode_int64,
         ),
+        s_obj.get_known_type_id('std::float32'): (
+            _encode_float32,
+            _decode_float32,
+        ),
     }
 
     def encode(self, data: Any) -> bytes:
@@ -1944,11 +2099,29 @@ class EnumDesc(SchemaTypeDesc):
     names: list[str]
     ancestors: Optional[list[TypeDesc]]
 
-    def encode(self, data: str) -> bytes:
-        return _encode_str(data)
+    @functools.cached_property
+    def _decoder(self) -> Callable[[bytes], Any]:
+        assert self.name is not None
+        pytype = statypes.maybe_get_python_type_for_scalar_type_name(self.name)
+        if pytype is not None and issubclass(pytype, statypes.ScalarType):
+            return pytype.decode
+        else:
+            return _decode_str
 
-    def decode(self, data: bytes) -> str:
-        return _decode_str(data)
+    @functools.cached_property
+    def _encoder(self) -> Callable[[Any], bytes]:
+        assert self.name is not None
+        pytype = statypes.maybe_get_python_type_for_scalar_type_name(self.name)
+        if pytype is not None and issubclass(pytype, statypes.ScalarType):
+            return pytype.encode
+        else:
+            return _encode_str
+
+    def encode(self, data: Any) -> bytes:
+        return self._encoder(data)
+
+    def decode(self, data: bytes) -> Any:
+        return self._decoder(data)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

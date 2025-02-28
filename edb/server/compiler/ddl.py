@@ -18,8 +18,9 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Tuple, Dict, List, FrozenSet
 
+import dataclasses
 import json
 import textwrap
 
@@ -36,12 +37,27 @@ from edb.edgeql import compiler as qlcompiler
 from edb.edgeql import qltypes
 from edb.edgeql import quote as qlquote
 
+
+from edb.schema import annos as s_annos
+from edb.schema import constraints as s_constraints
 from edb.schema import database as s_db
 from edb.schema import ddl as s_ddl
 from edb.schema import delta as s_delta
+from edb.schema import expraliases as s_expraliases
+from edb.schema import functions as s_func
+from edb.schema import globals as s_globals
+from edb.schema import indexes as s_indexes
+from edb.schema import links as s_links
 from edb.schema import migrations as s_migrations
 from edb.schema import objects as s_obj
+from edb.schema import objtypes as s_objtypes
+from edb.schema import policies as s_policies
+from edb.schema import pointers as s_pointers
+from edb.schema import properties as s_properties
+from edb.schema import rewrites as s_rewrites
+from edb.schema import scalars as s_scalars
 from edb.schema import schema as s_schema
+from edb.schema import triggers as s_triggers
 from edb.schema import utils as s_utils
 from edb.schema import version as s_ver
 
@@ -53,11 +69,23 @@ from . import dbstate
 from . import compiler
 
 
+NIL_QUERY = b"SELECT LIMIT 0"
+
+
 def compile_and_apply_ddl_stmt(
     ctx: compiler.CompileContext,
-    stmt: qlast.DDLOperation,
+    stmt: qlast.DDLCommand,
     source: Optional[edgeql.Source] = None,
 ) -> dbstate.DDLQuery:
+    query, _ = _compile_and_apply_ddl_stmt(ctx, stmt, source)
+    return query
+
+
+def _compile_and_apply_ddl_stmt(
+    ctx: compiler.CompileContext,
+    stmt: qlast.DDLCommand,
+    source: Optional[edgeql.Source] = None,
+) -> tuple[dbstate.DDLQuery, Optional[pg_dbops.SQLBlock]]:
     if isinstance(stmt, qlast.GlobalObjectCommand):
         ctx._assert_not_in_migration_block(stmt)
 
@@ -81,7 +109,7 @@ def compile_and_apply_ddl_stmt(
         allow_bare_ddl = compiler._get_config_val(ctx, 'allow_bare_ddl')
         if allow_bare_ddl != "AlwaysAllow":
             raise errors.QueryError(
-                "bare DDL statements are not allowed in this database",
+                "bare DDL statements are not allowed on this database branch",
                 hint="Use the migration commands instead.",
                 details=(
                     f"The `allow_bare_ddl` configuration variable "
@@ -90,7 +118,7 @@ def compile_and_apply_ddl_stmt(
                     f"to avoid accidental schema changes outside of "
                     f"the migration flow."
                 ),
-                context=stmt.context,
+                span=stmt.span,
             )
         cm = qlast.CreateMigration(  # type: ignore
             body=qlast.NestedQLBlock(
@@ -104,18 +132,16 @@ def compile_and_apply_ddl_stmt(
                             qlast.ObjectRef(
                                 name='MigrationGeneratedBy', module='schema'
                             ),
-                            qlast.Ptr(
-                                ptr=qlast.ObjectRef(name='DDLStatement')
-                            ),
+                            qlast.Ptr(name='DDLStatement'),
                         ]
                     ),
                 )
             ],
         )
-        return compile_and_apply_ddl_stmt(ctx, cm)
+        return _compile_and_apply_ddl_stmt(ctx, cm)
 
     assert isinstance(stmt, qlast.DDLCommand)
-    delta = s_ddl.delta_from_ddl(
+    new_schema, delta = s_ddl.delta_and_schema_from_ddl(
         stmt,
         schema=schema,
         modaliases=current_tx.get_modaliases(),
@@ -123,16 +149,13 @@ def compile_and_apply_ddl_stmt(
     )
 
     if debug.flags.delta_plan:
-        debug.header('Delta Plan Input')
-        debug.dump(delta)
+        debug.header('Canonical Delta Plan')
+        debug.dump(delta, schema=schema)
 
     if mstate := current_tx.get_migration_state():
         mstate = mstate._replace(
             accepted_cmds=mstate.accepted_cmds + (stmt,),
         )
-
-        context = _new_delta_context(ctx)
-        schema = delta.apply(schema, context=context)
 
         last_proposed = mstate.last_proposed
         if last_proposed:
@@ -161,14 +184,24 @@ def compile_and_apply_ddl_stmt(
                     mstate = mstate._replace(last_proposed=None)
 
         current_tx.update_migration_state(mstate)
-        current_tx.update_schema(schema)
+        current_tx.update_schema(new_schema)
 
-        return dbstate.DDLQuery(
-            sql=(b'SELECT LIMIT 0',),
+        query = dbstate.DDLQuery(
+            sql=NIL_QUERY,
             user_schema=current_tx.get_user_schema(),
             is_transactional=True,
-            single_unit=False,
+            warnings=tuple(delta.warnings),
+            feature_used_metrics=None,
         )
+
+        return query, None
+
+    store_migration_sdl = compiler._get_config_val(ctx, 'store_migration_sdl')
+    if (
+        isinstance(stmt, qlast.CreateMigration)
+        and store_migration_sdl == 'AlwaysStore'
+    ):
+        stmt.target_sdl = s_ddl.sdl_text_from_schema(new_schema)
 
     # If we are in a migration rewrite, we also don't actually
     # apply the DDL, just record it. (The DDL also needs to be a
@@ -185,37 +218,32 @@ def compile_and_apply_ddl_stmt(
         )
         current_tx.update_migration_rewrite_state(mrstate)
 
-        context = _new_delta_context(ctx)
-        schema = delta.apply(schema, context=context)
+        current_tx.update_schema(new_schema)
 
-        current_tx.update_schema(schema)
-
-        return dbstate.DDLQuery(
-            sql=(b'SELECT LIMIT 0',),
+        query = dbstate.DDLQuery(
+            sql=NIL_QUERY,
             user_schema=current_tx.get_user_schema(),
             is_transactional=True,
-            single_unit=False,
+            warnings=tuple(delta.warnings),
+            feature_used_metrics=None,
         )
 
-    # Do a dry-run on test_schema to canonicalize
-    # the schema delta-commands.
-    test_schema = current_tx.get_schema(ctx.compiler_state.std_schema)
-    context = _new_delta_context(ctx)
-    delta.apply(test_schema, context=context)
-    delta.canonical = True
+        return query, None
 
     # Apply and adapt delta, build native delta plan, which
     # will also update the schema.
     block, new_types, config_ops = _process_delta(ctx, delta)
 
     ddl_stmt_id: Optional[str] = None
-
     is_transactional = block.is_transactional()
     if not is_transactional:
-        sql = tuple(stmt.encode('utf-8') for stmt in block.get_statements())
+        if not isinstance(stmt, qlast.DatabaseCommand):
+            raise AssertionError(
+                f"unexpected non-transaction DDL command type: {stmt}")
+        sql_stmts = block.get_statements()
+        sql = sql_stmts[0].encode("utf-8")
+        db_op_trailer = tuple(stmt.encode("utf-8") for stmt in sql_stmts[1:])
     else:
-        sql = (block.to_string().encode('utf-8'),)
-
         if new_types:
             # Inject a query returning backend OIDs for the newly
             # created types.
@@ -223,10 +251,10 @@ def compile_and_apply_ddl_stmt(
             new_type_ids = [
                 f'{pg_common.quote_literal(tid)}::uuid' for tid in new_types
             ]
-            sql = sql + (
-                textwrap.dedent(
-                    f'''\
-                SELECT
+            # Return newly-added type id mapping via the indirect
+            # return channel (see PGConnection.last_indirect_return)
+            new_types_sql = textwrap.dedent(f"""\
+                PERFORM edgedb.indirect_return(
                     json_build_object(
                         'ddl_stmt_id',
                         {pg_common.quote_literal(ddl_stmt_id)},
@@ -234,71 +262,96 @@ def compile_and_apply_ddl_stmt(
                         (SELECT
                             json_object_agg(
                                 "id"::text,
-                                "backend_id"
+                                json_build_array("backend_id", "name")
                             )
                             FROM
-                            edgedb."_SchemaType"
+                            edgedb_VER."_SchemaType"
                             WHERE
                                 "id" = any(ARRAY[
                                     {', '.join(new_type_ids)}
                                 ])
                         )
-                    )::text;
-            '''
-                ).encode('utf-8'),
+                    )::text
+                )"""
             )
+
+            block.add_command(pg_dbops.Query(text=new_types_sql).code())
+
+        sql = block.to_string().encode('utf-8')
+        db_op_trailer = ()
 
     create_db = None
     drop_db = None
+    drop_db_reset_connections = False
     create_db_template = None
+    create_db_mode = None
     if isinstance(stmt, qlast.DropDatabase):
         drop_db = stmt.name.name
+        drop_db_reset_connections = stmt.force
     elif isinstance(stmt, qlast.CreateDatabase):
         create_db = stmt.name.name
         create_db_template = stmt.template.name if stmt.template else None
+        create_db_mode = stmt.branch_type
+    elif isinstance(stmt, qlast.AlterDatabase):
+        for cmd in stmt.commands:
+            if isinstance(cmd, qlast.Rename):
+                drop_db = stmt.name.name
+                create_db = cmd.new_name.name
+                drop_db_reset_connections = stmt.force
 
+    if debug.flags.delta_execute_ddl:
+        debug.header('Delta Script (DDL Only)')
+        # The schema updates are always the last statement, so grab
+        # everything but
+        code = '\n\n'.join(block.get_statements()[:-1])
+        debug.dump_code(code, lexer='sql')
     if debug.flags.delta_execute:
         debug.header('Delta Script')
-        debug.dump_code(b'\n'.join(sql), lexer='sql')
+        debug.dump_code(sql + b"\n".join(db_op_trailer), lexer='sql')
 
-    return dbstate.DDLQuery(
+    new_user_schema = current_tx.get_user_schema_if_updated()
+    query = dbstate.DDLQuery(
         sql=sql,
         is_transactional=is_transactional,
-        single_unit=bool(
-            (not is_transactional)
-            or (drop_db is not None)
-            or (create_db is not None)
-            or new_types
-        ),
         create_db=create_db,
         drop_db=drop_db,
+        drop_db_reset_connections=drop_db_reset_connections,
         create_db_template=create_db_template,
+        create_db_mode=create_db_mode,
+        db_op_trailer=db_op_trailer,
         ddl_stmt_id=ddl_stmt_id,
-        user_schema=current_tx.get_user_schema_if_updated(),  # type: ignore
+        user_schema=new_user_schema,
         cached_reflection=current_tx.get_cached_reflection_if_updated(),
         global_schema=current_tx.get_global_schema_if_updated(),
         config_ops=config_ops,
+        warnings=tuple(delta.warnings),
+        feature_used_metrics=(
+            produce_feature_used_metrics(ctx.compiler_state, new_user_schema)
+            if new_user_schema else None
+        ),
     )
+
+    return query, block
 
 
 def _new_delta_context(
-    ctx: compiler.CompileContext, args: Any=None
+    ctx: compiler.CompileContext, args: Any = None
 ) -> s_delta.CommandContext:
     return s_delta.CommandContext(
         backend_runtime_params=ctx.compiler_state.backend_runtime_params,
-        stdmode=ctx.bootstrap_mode,
         internal_schema_mode=ctx.internal_schema_mode,
         **(_get_delta_context_args(ctx) if args is None else args),
     )
 
 
 def _get_delta_context_args(ctx: compiler.CompileContext) -> dict[str, Any]:
-    """Get the args need from delta_from_ddl"""
+    """Get the args needed for delta_and_schema_from_ddl"""
     return dict(
-        testmode=compiler._get_config_val(ctx, '__internal_testmode'),
-        allow_dml_in_functions=(
-            compiler._get_config_val(ctx, 'allow_dml_in_functions')
-        ),
+        stdmode=ctx.bootstrap_mode,
+        testmode=ctx.is_testmode(),
+        store_migration_sdl=(
+            compiler._get_config_val(ctx, 'store_migration_sdl')
+        ) == 'AlwaysStore',
         schema_object_ids=ctx.schema_object_ids,
         compat_ver=ctx.compat_ver,
     )
@@ -312,10 +365,6 @@ def _process_delta(
     current_tx = ctx.state.current_tx()
     schema = current_tx.get_schema(ctx.compiler_state.std_schema)
 
-    if debug.flags.delta_plan:
-        debug.header('Canonical Delta Plan')
-        debug.dump(delta, schema=schema)
-
     pgdelta = pg_delta.CommandMeta.adapt(delta)
     assert isinstance(pgdelta, pg_delta.DeltaRoot)
     context = _new_delta_context(ctx)
@@ -327,7 +376,7 @@ def _process_delta(
         debug.dump(pgdelta, schema=schema)
 
     db_cmd = any(
-        isinstance(c, s_db.DatabaseCommand) for c in pgdelta.get_subcommands()
+        isinstance(c, s_db.BranchCommand) for c in pgdelta.get_subcommands()
     )
 
     if db_cmd:
@@ -339,12 +388,33 @@ def _process_delta(
 
     # Generate SQL DDL for the delta.
     pgdelta.generate(block)  # type: ignore
+    # XXX: We would prefer for there to not be trampolines ever after bootstrap
+    pgdelta.create_trampolines.generate(block)  # type: ignore
 
     # Generate schema storage SQL (DML into schema storage tables).
     subblock = block.add_block()
     compiler.compile_schema_storage_in_delta(
         ctx, pgdelta, subblock, context=context
     )
+
+    # Performance hack; we really want trivial migration commands
+    # (that only mutate the migration log) to not trigger a pg_catalog
+    # view refresh, since many get issued as part of MIGRATION
+    # REWRITEs.
+    all_migration_tweaks = all(
+        isinstance(
+            cmd, (s_ver.AlterSchemaVersion, s_migrations.MigrationCommand)
+        )
+        and not cmd.get_subcommands(type=s_delta.ObjectCommand)
+        for cmd in delta.get_subcommands()
+    )
+
+    if not ctx.bootstrap_mode and not all_migration_tweaks:
+        from edb.pgsql import metaschema
+        refresh = metaschema.generate_sql_information_schema_refresh(
+            ctx.compiler_state.backend_runtime_params.instance_params.version
+        )
+        refresh.generate(subblock)
 
     return block, new_types, pgdelta.config_ops
 
@@ -433,12 +503,11 @@ def _start_migration(
             tx_action=tx_query.action,
             cacheable=False,
             modaliases=None,
-            single_unit=tx_query.single_unit,
         )
     else:
         savepoint_name = current_tx.start_migration()
         query = dbstate.MigrationControlQuery(
-            sql=(b'SELECT LIMIT 0',),
+            sql=NIL_QUERY,
             action=dbstate.MigrationAction.START,
             tx_action=None,
             cacheable=False,
@@ -456,15 +525,13 @@ def _start_migration(
             s_schema.EMPTY_SCHEMA,
             current_tx.get_global_schema(),
         )
-        target_schema = s_ddl.apply_sdl(
+        target_schema, warnings = s_ddl.apply_sdl(
             ql.target,
             base_schema=base_schema,
             current_schema=schema,
-            testmode=(compiler._get_config_val(ctx, '__internal_testmode')),
-            allow_dml_in_functions=(
-                compiler._get_config_val(ctx, 'allow_dml_in_functions')
-            ),
+            testmode=ctx.is_testmode(),
         )
+        query = dataclasses.replace(query, warnings=tuple(warnings))
 
     current_tx.update_migration_state(
         dbstate.MigrationState(
@@ -503,7 +570,7 @@ def _populate_migration(
             schema,
             mstate.target_schema,
             diff,
-            testmode=compiler._get_config_val(ctx, '__internal_testmode'),
+            testmode=ctx.is_testmode(),
         ),
     )
     all_ddl = mstate.accepted_cmds + new_ddl
@@ -549,12 +616,11 @@ def _populate_migration(
     current_tx.update_schema(schema)
 
     return dbstate.MigrationControlQuery(
-        sql=(b'SELECT LIMIT 0',),
+        sql=NIL_QUERY,
         tx_action=None,
         action=dbstate.MigrationAction.POPULATE,
         cacheable=False,
         modaliases=None,
-        single_unit=False,
     )
 
 
@@ -715,8 +781,6 @@ def _describe_current_migration(
                     **extra,
                 }
             )
-            .encode('unicode_escape')
-            .decode('utf-8')
         )
 
         desc_ql = edgeql.parse_query(
@@ -780,12 +844,11 @@ def _alter_current_migration_reject_proposed(
     current_tx.update_migration_state(mstate)
 
     return dbstate.MigrationControlQuery(
-        sql=(b'SELECT LIMIT 0',),
+        sql=NIL_QUERY,
         tx_action=None,
         action=dbstate.MigrationAction.REJECT_PROPOSED,
         cacheable=False,
         modaliases=None,
-        single_unit=False,
     )
 
 
@@ -808,7 +871,7 @@ def _commit_migration(
                 ' to let the system populate the outstanding DDL'
                 ' automatically.'
             ),
-            context=ql.context,
+            span=ql.span,
         )
 
     if debug.flags.delta_plan:
@@ -828,11 +891,17 @@ def _commit_migration(
     else:
         last_migration_ref = None
 
+    target_sdl: Optional[str] = None
+    store_migration_sdl = compiler._get_config_val(ctx, 'store_migration_sdl')
+    if store_migration_sdl == 'AlwaysStore':
+        target_sdl = s_ddl.sdl_text_from_schema(schema)
+
     create_migration = qlast.CreateMigration(  # type: ignore
         body=qlast.NestedQLBlock(
             commands=mstate.accepted_cmds  # type: ignore
         ),
         parent=last_migration_ref,
+        target_sdl=target_sdl,
     )
 
     current_tx.update_schema(mstate.initial_schema)
@@ -850,7 +919,7 @@ def _commit_migration(
         current_tx.update_migration_rewrite_state(mrstate)
 
         return dbstate.MigrationControlQuery(
-            sql=(b'SELECT LIMIT 0',),
+            sql=NIL_QUERY,
             action=dbstate.MigrationAction.COMMIT,
             tx_action=None,
             cacheable=False,
@@ -867,22 +936,17 @@ def _commit_migration(
 
     if mstate.initial_savepoint:
         current_tx.commit_migration(mstate.initial_savepoint)
-        sql = ddl_query.sql
         tx_action = None
     else:
-        tx_cmd = qlast.CommitTransaction()
-        tx_query = compiler._compile_ql_transaction(ctx, tx_cmd)
-        sql = ddl_query.sql + tx_query.sql
-        tx_action = tx_query.action
+        tx_action = dbstate.TxAction.COMMIT
 
     return dbstate.MigrationControlQuery(
-        sql=sql,
+        sql=ddl_query.sql,
         ddl_stmt_id=ddl_query.ddl_stmt_id,
         action=dbstate.MigrationAction.COMMIT,
         tx_action=tx_action,
         cacheable=False,
         modaliases=None,
-        single_unit=True,
         user_schema=ctx.state.current_tx().get_user_schema(),
         cached_reflection=(current_tx.get_cached_reflection_if_updated()),
     )
@@ -898,7 +962,7 @@ def _abort_migration(
 
     if mstate.initial_savepoint:
         current_tx.abort_migration(mstate.initial_savepoint)
-        sql: Tuple[bytes, ...] = (b'SELECT LIMIT 0',)
+        sql = NIL_QUERY
         tx_action = None
     else:
         tx_cmd = qlast.RollbackTransaction()
@@ -913,7 +977,6 @@ def _abort_migration(
         tx_action=tx_action,
         cacheable=False,
         modaliases=None,
-        single_unit=True,
     )
 
 
@@ -939,12 +1002,11 @@ def _start_migration_rewrite(
             tx_action=tx_query.action,
             cacheable=False,
             modaliases=None,
-            single_unit=tx_query.single_unit,
         )
     else:
         savepoint_name = current_tx.start_migration()
         query = dbstate.MigrationControlQuery(
-            sql=(b'SELECT LIMIT 0',),
+            sql=NIL_QUERY,
             action=dbstate.MigrationAction.START,
             tx_action=None,
             cacheable=False,
@@ -957,7 +1019,7 @@ def _start_migration_rewrite(
         s_schema.EMPTY_SCHEMA,
         current_tx.get_global_schema(),
     )
-    base_schema = s_ddl.apply_sdl(  # type: ignore
+    new_base_schema, _ = s_ddl.apply_sdl(
         qlast.Schema(
             declarations=[
                 qlast.ModuleDeclaration(
@@ -971,7 +1033,7 @@ def _start_migration_rewrite(
     )
 
     # Set our current schema to be the empty one
-    current_tx.update_schema(base_schema)
+    current_tx.update_schema(new_base_schema)
     current_tx.update_migration_rewrite_state(
         dbstate.MigrationRewriteState(
             target_schema=schema,
@@ -1001,7 +1063,7 @@ def _commit_migration_rewrite(
         raise errors.QueryError(
             'cannot commit migration rewrite: schema resulting '
             'from rewrite does not match committed schema',
-            context=ql.context,
+            span=ql.span,
         )
 
     schema = mrstate.target_schema
@@ -1010,13 +1072,10 @@ def _commit_migration_rewrite(
 
     cmds: List[qlast.DDLCommand] = []
     # Now we find all the migrations...
-    migrations = s_delta.sort_by_cross_refs(
-        schema,
-        schema.get_objects(type=s_migrations.Migration),
-    )
-    for mig in migrations:
+    migrations = s_migrations.get_ordered_migrations(schema)
+    for mig in reversed(migrations):
         cmds.append(
-            qlast.DropMigration(  # type: ignore
+            qlast.DropMigration(
                 name=qlast.ObjectRef(name=mig.get_name(schema).name)
             )
         )
@@ -1029,30 +1088,28 @@ def _commit_migration_rewrite(
         for cm in cmds:
             cm.dump_edgeql()
 
-    sqls: List[bytes] = []
+    block = pg_dbops.PLTopBlock()
     for cmd in cmds:
-        ddl_query = compile_and_apply_ddl_stmt(ctx, cmd)
+        _, ddl_block = _compile_and_apply_ddl_stmt(ctx, cmd)
+        assert isinstance(ddl_block, pg_dbops.PLBlock)
         # We know nothing serious can be in that query
         # except for the SQL, so it's fine to just discard
         # it all.
-        sqls.extend(ddl_query.sql)
+        for stmt in ddl_block.get_statements():
+            block.add_command(stmt)
 
     if mrstate.initial_savepoint:
         current_tx.commit_migration(mrstate.initial_savepoint)
         tx_action = None
     else:
-        tx_cmd = qlast.CommitTransaction()
-        tx_query = compiler._compile_ql_transaction(ctx, tx_cmd)
-        sqls.extend(tx_query.sql)
-        tx_action = tx_query.action
+        tx_action = dbstate.TxAction.COMMIT
 
     return dbstate.MigrationControlQuery(
-        sql=tuple(sqls),
+        sql=block.to_string().encode("utf-8"),
         action=dbstate.MigrationAction.COMMIT,
         tx_action=tx_action,
         cacheable=False,
         modaliases=None,
-        single_unit=True,
         user_schema=ctx.state.current_tx().get_user_schema(),
         cached_reflection=(current_tx.get_cached_reflection_if_updated()),
     )
@@ -1068,7 +1125,7 @@ def _abort_migration_rewrite(
 
     if mrstate.initial_savepoint:
         current_tx.abort_migration(mrstate.initial_savepoint)
-        sql: Tuple[bytes, ...] = (b'SELECT LIMIT 0',)
+        sql = NIL_QUERY
         tx_action = None
     else:
         tx_cmd = qlast.RollbackTransaction()
@@ -1084,7 +1141,6 @@ def _abort_migration_rewrite(
         tx_action=tx_action,
         cacheable=False,
         modaliases=None,
-        single_unit=True,
     )
 
     return query
@@ -1101,7 +1157,7 @@ def _reset_schema(
         raise errors.QueryError(
             f'Unknown schema version "{ql.target.name}". '
             'Currently, only revision supported is "initial"',
-            context=ql.target.context,
+            span=ql.target.span,
         )
 
     current_tx = ctx.state.current_tx()
@@ -1112,7 +1168,7 @@ def _reset_schema(
         s_schema.EMPTY_SCHEMA,
         current_tx.get_global_schema(),
     )
-    empty_schema = s_ddl.apply_sdl(  # type: ignore
+    empty_schema, _ = s_ddl.apply_sdl(  # type: ignore
         qlast.Schema(
             declarations=[
                 qlast.ModuleDeclaration(
@@ -1125,8 +1181,6 @@ def _reset_schema(
         current_schema=empty_schema,
     )
 
-    sqls: List[bytes] = []
-
     # diff and create migration that drops all objects
     diff = s_ddl.delta_schemas(schema, empty_schema)
     new_ddl: Tuple[qlast.DDLCommand, ...] = tuple(
@@ -1135,8 +1189,8 @@ def _reset_schema(
     create_mig = qlast.CreateMigration(  # type: ignore
         body=qlast.NestedQLBlock(commands=tuple(new_ddl)),  # type: ignore
     )
-    ddl_query = compile_and_apply_ddl_stmt(ctx, create_mig)
-    sqls.extend(ddl_query.sql)
+    ddl_query, ddl_block = _compile_and_apply_ddl_stmt(ctx, create_mig)
+    assert ddl_block is not None
 
     # delete all migrations
     schema = current_tx.get_schema(ctx.compiler_state.std_schema)
@@ -1146,28 +1200,126 @@ def _reset_schema(
         schema.get_objects(type=s_migrations.Migration),
     )
     for mig in migrations:
-        drop_mig = qlast.DropMigration(  # type: ignore
+        drop_mig = qlast.DropMigration(
             name=qlast.ObjectRef(name=mig.get_name(schema).name),
         )
-        ddl_query = compile_and_apply_ddl_stmt(ctx, drop_mig)
-        sqls.extend(ddl_query.sql)
+        _, mig_block = _compile_and_apply_ddl_stmt(ctx, drop_mig)
+        assert isinstance(mig_block, pg_dbops.PLBlock)
+        for stmt in mig_block.get_statements():
+            ddl_block.add_command(stmt)
 
     return dbstate.MigrationControlQuery(
-        sql=tuple(sqls),
+        sql=ddl_block.to_string().encode("utf-8"),
         ddl_stmt_id=ddl_query.ddl_stmt_id,
         action=dbstate.MigrationAction.COMMIT,
         tx_action=None,
         cacheable=False,
         modaliases=None,
-        single_unit=True,
         user_schema=current_tx.get_user_schema(),
         cached_reflection=(current_tx.get_cached_reflection_if_updated()),
     )
 
 
+_FEATURE_NAMES: dict[type[s_obj.Object], str] = {
+    s_annos.AnnotationValue: 'annotation',
+    s_policies.AccessPolicy: 'policy',
+    s_triggers.Trigger: 'trigger',
+    s_rewrites.Rewrite: 'rewrite',
+    s_globals.Global: 'global',
+    s_expraliases.Alias: 'alias',
+    s_func.Function: 'function',
+    s_indexes.Index: 'index',
+    s_scalars.ScalarType: 'scalar',
+    s_migrations.Migration: 'migration',
+}
+
+
+def produce_feature_used_metrics(
+    compiler_state: compiler.CompilerState,
+    user_schema: s_schema.Schema,
+) -> dict[str, float]:
+    schema = s_schema.ChainedSchema(
+        compiler_state.std_schema,
+        user_schema,
+        # Skipping global schema is a little dodgy but not that bad
+        s_schema.EMPTY_SCHEMA,
+    )
+
+    features: dict[str, float] = {}
+
+    def _track(key: str) -> None:
+        features[key] = features.get(key, 0) + 1
+
+    # TODO(perf): Should we optimize peeking into the innards directly
+    # so we can skip creating the proxies?
+    for obj in user_schema.get_objects(
+        type=s_obj.Object, exclude_extensions=True,
+    ):
+        typ = type(obj)
+        if (key := _FEATURE_NAMES.get(typ)):
+            _track(key)
+
+        if isinstance(obj, s_globals.Global) and obj.get_expr(user_schema):
+            _track('computed_global')
+        elif (
+            isinstance(obj, s_properties.Property)
+        ):
+            if obj.get_expr(user_schema):
+                _track('computed_property')
+            elif obj.get_cardinality(schema).is_multi():
+                _track('multi_property')
+
+            if (
+                obj.is_link_property(schema)
+                and not obj.is_special_pointer(schema)
+            ):
+                _track('link_property')
+        elif (
+            isinstance(obj, s_links.Link)
+            and obj.get_expr(user_schema)
+        ):
+            _track('computed_link')
+        elif (
+            isinstance(obj, s_indexes.Index)
+            and s_indexes.is_fts_index(schema, obj)
+        ):
+            _track('fts')
+        elif (
+            isinstance(obj, s_constraints.Constraint)
+            and not (
+                (subject := obj.get_subject(schema))
+                and isinstance(subject, s_properties.Property)
+                and subject.is_special_pointer(schema)
+            )
+        ):
+            _track('constraint')
+            exclusive_constr = schema.get(
+                'std::exclusive', type=s_constraints.Constraint
+            )
+            if not obj.issubclass(schema, exclusive_constr):
+                _track('constraint_expr')
+        elif (
+            isinstance(obj, s_objtypes.ObjectType)
+            and len(obj.get_bases(schema).objects(schema)) > 1
+        ):
+            _track('multiple_inheritance')
+        elif (
+            isinstance(obj, s_objtypes.ObjectType)
+            and obj.is_material_object_type(schema)
+        ):
+            _track('object_type')
+        elif (
+            isinstance(obj, s_scalars.ScalarType)
+            and obj.is_enum(schema)
+        ):
+            _track('enum')
+
+    return features
+
+
 def repair_schema(
     ctx: compiler.CompileContext,
-) -> Optional[tuple[tuple[bytes, ...], s_schema.Schema, Any]]:
+) -> Optional[tuple[bytes, s_schema.Schema, Any]]:
     """Repair inconsistencies in the schema caused by bug fixes
 
     Works by comparing the actual current schema to the schema we get
@@ -1186,7 +1338,6 @@ def repair_schema(
     context_args = _get_delta_context_args(ctx)
     context_args.update(dict(
         testmode=True,
-        allow_dml_in_functions=True,
     ))
 
     text = s_ddl.ddl_text_from_schema(schema)
@@ -1230,11 +1381,11 @@ def repair_schema(
     is_transactional = block.is_transactional()
     assert not new_types
     assert is_transactional
-    sql = (block.to_string().encode('utf-8'),)
+    sql = block.to_string().encode('utf-8')
 
     if debug.flags.delta_execute:
         debug.header('Repair Delta Script')
-        debug.dump_code(b'\n'.join(sql), lexer='sql')
+        debug.dump_code(sql, lexer='sql')
 
     return sql, reloaded_schema, config_ops
 
@@ -1246,24 +1397,24 @@ def administer_repair_schema(
     if ql.expr.args or ql.expr.kwargs:
         raise errors.QueryError(
             'repair_schema() does not take arguments',
-            context=ql.expr.context,
+            span=ql.expr.span,
         )
 
     current_tx = ctx.state.current_tx()
 
     res = repair_schema(ctx)
     if not res:
-        return dbstate.MaintenanceQuery(sql=(b'',))
+        return dbstate.MaintenanceQuery(sql=b"")
     sql, new_schema, config_ops = res
 
     current_tx.update_schema(new_schema)
 
     return dbstate.DDLQuery(
         sql=sql,
-        single_unit=False,
-        user_schema=current_tx.get_user_schema_if_updated(),  # type: ignore
+        user_schema=current_tx.get_user_schema_if_updated(),
         global_schema=current_tx.get_global_schema_if_updated(),
         config_ops=config_ops,
+        feature_used_metrics=None,
     )
 
 
@@ -1277,12 +1428,11 @@ def administer_reindex(
     from edb.schema import objtypes as s_objtypes
     from edb.schema import constraints as s_constraints
     from edb.schema import indexes as s_indexes
-    from edb.schema import pointers as s_pointers
 
     if len(ql.expr.args) != 1 or ql.expr.kwargs:
         raise errors.QueryError(
             'reindex() takes exactly one position argument',
-            context=ql.expr.context,
+            span=ql.expr.span,
         )
 
     arg = ql.expr.args[0]
@@ -1300,7 +1450,7 @@ def administer_reindex(
         case _:
             raise errors.QueryError(
                 'argument to reindex() must be an object type',
-                context=arg.context,
+                span=arg.span,
             )
 
     current_tx = ctx.state.current_tx()
@@ -1319,13 +1469,13 @@ def administer_reindex(
         if (
             not expr.expr
             or not isinstance(expr.expr, irast.SelectStmt)
-            or not expr.expr.result.rptr
+            or not isinstance(expr.expr.result.expr, irast.Pointer)
         ):
             raise errors.QueryError(
                 'invalid pointer argument to reindex()',
-                context=arg.context,
+                span=arg.span,
             )
-        rptr = expr.expr.result.rptr
+        rptr = expr.expr.result.expr
         source = rptr.source
     else:
         rptr = None
@@ -1338,7 +1488,7 @@ def administer_reindex(
     ):
         raise errors.QueryError(
             'argument to reindex() must be a regular object type',
-            context=arg.context,
+            span=arg.span,
         )
 
     tables: set[s_pointers.Pointer | s_objtypes.ObjectType] = set()
@@ -1359,7 +1509,7 @@ def administer_reindex(
         if not isinstance(rptr.ptrref, irast.PointerRef):
             raise errors.QueryError(
                 'invalid pointer argument to reindex()',
-                context=arg.context,
+                span=arg.span,
             )
         schema, ptrcls = irtypeutils.ptrcls_from_ptrref(
             rptr.ptrref, schema=schema)
@@ -1403,6 +1553,254 @@ def administer_reindex(
         for pindex in pindexes
     ]
 
-    return dbstate.MaintenanceQuery(
-        sql=tuple(q.encode('utf-8') for q in commands)
+    block = pg_dbops.PLTopBlock()
+    for command in commands:
+        block.add_command(command)
+
+    return dbstate.MaintenanceQuery(sql=block.to_string().encode("utf-8"))
+
+
+def _identify_administer_tables_and_cols(
+    ctx: compiler.CompileContext,
+    call: qlast.FunctionCall,
+) -> list[str]:
+    from edb.ir import ast as irast
+    from edb.ir import typeutils as irtypeutils
+    from edb.schema import objtypes as s_objtypes
+
+    args: List[Tuple[irast.Pointer | None, s_objtypes.ObjectType]] = []
+    current_tx = ctx.state.current_tx()
+    schema = current_tx.get_schema(ctx.compiler_state.std_schema)
+    modaliases = current_tx.get_modaliases()
+
+    for arg in call.args:
+        match arg:
+            case qlast.Path(
+                steps=[qlast.ObjectRef()],
+                partial=False,
+            ):
+                ptr = False
+            case qlast.Path(
+                steps=[qlast.ObjectRef(), qlast.Ptr()],
+                partial=False,
+            ):
+                ptr = True
+            case _:
+                raise errors.QueryError(
+                    'argument to vacuum() must be an object type '
+                    'or a link or property reference',
+                    span=arg.span,
+                )
+
+        ir: irast.Statement = qlcompiler.compile_ast_to_ir(
+            arg,
+            schema=schema,
+            options=qlcompiler.CompilerOptions(
+                modaliases=modaliases
+            ),
+        )
+        expr = ir.expr
+        if ptr:
+            if (
+                not expr.expr
+                or not isinstance(expr.expr, irast.SelectStmt)
+                or not isinstance(expr.expr.result.expr, irast.Pointer)
+            ):
+                raise errors.QueryError(
+                    'invalid pointer argument to vacuum()',
+                    span=arg.span,
+                )
+            rptr = expr.expr.result.expr
+            source = rptr.source
+        else:
+            rptr = None
+            source = expr
+        schema, obj = irtypeutils.ir_typeref_to_type(schema, source.typeref)
+
+        if (
+            not isinstance(obj, s_objtypes.ObjectType)
+            or not obj.is_material_object_type(schema)
+        ):
+            raise errors.QueryError(
+                'argument to vacuum() must be an object type '
+                'or a link or property reference',
+                span=arg.span,
+            )
+        args.append((rptr, obj))
+
+    tables: set[s_pointers.Pointer | s_objtypes.ObjectType] = set()
+
+    for arg, (rptr, obj) in zip(call.args, args):
+        if not rptr:
+            # On a type, we just vacuum the type and its descendants
+            tables.update({obj} | {
+                desc for desc in obj.descendants(schema)
+                if desc.is_material_object_type(schema)
+            })
+        else:
+            # On a pointer, we must go over the pointer and its descendants
+            # so that we may retrieve any link talbes if necessary.
+            if not isinstance(rptr.ptrref, irast.PointerRef):
+                raise errors.QueryError(
+                    'invalid pointer argument to vacuum()',
+                    span=arg.span,
+                )
+            schema, ptrcls = irtypeutils.ptrcls_from_ptrref(
+                rptr.ptrref, schema=schema)
+
+            card = ptrcls.get_cardinality(schema)
+            if not (
+                card.is_multi() or ptrcls.has_user_defined_properties(schema)
+            ):
+                vn = ptrcls.get_verbosename(schema, with_parent=True)
+                if ptrcls.is_property(schema):
+                    raise errors.QueryError(
+                        f'{vn} is not a valid argument to vacuum() '
+                        f'because it is not a multi property',
+                        span=arg.span,
+                    )
+                else:
+                    raise errors.QueryError(
+                        f'{vn} is not a valid argument to vacuum() '
+                        f'because it is neither a multi link nor '
+                        f'does it have link properties',
+                        span=arg.span,
+                    )
+
+            ptrclses = {ptrcls} | {
+                desc for desc in ptrcls.descendants(schema)
+                if isinstance(
+                    (src := desc.get_source(schema)), s_objtypes.ObjectType)
+                and src.is_material_object_type(schema)
+            }
+            tables.update(ptrclses)
+
+    return [
+        pg_common.get_backend_name(schema, table)
+        for table in tables
+    ]
+
+
+def administer_vacuum(
+    ctx: compiler.CompileContext,
+    ql: qlast.AdministerStmt,
+) -> dbstate.BaseQuery:
+    # check that the kwargs are valid
+    kwargs: Dict[str, str] = {}
+    for name, val in ql.expr.kwargs.items():
+        if name not in ('statistics_update', 'full'):
+            raise errors.QueryError(
+                f'unrecognized keyword argument {name!r} for vacuum()',
+                span=val.span,
+            )
+        elif (
+            not isinstance(val, qlast.Constant)
+            or val.kind != qlast.ConstantKind.BOOLEAN
+        ):
+            raise errors.QueryError(
+                f'argument {name!r} for vacuum() must be a boolean literal',
+                span=val.span,
+            )
+        kwargs[name] = val.value
+
+    option_map = {
+        "statistics_update": "ANALYZE",
+        "full": "FULL",
+    }
+    command = "VACUUM"
+    options = ",".join(
+        f"{option_map[k.lower()]} {v.upper()}"
+        for k, v in kwargs.items()
     )
+    if options:
+        command += f" ({options})"
+    command += " " + ", ".join(
+        _identify_administer_tables_and_cols(ctx, ql.expr),
+    )
+
+    return dbstate.MaintenanceQuery(
+        sql=command.encode('utf-8'),
+        is_transactional=False,
+    )
+
+
+def administer_statistics_update(
+    ctx: compiler.CompileContext,
+    ql: qlast.AdministerStmt,
+) -> dbstate.BaseQuery:
+    for name, val in ql.expr.kwargs.items():
+        raise errors.QueryError(
+            f'unrecognized keyword argument {name!r} for statistics_update()',
+            span=val.span,
+        )
+
+    command = "ANALYZE " + ", ".join(
+        _identify_administer_tables_and_cols(ctx, ql.expr),
+    )
+
+    return dbstate.MaintenanceQuery(
+        sql=command.encode('utf-8'),
+        is_transactional=True,
+    )
+
+
+def administer_prepare_upgrade(
+    ctx: compiler.CompileContext,
+    ql: qlast.AdministerStmt,
+) -> dbstate.BaseQuery:
+
+    user_schema = ctx.state.current_tx().get_user_schema()
+    global_schema = ctx.state.current_tx().get_global_schema()
+
+    schema = s_schema.ChainedSchema(
+        ctx.compiler_state.std_schema,
+        user_schema,
+        global_schema
+    )
+
+    schema_ddl = s_ddl.ddl_text_from_schema(
+        schema, include_migrations=True)
+    ids, _ = compiler.get_obj_ids(schema, include_extras=True)
+    json_ids = [(name, cls, str(id)) for name, cls, id in ids]
+
+    obj = dict(
+        ddl=schema_ddl, ids=json_ids
+    )
+
+    desc_ql = edgeql.parse_query(
+        f'SELECT to_json({qlquote.quote_literal(json.dumps(obj))})'
+    )
+    return compiler._compile_ql_query(
+        ctx,
+        desc_ql,
+        cacheable=False,
+        migration_block_query=True,
+    )
+
+
+def validate_schema_equivalence(
+    state: compiler.CompilerState,
+    schema_a: s_schema.FlatSchema,
+    schema_b: s_schema.FlatSchema,
+    global_schema: s_schema.FlatSchema,
+) -> None:
+    schema_a_full = s_schema.ChainedSchema(
+        state.std_schema,
+        schema_a,
+        global_schema,
+    )
+    schema_b_full = s_schema.ChainedSchema(
+        state.std_schema,
+        schema_b,
+        global_schema,
+    )
+
+    diff = s_ddl.delta_schemas(schema_a_full, schema_b_full)
+    complete = not bool(diff.get_subcommands())
+    if not complete:
+        if debug.flags.delta_plan:
+            debug.header('COMPARE SCHEMAS MISMATCH')
+            debug.dump(diff)
+        raise AssertionError(
+            f'schemas did not match after introspection:\n{debug.dumps(diff)}'
+        )

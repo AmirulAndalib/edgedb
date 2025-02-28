@@ -80,6 +80,7 @@ class TestEdgeSchemaParser(SchemaSyntaxTest):
 \t      required property bar: str;
 };
         """
+
     def test_eschema_syntax_semicolon_01(self):
         """
         abstract type test::OwnedObject {
@@ -442,6 +443,9 @@ class TestEdgeSchemaParser(SchemaSyntaxTest):
                 };
                 constraint exclusive on (.asdf) except (.baz);
                 index on (.asdf) except (.baz);
+                deferred index on (.asdf) except (.baz);
+                deferred index bar on (.foo);
+                deferred index bar on (.foo) except (.bar);
             };
         };
         """
@@ -1953,8 +1957,12 @@ abstract property test::foo {
         };
         """
 
-    @tb.must_fail(errors.EdgeQLSyntaxError, r"Missing keyword 'ABSTRACT'",
-                  line=2, col=1)
+    @tb.must_fail(
+        errors.EdgeQLSyntaxError,
+        r"Missing keyword 'ABSTRACT'",
+        line=1,
+        col=1
+    )
     def test_eschema_syntax_annotation_15(self):
         """
 annotation test::foo;
@@ -2135,6 +2143,35 @@ annotation test::foo;
         module test {
             global foo: str;
         };
+
+% OK %
+
+        module test {
+            global foo -> str;
+        };
+        """
+
+    @tb.must_fail(
+        errors.EdgeQLSyntaxError,
+        r"Missing '}'",
+        line=6,
+        col=26,
+    )
+    def test_eschema_syntax_missing_semicolon(self):
+        """
+        module default {
+            type Foo;
+            type Bar {
+                link l -> Foo {
+                a -> bool # missing semicolon
+                b -> bool;
+                c -> bool;
+                };
+            };
+        }
+        ;
+
+        using future nonrecursive_access_policies;
 
 % OK %
 

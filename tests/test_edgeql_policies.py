@@ -918,10 +918,10 @@ class TestEdgeQLPolicies(tb.QueryTestCase):
             alter type Issue {
                 create access policy foo_1 deny all using (
                     not exists (select .watchers { foo := .todo }
-                                filter .foo.name = "x"));
+                                filter "x" in .foo.name));
                 create access policy foo_2 deny all using (
                     not exists (select .watchers { todo }
-                                filter .todo.name = "x"));
+                                filter "x" in .todo.name));
              };
         ''')
 
@@ -1296,3 +1296,57 @@ class TestEdgeQLPolicies(tb.QueryTestCase):
             __typenames__=True,
         )
         self.assertEqual(obj, [])
+
+    async def test_edgeql_policies_global_01(self):
+        # GH issue #6404
+
+        clan_and_global = '''
+            type Clan {
+                access policy allow_select_players
+                    allow select
+                    using (
+                        global current_player.clan.id ?= .id
+                    );
+            };
+            global current_player_id: uuid;
+            global current_player := (
+                select Player filter .id = global current_player_id
+            );
+        '''
+
+        await self.migrate(
+            '''
+            type Principal;
+            type Player extending Principal {
+                required link clan: Clan;
+            }
+            ''' + clan_and_global
+        )
+
+        await self.migrate(
+            '''
+            type Player {
+                required link clan: Clan;
+            }
+            ''' + clan_and_global
+        )
+
+    async def test_edgeql_policies_global_02(self):
+        await self.con.execute('''
+            create type T {
+                create access policy ok allow all;
+                create access policy no deny select;
+            };
+            insert T;
+            create global foo := (select T limit 1);
+            create type S {
+                create access policy ok allow all using (exists global foo)
+            };
+        ''')
+
+        await self.assert_query_result(
+            r'''
+            select { s := S, foo := global foo };
+            ''',
+            [{"s": [], "foo": None}]
+        )

@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Optional, Type, List, Union, overload, TYPE_CHECKING
 
 from edgedb import scram
 
@@ -30,6 +30,7 @@ from edb.schema import defines as s_def
 from . import annos as s_anno
 from . import delta as sd
 from . import inheriting
+from . import name as sn
 from . import objects as so
 from . import utils
 
@@ -91,7 +92,7 @@ class RoleCommand(
                 raise errors.EdgeQLSyntaxError(
                     'cannot specify both `password` and `password_hash` in'
                     ' the same statement',
-                    context=astnode.context,
+                    span=astnode.span,
                 )
             salted_password = scram.build_verifier(password)
             cmd.set_attribute_value('password', salted_password)
@@ -103,7 +104,7 @@ class RoleCommand(
             except ValueError as e:
                 raise errors.InvalidValueError(
                     e.args[0],
-                    context=astnode.context)
+                    span=astnode.span)
             cmd.set_attribute_value('password', password_hash)
 
     @classmethod
@@ -131,11 +132,11 @@ class RoleCommand(
     ) -> None:
         name = self.get_attribute_value('name')
         if len(str(name)) > s_def.MAX_NAME_LENGTH:
-            source_context = self.get_attribute_source_context('name')
+            span = self.get_attribute_span('name')
             raise errors.SchemaDefinitionError(
                 f'Role names longer than {s_def.MAX_NAME_LENGTH} '
                 f'characters are not supported',
-                context=source_context,
+                span=span,
             )
 
 
@@ -155,7 +156,7 @@ class CreateRole(RoleCommand, inheriting.CreateInheritingObject[Role]):
         if not astnode.superuser and not context.testmode:
             raise errors.EdgeQLSyntaxError(
                 'missing required SUPERUSER qualifier',
-                context=astnode.context,
+                span=astnode.span,
             )
 
         cmd.set_attribute_value('superuser', astnode.superuser)
@@ -194,6 +195,60 @@ class RenameRole(RoleCommand, sd.RenameObject[Role]):
 
 class AlterRole(RoleCommand, inheriting.AlterInheritingObject[Role]):
     astnode = qlast.AlterRole
+
+    @overload
+    def get_object(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+        *,
+        name: Optional[sn.Name] = None,
+        default: Union[Role, so.NoDefaultT] = so.NoDefault,
+        sourcectx: Optional[qlast.Span] = None,
+    ) -> Role:
+        ...
+
+    @overload
+    def get_object(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+        *,
+        name: Optional[sn.Name] = None,
+        default: None = None,
+        sourcectx: Optional[qlast.Span] = None,
+    ) -> Optional[Role]:
+        ...
+
+    def get_object(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+        *,
+        name: Optional[sn.Name] = None,
+        default: Union[Role, so.NoDefaultT, None] = so.NoDefault,
+        sourcectx: Optional[qlast.Span] = None,
+    ) -> Optional[Role]:
+        # On an ALTER ROLE edgedb, if 'edgedb' doesn't exist, fall
+        # back to 'admin'. This mirrors what we do for login and
+        # avoids breaking setup scripts.
+        if name is None and str(self.classname) == 'edgedb':
+            try:
+                return super().get_object(
+                    schema,
+                    context,
+                    sourcectx=sourcectx,
+                )
+            except errors.InvalidReferenceError:
+                name = sn.UnqualName('admin')
+
+        return super().get_object(
+            schema,
+            context,
+            name=name,
+            default=default,
+            sourcectx=sourcectx,
+        )
 
     @classmethod
     def _cmd_tree_from_ast(

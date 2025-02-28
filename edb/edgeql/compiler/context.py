@@ -20,8 +20,26 @@
 """EdgeQL to IR compiler context."""
 
 from __future__ import annotations
-from typing import *
-from typing import overload
+from typing import (
+    Callable,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    ChainMap,
+    Dict,
+    List,
+    Set,
+    FrozenSet,
+    NamedTuple,
+    cast,
+    overload,
+    TYPE_CHECKING,
+)
 
 import collections
 import dataclasses
@@ -33,6 +51,8 @@ from edb.common import compiler
 from edb.common import ordered
 from edb.common import parsing
 
+from edb import errors
+
 from edb.edgeql import ast as qlast
 from edb.edgeql import qltypes
 
@@ -41,7 +61,7 @@ from edb.ir import utils as irutils
 from edb.ir import typeutils as irtyputils
 
 from edb.schema import expraliases as s_aliases
-from edb.schema import functions as s_func
+from edb.schema import futures as s_futures
 from edb.schema import name as s_name
 from edb.schema import objects as s_obj
 from edb.schema import pointers as s_pointers
@@ -135,7 +155,10 @@ class Environment:
     path_scope: irast.ScopeTreeNode
     """Overrall expression path scope tree."""
 
-    schema_view_cache: Dict[s_types.Type, tuple[s_types.Type, irast.Set]]
+    schema_view_cache: Dict[
+        tuple[s_types.Type, object],
+        tuple[s_types.Type, irast.Set],
+    ]
     """Type cache used by schema-level views."""
 
     query_parameters: Dict[str, irast.Param]
@@ -149,7 +172,7 @@ class Environment:
     set_types: Dict[irast.Set, s_types.Type]
     """A dictionary of all Set instances and their schema types."""
 
-    type_origins: Dict[s_types.Type, Optional[parsing.ParserContext]]
+    type_origins: Dict[s_types.Type, Optional[parsing.Span]]
     """A dictionary of notable types and their source origins.
 
     This is used to trace where a particular type instance originated in
@@ -178,7 +201,7 @@ class Environment:
         Tuple[
             Optional[qltypes.SchemaCardinality],
             Optional[bool],
-            Optional[parsing.ParserContext],
+            Optional[parsing.Span],
         ],
     ]
     """Cardinality/source context for pointers with unclear cardinality."""
@@ -192,9 +215,6 @@ class Environment:
     """Map from all schema objects referenced to the ast referants.
 
     This is used for rewriting expressions in the schema after a rename. """
-
-    created_schema_objects: Set[s_obj.Object]
-    """A set of all schema objects derived by this compilation."""
 
     # Caches for costly operations in edb.ir.typeutils
     ptr_ref_cache: PointerRefCache
@@ -261,6 +281,9 @@ class Environment:
     dml_rewrites: Dict[irast.Set, irast.Rewrites]
     """Compiled rewrites that should be attached to InsertStmt or UpdateStmt"""
 
+    warnings: list[errors.EdgeDBError]
+    """List of warnings to emit"""
+
     def __init__(
         self,
         *,
@@ -290,7 +313,6 @@ class Environment:
             irast.ViewShapeMetadata)
         self.schema_refs = set()
         self.schema_ref_exprs = {} if options.track_schema_ref_exprs else None
-        self.created_schema_objects = set()
         self.ptr_ref_cache = PointerRefCache()
         self.type_ref_cache = {}
         self.dml_exprs = []
@@ -309,9 +331,11 @@ class Environment:
         self.expr_view_cache = {}
         self.path_scope_map = {}
         self.dml_rewrites = {}
+        self.warnings = []
 
     def add_schema_ref(
-            self, sobj: s_obj.Object, expr: Optional[qlast.Base]) -> None:
+        self, sobj: s_obj.Object, expr: Optional[qlast.Base]
+    ) -> None:
         self.schema_refs.add(sobj)
         if self.schema_ref_exprs is not None and expr:
             self.schema_ref_exprs.setdefault(sobj, set()).add(expr)
@@ -419,9 +443,6 @@ class ContextLevel(compiler.ContextLevel):
     or passed to the compiler programmatically.
     """
 
-    func: Optional[s_func.Function]
-    """Schema function object required when compiling functions bodies."""
-
     view_nodes: Dict[s_name.Name, s_types.Type]
     """A dictionary of newly derived Node classes representing views."""
 
@@ -431,7 +452,7 @@ class ContextLevel(compiler.ContextLevel):
     suppress_rewrites: FrozenSet[s_types.Type]
     """Types to suppress using rewrites on"""
 
-    aliased_views: ChainMap[s_name.Name, s_types.Type]
+    aliased_views: ChainMap[s_name.Name, irast.Set]
     """A dictionary of views aliased in a statement body."""
 
     class_view_overrides: Dict[uuid.UUID, s_types.Type]
@@ -515,9 +536,6 @@ class ContextLevel(compiler.ContextLevel):
     implicit_limit: int
     """Implicit LIMIT clause in SELECT statements."""
 
-    inhibit_implicit_limit: bool
-    """Whether implicit limit injection should be inhibited."""
-
     special_computables_in_mutation_shape: FrozenSet[str]
     """A set of "special" computable pointers allowed in mutation shape."""
 
@@ -539,6 +557,9 @@ class ContextLevel(compiler.ContextLevel):
     active_computeds: ordered.OrderedSet[s_pointers.Pointer]
     """A ordered set of currently compiling computeds"""
 
+    allow_endpoint_linkprops: bool
+    """Whether to allow references to endpoint linkpoints (@source, @target)."""
+
     disallow_dml: Optional[str]
     """Whether we are currently in a place where no dml is allowed,
         if not None, then it is of the form `in a FILTER clause`  """
@@ -548,6 +569,19 @@ class ContextLevel(compiler.ContextLevel):
 
     active_defaults: FrozenSet[s_objtypes.ObjectType]
     """For detecting cycles in defaults"""
+
+    collection_cast_info: Optional[CollectionCastInfo]
+    """For generating errors messages when casting to collections.
+
+    This will be set by the outermost cast and then shared between all
+    sub-casts.
+
+    Some casts (eg. arrays) will generate select statements containing other
+    type casts. These will also share the outermost cast info.
+    """
+
+    no_factoring: bool
+    warn_factoring: bool
 
     def __init__(
         self,
@@ -595,7 +629,6 @@ class ContextLevel(compiler.ContextLevel):
             self.implicit_tid_in_shapes = False
             self.implicit_tname_in_shapes = False
             self.implicit_limit = 0
-            self.inhibit_implicit_limit = False
             self.special_computables_in_mutation_shape = frozenset()
             self.empty_result_type_hint = None
             self.defining_view = None
@@ -606,7 +639,12 @@ class ContextLevel(compiler.ContextLevel):
             self.active_rewrites = frozenset()
             self.active_defaults = frozenset()
 
+            self.allow_endpoint_linkprops = False
             self.disallow_dml = None
+            self.no_factoring = False
+            self.warn_factoring = False
+
+            self.collection_cast_info = None
 
         else:
             self.env = prevlevel.env
@@ -637,7 +675,6 @@ class ContextLevel(compiler.ContextLevel):
             self.implicit_tid_in_shapes = prevlevel.implicit_tid_in_shapes
             self.implicit_tname_in_shapes = prevlevel.implicit_tname_in_shapes
             self.implicit_limit = prevlevel.implicit_limit
-            self.inhibit_implicit_limit = prevlevel.inhibit_implicit_limit
             self.special_computables_in_mutation_shape = \
                 prevlevel.special_computables_in_mutation_shape
             self.empty_result_type_hint = prevlevel.empty_result_type_hint
@@ -649,7 +686,12 @@ class ContextLevel(compiler.ContextLevel):
             self.active_rewrites = prevlevel.active_rewrites
             self.active_defaults = prevlevel.active_defaults
 
+            self.allow_endpoint_linkprops = prevlevel.allow_endpoint_linkprops
             self.disallow_dml = prevlevel.disallow_dml
+            self.no_factoring = prevlevel.no_factoring
+            self.warn_factoring = prevlevel.warn_factoring
+
+            self.collection_cast_info = prevlevel.collection_cast_info
 
             if mode == ContextSwitchMode.SUBQUERY:
                 self.anchors = prevlevel.anchors.copy()
@@ -732,7 +774,7 @@ class ContextLevel(compiler.ContextLevel):
         return self.new(ContextSwitchMode.DETACHED)
 
     def create_anchor(
-        self, ir: irast.Set, name: str='v', *, check_dml: bool=False
+        self, ir: irast.Set, name: str = 'v', *, check_dml: bool = False
     ) -> qlast.Path:
         alias = self.aliases.get(name)
         # TODO: We should probably always check for DML, but I'm
@@ -744,14 +786,62 @@ class ContextLevel(compiler.ContextLevel):
         )
 
     def maybe_create_anchor(
-        self, ir: Union[irast.Set, qlast.Expr], name: str='v',
+        self,
+        ir: Union[irast.Set, qlast.Expr],
+        name: str = 'v',
     ) -> qlast.Expr:
         if isinstance(ir, irast.Set):
             return self.create_anchor(ir, name)
         else:
             return ir
 
+    def get_security_context(self) -> object:
+        '''Compute an additional compilation cache key.
+
+        Return an additional key for any compilation caches that may
+        vary based on "security contexts" such as whether we are in an
+        access policy.
+        '''
+        # N.B: Whether we are compiling a trigger is not included here
+        # since we clear cached rewrites when compiling them in the
+        # *pgsql* compiler.
+        return bool(self.suppress_rewrites)
+
+    def log_warning(self, warning: errors.EdgeDBError) -> None:
+        self.env.warnings.append(warning)
+
+    def allow_factoring(self) -> None:
+        self.no_factoring = self.warn_factoring = False
+
+    def schema_factoring(self) -> None:
+        self.no_factoring = s_futures.future_enabled(
+            self.env.schema, 'simple_scoping'
+        )
+        self.warn_factoring = s_futures.future_enabled(
+            self.env.schema, 'warn_old_scoping'
+        )
+
 
 class CompilerContext(compiler.CompilerContext[ContextLevel]):
     ContextLevelClass = ContextLevel
     default_mode = ContextSwitchMode.NEW
+
+
+class CollectionCastInfo(NamedTuple):
+    """For generating errors messages when casting to collections."""
+
+    from_type: s_types.Type
+    to_type: s_types.Type
+
+    path_elements: list[Tuple[str, Optional[str]]]
+    """Represents a path to the current collection element being cast.
+
+    A path element is a tuple of the collection type and an optional
+    element name. eg. ('tuple', 'a') or ('array', None)
+
+    The list is shared between the outermost context and all its sub contexts.
+    When casting a collection, each element's path should be pushed before
+    entering the "sub-cast" and popped immediately after.
+
+    In the event of a cast error, the list is preserved at the outermost cast.
+    """

@@ -20,7 +20,7 @@
 """Implementation of DESCRIBE ... CONFIG"""
 
 from __future__ import annotations
-from typing import *
+from typing import Dict, List
 
 import textwrap
 
@@ -45,14 +45,15 @@ ql = common.quote_literal
 
 
 def compile_describe_config(
-    scope: qltypes.ConfigScope,
-    ctx: context.ContextLevel
+    scope: qltypes.ConfigScope, ctx: context.ContextLevel
 ) -> irast.Set:
     config_edgeql = _describe_config(
         ctx.env.schema, scope, ctx.env.options.testmode)
     config_ast = qlparser.parse_fragment(config_edgeql)
 
-    return dispatch.compile(config_ast, ctx=ctx)
+    with ctx.new() as subctx:
+        subctx.allow_factoring()
+        return dispatch.compile(config_ast, ctx=subctx)
 
 
 def _describe_config(
@@ -123,7 +124,11 @@ def _describe_config_inner(
         key=lambda x: x[0],
     ):
         pn = str(ptr_name)
-        if pn in ('id', '__type__') or p.get_computable(schema):
+        if (
+            pn == 'id'
+            or p.get_computable(schema)
+            or p.get_protected(schema)
+        ):
             continue
 
         is_internal = (
@@ -145,7 +150,7 @@ def _describe_config_inner(
 
         ptr_card = p.get_cardinality(schema)
         mult = ptr_card.is_multi()
-        psource = f'{config_object_name}{cast}.{ qlquote.quote_ident(pn) }'
+        psource = f'{config_object_name}{cast}.{qlquote.quote_ident(pn)}'
         if isinstance(ptype, s_objtypes.ObjectType):
             item = textwrap.indent(
                 _render_config_object(
@@ -185,6 +190,16 @@ def _describe_config_inner(
         condition = f'EXISTS json_get(conf, {ql(fpn)})'
         if is_internal:
             condition = f'({condition}) AND testmode'
+        # For INSTANCE, filter out configs that are set to the default.
+        # This is because we currently implement the defaults by
+        # setting them with CONFIGURE INSTANCE, so we can't detect
+        # defaults by seeing what is unset.
+        if (
+            scope == qltypes.ConfigScope.INSTANCE
+            and (default := p.get_default(schema))
+        ):
+            condition = f'({condition}) AND {psource} ?!= ({default.text})'
+
         items.append(f"(\n{item}\n    IF {condition} ELSE ''\n  )")
 
     return items
@@ -245,13 +260,11 @@ def _render_config_redacted(
     if level == 1:
         return (
             f"'CONFIGURE {scope.to_edgeql()} "
-            f"SET { qlquote.quote_ident(name) } := {{}};  # REDACTED\\n'"
+            f"SET {qlquote.quote_ident(name)} := {{}};  # REDACTED\\n'"
         )
     else:
         indent = ' ' * (4 * (level - 1))
-        return (
-            f"'{indent}{ qlquote.quote_ident(name) } := {{}},  # REDACTED'"
-        )
+        return f"'{indent}{qlquote.quote_ident(name)} := {{}},  # REDACTED'"
 
 
 def _render_config_set(
@@ -269,14 +282,14 @@ def _render_config_set(
     if level == 1:
         return (
             f"'CONFIGURE {scope.to_edgeql()} "
-            f"SET { qlquote.quote_ident(name) } := {{' ++ "
+            f"SET {qlquote.quote_ident(name)} := {{' ++ "
             f"array_join(array_agg((select _ := {v} order by _)), ', ') "
             f"++ '}};\\n'"
         )
     else:
         indent = ' ' * (4 * (level - 1))
         return (
-            f"'{indent}{ qlquote.quote_ident(name) } := {{' ++ "
+            f"'{indent}{qlquote.quote_ident(name)} := {{' ++ "
             f"array_join(array_agg((SELECT _ := {v} ORDER BY _)), ', ') "
             f"++ '}},'"
         )
@@ -297,11 +310,11 @@ def _render_config_scalar(
     if level == 1:
         return (
             f"'CONFIGURE {scope.to_edgeql()} "
-            f"SET { qlquote.quote_ident(name) } := ' ++ {v} ++ ';\\n'"
+            f"SET {qlquote.quote_ident(name)} := ' ++ {v} ++ ';\\n'"
         )
     else:
         indent = ' ' * (4 * (level - 1))
-        return f"'{indent}{ qlquote.quote_ident(name) } := ' ++ {v} ++ ','"
+        return f"'{indent}{qlquote.quote_ident(name)} := ' ++ {v} ++ ','"
 
 
 def _render_config_object(
@@ -402,7 +415,7 @@ def _describe_config_object(
 
             ptr_card = p.get_cardinality(schema)
             mult = ptr_card.is_multi()
-            psource = f'item.{ qlquote.quote_ident(pn) }'
+            psource = f'item.{qlquote.quote_ident(pn)}'
 
             if isinstance(ptype, s_objtypes.ObjectType):
                 rval = textwrap.indent(

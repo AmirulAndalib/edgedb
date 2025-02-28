@@ -16,7 +16,7 @@
 # limitations under the License.
 #
 
-from typing import *
+from typing import Optional, Tuple, Iterable, Sequence, Collection, Dict, List
 
 from edb import errors
 
@@ -25,6 +25,7 @@ from edb.schema import types as s_types
 from edb.schema import expr as s_expr
 from edb.schema import schema as s_schema
 from edb.schema import delta as sd
+from edb.schema import name as sn
 
 from edb.ir import ast as irast
 
@@ -41,6 +42,7 @@ from .common import qname as q
 from .common import quote_literal as ql
 from .common import quote_ident as qi
 from .compiler import astutils
+from .compiler import enums as pgce
 
 
 def create_fts_index(
@@ -55,8 +57,8 @@ def create_fts_index(
     subject = index.get_subject(schema)
     assert isinstance(subject, s_indexes.IndexableSubject)
 
-    effective, has_overridden = s_indexes.get_effective_fts_index(
-        subject, schema
+    effective, has_overridden = s_indexes.get_effective_object_index(
+        schema, subject, sn.QualName("std::fts", "index")
     )
 
     if index != effective:
@@ -89,7 +91,9 @@ def delete_fts_index(
     subject = index.get_subject(orig_schema)
     assert isinstance(subject, s_indexes.IndexableSubject)
 
-    effective, _ = s_indexes.get_effective_fts_index(subject, schema)
+    effective, _ = s_indexes.get_effective_object_index(
+        schema, subject, sn.QualName("std::fts", "index")
+    )
 
     if not effective:
         return _delete_fts_document(index, drop_index, orig_schema, context)
@@ -107,6 +111,26 @@ def delete_fts_index(
             return dbops.CommandGroup()
 
 
+def _compile_ir_index_exprs(
+    index: s_indexes.Index, index_expr: irast.Set, schema: s_schema.Schema
+):
+    subject = index.get_subject(schema)
+    assert isinstance(subject, s_types.Type)
+
+    subject_id = irast.PathId.from_type(schema, subject, env=None)
+    sql_res = compiler.compile_ir_to_sql_tree(
+        index_expr,
+        singleton_mode=True,
+        external_rvars={
+            (subject_id, pgce.PathAspect.SOURCE): pgast.RelRangeVar(
+                alias=pgast.Alias(aliasname='NEW'),
+                relation=pgast.Relation(name='NEW'),
+            )
+        },
+    )
+    return astutils.maybe_unpack_row(sql_res.ast)
+
+
 def _create_fts_document(
     index: s_indexes.Index,
     index_expr: irast.Set,
@@ -115,21 +139,7 @@ def _create_fts_document(
     schema: s_schema.Schema,
     context: sd.CommandContext,
 ) -> dbops.Command:
-    subject = index.get_subject(schema)
-    assert isinstance(subject, s_types.Type)
-
-    subject_id = irast.PathId.from_type(schema, subject)
-    sql_res = compiler.compile_ir_to_sql_tree(
-        index_expr,
-        singleton_mode=True,
-        external_rvars={
-            (subject_id, 'source'): pgast.RelRangeVar(
-                alias=pgast.Alias(aliasname='NEW'),
-                relation=pgast.Relation(name='NEW'),
-            )
-        },
-    )
-    exprs = astutils.maybe_unpack_row(sql_res.ast)
+    exprs = _compile_ir_index_exprs(index, index_expr, schema)
 
     from edb.common import debug
 
@@ -149,7 +159,7 @@ def _delete_fts_document(
     schema: s_schema.Schema,
     context: sd.CommandContext,
 ) -> dbops.Command:
-    table_name = _index_table_name(index, schema)
+    table_name = common.get_index_table_backend_name(index, schema)
 
     ops = dbops.CommandGroup()
     ops.add_command(drop_index)
@@ -181,13 +191,12 @@ def _delete_fts_document(
     return ops
 
 
-def _refresh_fts_document(
+def update_fts_document(
     index: s_indexes.Index,
     options: qlcompiler.CompilerOptions,
     schema: s_schema.Schema,
-    context: sd.CommandContext,
-) -> dbops.Command:
-    table_name = _index_table_name(index, schema)
+) -> dbops.Query:
+    table_name = common.get_index_table_backend_name(index, schema)
 
     # compile the expression
     index_sexpr: Optional[s_expr.Expression] = index.get_expr(schema)
@@ -195,22 +204,41 @@ def _refresh_fts_document(
     index_expr = index_sexpr.ensure_compiled(
         schema=schema,
         options=options,
+        context=None,
+    )
+    exprs = _compile_ir_index_exprs(index, index_expr.irast.expr, schema)
+
+    from edb.common import debug
+    if debug.flags.zombodb:
+        raise NotImplementedError('zombo refresh index not implemented')
+    else:
+        # to avoid code duplication, we call code for creating triggers and
+        # extract the first UPDATE command
+        create_trigger_ops = _pg_create_trigger(table_name, exprs)
+        update_fts_document_op = create_trigger_ops.commands[0]
+        assert isinstance(update_fts_document_op, dbops.Query)
+
+        return update_fts_document_op
+
+
+def _refresh_fts_document(
+    index: s_indexes.Index,
+    options: qlcompiler.CompilerOptions,
+    schema: s_schema.Schema,
+    context: sd.CommandContext,
+) -> dbops.Command:
+    table_name = common.get_index_table_backend_name(index, schema)
+
+    # compile the expression
+    index_sexpr: Optional[s_expr.Expression] = index.get_expr(schema)
+    assert index_sexpr
+    index_expr = index_sexpr.ensure_compiled(
+        schema=schema,
+        options=options,
+        context=context,
     )
 
-    subject = index.get_subject(schema)
-    assert isinstance(subject, s_types.Type)
-    subject_id = irast.PathId.from_type(schema, subject)
-    sql_res = compiler.compile_ir_to_sql_tree(
-        index_expr.irast,
-        singleton_mode=True,
-        external_rvars={
-            (subject_id, 'source'): pgast.RelRangeVar(
-                alias=pgast.Alias(aliasname='NEW'),
-                relation=pgast.Relation(name='NEW'),
-            )
-        },
-    )
-    exprs = astutils.maybe_unpack_row(sql_res.ast)
+    exprs = _compile_ir_index_exprs(index, index_expr.irast.expr, schema)
 
     ops = dbops.CommandGroup()
 
@@ -241,14 +269,6 @@ def _raise_unsupported_language_error(
     raise errors.UnsupportedFeatureError(msg)
 
 
-def _index_table_name(
-    index: s_indexes.Index, schema: s_schema.Schema
-) -> Tuple[str, str]:
-    subject = index.get_subject(schema)
-    assert isinstance(subject, s_types.Type)
-    return common.get_backend_name(schema, subject, catenate=False)
-
-
 # --- pg fts ---
 
 
@@ -262,7 +282,7 @@ def _pg_create_fts_document(
     ops = dbops.CommandGroup()
 
     # create column __fts_document__
-    table_name = _index_table_name(index, schema)
+    table_name = common.get_index_table_backend_name(index, schema)
 
     module_name = index.get_name(schema).module
     index_name = common.get_index_backend_name(
@@ -299,7 +319,7 @@ def _pg_create_fts_document(
 def _pg_create_trigger(
     table_name: Tuple[str, str],
     exprs: Sequence[pgast.BaseExpr],
-) -> dbops.Command:
+) -> dbops.CommandGroup:
     ops = dbops.CommandGroup()
 
     # prepare the expression to update __fts_document__
@@ -359,7 +379,7 @@ def _pg_create_trigger(
         name=trigger_name,
         table_name=table_name,
         events=('insert', 'update'),
-        timing='before',
+        timing=dbops.TriggerTiming.Before,
         procedure=func_name,
     )
     ops.add_command(dbops.CreateTrigger(trigger))
@@ -418,7 +438,7 @@ def _zombo_create_fts_document(
 ) -> dbops.Command:
     ops = dbops.CommandGroup()
 
-    table_name = _index_table_name(index, schema)
+    table_name = common.get_index_table_backend_name(index, schema)
 
     module_name = index.get_name(schema).module
     index_name = common.get_index_backend_name(
@@ -507,7 +527,7 @@ def _zombo_create_fts_document(
 
 def _zombo_type_name(
     tbl_name: Tuple[str, str],
-) -> Tuple[str, ...]:
+) -> Tuple[str, str]:
     return (
         tbl_name[0],
         common.edgedb_name_to_pg_name(tbl_name[1] + '_zombo_type'),

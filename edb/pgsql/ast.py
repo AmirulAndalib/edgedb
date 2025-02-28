@@ -24,10 +24,16 @@ import dataclasses
 import typing
 import uuid
 
-from edb.common import ast, parsing
+from edb.common import ast, span
 from edb.common import typeutils
 from edb.edgeql import ast as qlast
 from edb.ir import ast as irast
+
+if typing.TYPE_CHECKING:
+    # PathAspect is imported without qualifiers here because otherwise in
+    # base.AST._collect_direct_fields, typing.get_type_hints will not correctly
+    # locate the type.
+    from .compiler.enums import PathAspect
 
 
 # The structure of the nodes mostly follows that of Postgres'
@@ -38,10 +44,13 @@ from edb.ir import ast as irast
 # compiler.
 
 
-class Base(ast.AST):
-    __ast_hidden__ = {'context'}
+Span = span.Span
 
-    context: typing.Optional[parsing.ParserContext] = None
+
+class Base(ast.AST):
+    __ast_hidden__ = {'span'}
+
+    span: typing.Optional[Span] = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -55,7 +64,7 @@ class Base(ast.AST):
 
 
 class ImmutableBase(ast.ImmutableASTMixin, Base):
-    pass
+    __ast_mutable_fields__ = frozenset(['span'])
 
 
 class Alias(ImmutableBase):
@@ -85,13 +94,15 @@ class BaseExpr(Base):
     nullable: typing.Optional[bool] = None  # Whether the result can be NULL.
     ser_safe: bool = False  # Whether the expr is serialization-safe.
 
-    def __init__(self, *, nullable: typing.Optional[bool]=None,
-                 **kwargs) -> None:
+    def __init__(
+        self, *, nullable: typing.Optional[bool] = None, **kwargs
+    ) -> None:
         nullable = self._is_nullable(kwargs, nullable)
         super().__init__(nullable=nullable, **kwargs)
 
-    def _is_nullable(self, kwargs: typing.Dict[str, object],
-                     nullable: typing.Optional[bool]) -> bool:
+    def _is_nullable(
+        self, kwargs: typing.Dict[str, object], nullable: typing.Optional[bool]
+    ) -> bool:
         if nullable is None:
             default = type(self).get_field('nullable').default
             if default is not None:
@@ -105,7 +116,7 @@ class BaseExpr(Base):
         for v in kwargs.values():
             if typeutils.is_container(v):
                 items = typing.cast(typing.Iterable, v)
-                nullable = all(getattr(vv, 'nullable', False) for vv in items)
+                nullable = any(getattr(vv, 'nullable', False) for vv in items)
 
             elif getattr(v, 'nullable', None):
                 nullable = True
@@ -148,7 +159,7 @@ class EdgeQLPathInfo(Base):
 
     # Ignore the below fields in AST visitor/transformer.
     __ast_meta__ = {
-        'path_id', 'path_scope', 'path_outputs', 'is_distinct',
+        'path_id', 'path_bonds', 'path_outputs', 'is_distinct',
         'path_id_mask', 'path_namespace',
         'packed_path_outputs', 'packed_path_namespace',
     }
@@ -160,21 +171,27 @@ class EdgeQLPathInfo(Base):
     is_distinct: bool = True
 
     # A subset of paths necessary to perform joining.
-    path_scope: typing.Set[irast.PathId] = ast.field(factory=set)
+    path_bonds: typing.Set[tuple[irast.PathId, bool]] = ast.field(factory=set)
+
+    # Whether to ignore namespaces when looking at path outputs.
+    # TODO: Maybe instead, Relation should have a way of specifying
+    # output by PointerRef instead.
+    strip_output_namespaces: bool = False
 
     # Map of res target names corresponding to paths.
     path_outputs: typing.Dict[
-        typing.Tuple[irast.PathId, str], OutputVar
+        typing.Tuple[irast.PathId, PathAspect], OutputVar
     ] = ast.field(factory=dict)
 
     # Map of res target names corresponding to materialized paths.
     packed_path_outputs: typing.Optional[typing.Dict[
-        typing.Tuple[irast.PathId, str],
+        typing.Tuple[irast.PathId, PathAspect],
         OutputVar,
     ]] = None
 
-    def get_path_outputs(self, flavor: str) -> typing.Dict[
-            typing.Tuple[irast.PathId, str], OutputVar]:
+    def get_path_outputs(
+        self, flavor: str
+    ) -> typing.Dict[typing.Tuple[irast.PathId, PathAspect], OutputVar]:
         if flavor == 'packed':
             if self.packed_path_outputs is None:
                 self.packed_path_outputs = {}
@@ -188,12 +205,13 @@ class EdgeQLPathInfo(Base):
 
     # Map of col refs corresponding to paths.
     path_namespace: typing.Dict[
-        typing.Tuple[irast.PathId, str], BaseExpr
+        typing.Tuple[irast.PathId, PathAspect],
+        BaseExpr,
     ] = ast.field(factory=dict)
 
     # Same, but for packed.
     packed_path_namespace: typing.Optional[typing.Dict[
-        typing.Tuple[irast.PathId, str],
+        typing.Tuple[irast.PathId, PathAspect],
         BaseExpr,
     ]] = None
 
@@ -206,7 +224,7 @@ class BaseRangeVar(ImmutableBaseExpr):
     """
 
     __ast_meta__ = {'schema_object_id', 'tag', 'ir_origins'}
-    __ast_mutable_fields__ = frozenset(['ir_origins'])
+    __ast_mutable_fields__ = frozenset(['ir_origins', 'span'])
 
     # This is a hack, since there is some code that relies on not
     # having an alias on a range var (to refer to a CTE directly, for
@@ -272,6 +290,9 @@ class CommonTableExpr(Base):
     # If specified, determines if CTE is [NOT] MATERIALIZED
     materialized: typing.Optional[bool] = None
 
+    # the dml stmt that this CTE was generated for
+    for_dml_stmt: typing.Optional[irast.MutatingLikeStmt] = None
+
     def __repr__(self):
         return (
             f'<pg.{self.__class__.__name__} '
@@ -329,8 +350,13 @@ class DynamicRangeVarFunc(typing.Protocol):
     # PathRangeVar, keep looking in that rvar. If it returns
     # another expression, that's the output.
     def __call__(
-        self, rel: Query, path_id: irast.PathId, *,
-        flavor: str, aspect: str, env: typing.Any
+        self,
+        rel: Query,
+        path_id: irast.PathId,
+        *,
+        flavor: str,
+        aspect: str,
+        env: typing.Any,
     ) -> typing.Optional[BaseExpr | PathRangeVar]:
         pass
 
@@ -383,28 +409,40 @@ class TupleElementBase(ImmutableBase):
     path_id: irast.PathId
     name: typing.Optional[typing.Union[OutputVar, str]]
 
-    def __init__(self, path_id: irast.PathId,
-                 name: typing.Optional[typing.Union[OutputVar, str]]=None):
+    def __init__(
+        self,
+        path_id: irast.PathId,
+        name: typing.Optional[typing.Union[OutputVar, str]] = None,
+    ):
         self.path_id = path_id
         self.name = name
 
     def __repr__(self):
-        return f'<{self.__class__.__name__} ' \
-               f'name={self.name} path_id={self.path_id}>'
+        return (
+            f'<{self.__class__.__name__} '
+            f'name={self.name} path_id={self.path_id}>'
+        )
 
 
 class TupleElement(TupleElementBase):
 
     val: BaseExpr
 
-    def __init__(self, path_id: irast.PathId, val: BaseExpr, *,
-                 name: typing.Optional[typing.Union[OutputVar, str]]=None):
+    def __init__(
+        self,
+        path_id: irast.PathId,
+        val: BaseExpr,
+        *,
+        name: typing.Optional[typing.Union[OutputVar, str]] = None,
+    ):
         super().__init__(path_id, name)
         self.val = val
 
     def __repr__(self):
-        return f'<{self.__class__.__name__} ' \
-               f'name={self.name} val={self.val} path_id={self.path_id}>'
+        return (
+            f'<{self.__class__.__name__} '
+            f'name={self.name} val={self.val} path_id={self.path_id}>'
+        )
 
 
 class TupleVarBase(OutputVar):
@@ -414,10 +452,15 @@ class TupleVarBase(OutputVar):
     nullable: bool
     typeref: typing.Optional[irast.TypeRef]
 
-    def __init__(self, elements: typing.List[TupleElementBase], *,
-                 named: bool=False, nullable: bool=False,
-                 is_packed_multi: bool=False,
-                 typeref: typing.Optional[irast.TypeRef]=None):
+    def __init__(
+        self,
+        elements: typing.List[TupleElementBase],
+        *,
+        named: bool = False,
+        nullable: bool = False,
+        is_packed_multi: bool = False,
+        typeref: typing.Optional[irast.TypeRef] = None,
+    ):
         self.elements = elements
         self.named = named
         self.nullable = nullable
@@ -432,10 +475,15 @@ class TupleVar(TupleVarBase):
 
     elements: typing.Sequence[TupleElement]
 
-    def __init__(self, elements: typing.List[TupleElement], *,
-                 named: bool=False, nullable: bool=False,
-                 is_packed_multi: bool=False,
-                 typeref: typing.Optional[irast.TypeRef]=None):
+    def __init__(
+        self,
+        elements: typing.List[TupleElement],
+        *,
+        named: bool = False,
+        nullable: bool = False,
+        is_packed_multi: bool = False,
+        typeref: typing.Optional[irast.TypeRef] = None,
+    ):
         self.elements = elements
         self.named = named
         self.nullable = nullable
@@ -446,6 +494,9 @@ class TupleVar(TupleVarBase):
 class ParamRef(ImmutableBaseExpr):
     """Query parameter ($0..$n)."""
 
+    __ast_mutable_fields__ = (
+        ImmutableBaseExpr.__ast_mutable_fields__ | frozenset(['number']))
+
     # Number of the parameter.
     number: int
 
@@ -455,8 +506,6 @@ class ResTarget(ImmutableBaseExpr):
 
     # Column name (optional)
     name: typing.Optional[str] = None
-    # subscripts, field names and '*'
-    indirection: typing.Optional[typing.List[IndirectionOp]] = None
     # value expression to compute
     val: BaseExpr
 
@@ -472,7 +521,7 @@ class UpdateTarget(ImmutableBaseExpr):
     """Query update target."""
 
     # column names
-    name: str | typing.List[str]
+    name: str
     # value expression to assign
     val: BaseExpr
     # subscripts, field names and '*'
@@ -536,11 +585,11 @@ class Query(ReturningQuery):
     ] = ast.field(factory=dict)
     # Map of RangeVars corresponding to paths.
     path_rvar_map: typing.Dict[
-        typing.Tuple[irast.PathId, str], PathRangeVar
+        typing.Tuple[irast.PathId, PathAspect], PathRangeVar
     ] = ast.field(factory=dict)
     # Map of materialized RangeVars corresponding to paths.
     path_packed_rvar_map: typing.Optional[typing.Dict[
-        typing.Tuple[irast.PathId, str],
+        typing.Tuple[irast.PathId, PathAspect],
         PathRangeVar,
     ]] = None
 
@@ -548,8 +597,9 @@ class Query(ReturningQuery):
 
     ctes: typing.Optional[typing.List[CommonTableExpr]] = None
 
-    def get_rvar_map(self, flavor: str) -> typing.Dict[
-            typing.Tuple[irast.PathId, str], PathRangeVar]:
+    def get_rvar_map(
+        self, flavor: str
+    ) -> typing.Dict[typing.Tuple[irast.PathId, PathAspect], PathRangeVar]:
         if flavor == 'packed':
             if self.path_packed_rvar_map is None:
                 self.path_packed_rvar_map = {}
@@ -559,8 +609,11 @@ class Query(ReturningQuery):
         else:
             raise AssertionError(f'unexpected flavor "{flavor}"')
 
-    def maybe_get_rvar_map(self, flavor: str) -> typing.Optional[typing.Dict[
-            typing.Tuple[irast.PathId, str], PathRangeVar]]:
+    def maybe_get_rvar_map(
+        self, flavor: str
+    ) -> typing.Optional[
+        typing.Dict[typing.Tuple[irast.PathId, PathAspect], PathRangeVar]
+    ]:
         if flavor == 'packed':
             return self.path_packed_rvar_map
         elif flavor == 'normal':
@@ -570,6 +623,8 @@ class Query(ReturningQuery):
 
     @property
     def ser_safe(self):
+        if not self.target_list:
+            return False
         return all(t.ser_safe for t in self.target_list)
 
     def append_cte(self, cte: CommonTableExpr) -> None:
@@ -580,9 +635,10 @@ class Query(ReturningQuery):
 
 class DMLQuery(Query):
     """Generic superclass for INSERT/UPDATE/DELETE statements."""
+    __abstract_node__ = True
 
     # Target relation to perform the operation on.
-    relation: typing.Optional[PathRangeVar] = None
+    relation: RelRangeVar
     # List of expressions returned
     returning_list: typing.List[ResTarget] = ast.field(factory=list)
 
@@ -631,7 +687,7 @@ class SelectStmt(Query):
     # GROUP BY clauses
     group_clause: typing.Optional[typing.List[Base]] = None
     # HAVING expression
-    having: typing.Optional[BaseExpr] = None
+    having_clause: typing.Optional[BaseExpr] = None
     # WINDOW window_name AS(...),
     window_clause: typing.Optional[typing.List[Base]] = None
     # List of ImplicitRow's in a VALUES query
@@ -643,7 +699,7 @@ class SelectStmt(Query):
     # LIMIT expression
     limit_count: typing.Optional[BaseExpr] = None
     # FOR UPDATE clause
-    locking_clause: typing.Optional[list] = None
+    locking_clause: typing.Optional[list[LockingClause]] = None
 
     # Set operation type
     op: typing.Optional[str] = None
@@ -653,6 +709,9 @@ class SelectStmt(Query):
     larg: typing.Optional[Query] = None
     # Right operand of set op,
     rarg: typing.Optional[Query] = None
+
+    # When used as a sub-query, it is generally nullable.
+    nullable: bool = True
 
 
 class Expr(ImmutableBaseExpr):
@@ -683,8 +742,17 @@ class NullConstant(BaseConstant):
     nullable: bool = True
 
 
+class BitStringConstant(BaseConstant):
+    """A bit string constant."""
+
+    # x or b
+    kind: str
+
+    val: str
+
+
 class ByteaConstant(BaseConstant):
-    """An bytea string."""
+    """A bytea string."""
 
     val: bytes
 
@@ -765,12 +833,17 @@ class FuncCall(ImmutableBaseExpr):
     over: typing.Optional[WindowDef]
     # WITH ORDINALITY
     with_ordinality: bool = False
-    # list of ColumnDef nodes to describe result of
+    # list of Columndef  nodes to describe result of
     # the function returning RECORD.
     coldeflist: typing.List[ColumnDef]
 
-    def __init__(self, *, nullable: typing.Optional[bool]=None,
-                 null_safe: bool=False, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        nullable: typing.Optional[bool] = None,
+        null_safe: bool = False,
+        **kwargs,
+    ) -> None:
         """Function call node.
 
         @param null_safe:
@@ -837,7 +910,7 @@ class MultiAssignRef(ImmutableBase):
     # row-valued expression
     source: BaseExpr
     # list of columns to assign to
-    columns: typing.List[ColumnRef]
+    columns: typing.List[str]
 
 
 class SortBy(ImmutableBase):
@@ -849,6 +922,32 @@ class SortBy(ImmutableBase):
     dir: typing.Optional[qlast.SortOrder] = None
     # NULLS FIRST/LAST
     nulls: typing.Optional[qlast.NonesOrder] = None
+
+
+class LockClauseStrength(enum.StrEnum):
+    UPDATE = "UPDATE"
+    NO_KEY_UPDATE = "NO KEY UPDATE"
+    SHARE = "SHARE"
+    KEY_SHARE = "KEY SHARE"
+
+
+class LockWaitPolicy(enum.StrEnum):
+    LockWaitBlock = ""
+    LockWaitSkip = "SKIP LOCKED"
+    LockWaitError = "NOWAIT"
+
+
+class LockingClause(ImmutableBase):
+    """Locking clause element (FOR ... )"""
+
+    strength: LockClauseStrength
+    "lock strength"
+
+    locked_rels: typing.Optional[list[RelRangeVar]] = None
+    "locked relations"
+
+    wait_policy: typing.Optional[LockWaitPolicy] = None
+    "lock wait policy"
 
 
 class WindowDef(ImmutableBase):
@@ -873,11 +972,16 @@ class WindowDef(ImmutableBase):
 class RangeSubselect(PathRangeVar):
     """Subquery appearing in FROM clauses."""
 
+    # Before postgres 16, an alias is always required on selects from
+    # a subquery. Try to catch that with the typechecker by getting
+    # rid of the default value.
+    alias: Alias
+
     lateral: bool = False
     subquery: Query
 
     @property
-    def query(self):
+    def query(self) -> Query:
         return self.subquery
 
 
@@ -888,7 +992,7 @@ class RangeFunction(BaseRangeVar):
     with_ordinality: bool = False
     # ROWS FROM form
     is_rowsfrom: bool = False
-    functions: typing.List[FuncCall]
+    functions: typing.List[BaseExpr]
 
 
 class JoinClause(BaseRangeVar):
@@ -911,7 +1015,8 @@ class JoinExpr(BaseRangeVar):
 
     @classmethod
     def make_inplace(
-        cls, *,
+        cls,
+        *,
         larg: BaseRangeVar,
         type: str,
         rarg: BaseRangeVar,
@@ -964,6 +1069,13 @@ class CoalesceExpr(ImmutableBaseExpr):
 
     # The arguments.
     args: typing.List[Base]
+
+    def _infer_nullability(self, kwargs: typing.Dict[str, typing.Any]) -> bool:
+        # nullability of COALESCE is the nullability of the RHS
+        if 'args' in kwargs:
+            return kwargs['args'][1].nullable
+        else:
+            return True
 
 
 class NullTest(ImmutableBaseExpr):
@@ -1045,7 +1157,17 @@ class IteratorCTE(ImmutableBase):
 
     # A list of other paths to *also* register the iterator rvar as
     # providing when it is merged into a statement.
-    other_paths: tuple[tuple[irast.PathId, str], ...] = ()
+    other_paths: tuple[tuple[irast.PathId, PathAspect], ...] = ()
+    iterator_bond: bool = False
+
+    @property
+    def aspect(self) -> PathAspect:
+        from .compiler import enums as pgce
+        return (
+            pgce.PathAspect.ITERATOR
+            if self.iterator_bond else
+            pgce.PathAspect.IDENTITY
+        )
 
 
 class Statement(Base):
@@ -1242,7 +1364,7 @@ class FTSDocument(BaseExpr):
     """
     Text and information on how to search through it.
 
-    Constructed with `fts::with_options`.
+    Constructed with `std::fts::with_options`.
     """
 
     text: BaseExpr

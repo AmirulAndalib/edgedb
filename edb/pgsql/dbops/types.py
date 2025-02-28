@@ -19,7 +19,14 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import (
+    Any,
+    Collection,
+    Iterable,
+    Iterator,
+    Optional,
+    TypeAlias,
+)
 
 import textwrap
 
@@ -34,22 +41,27 @@ from . import ddl
 from . import tables
 
 
+CompositeTypeName: TypeAlias = tuple[str, str]
+
+
 class CompositeType(composites.CompositeDBObject):
     def __init__(
-        self, name: Sequence[str], columns: Collection[tables.Column] = ()
+        self,
+        name: CompositeTypeName,
+        columns: Collection[tables.Column] = (),
     ):
         super().__init__(name)
         self._columns = ordered.OrderedSet(columns)
 
-    def iter_columns(self):
+    def iter_columns(self) -> Iterator[tables.Column]:
         return iter(self._columns)
 
 
 class TypeExists(base.Condition):
-    def __init__(self, name: Tuple[str, str]):
+    def __init__(self, name: CompositeTypeName):
         self.name = name
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return textwrap.dedent(f'''\
             SELECT
                 typname
@@ -63,7 +75,7 @@ class TypeExists(base.Condition):
         ''')
 
 
-def type_oid(name):
+def type_oid(name: CompositeTypeName) -> base.Query:
     if len(name) == 2:
         typnamespace, typname = name
     else:
@@ -89,11 +101,15 @@ CompositeTypeExists = TypeExists
 
 
 class CompositeTypeAttributeExists(base.Condition):
-    def __init__(self, type_name, attribute_name):
+    def __init__(
+        self,
+        type_name: CompositeTypeName,
+        attribute_name: str,
+    ):
         self.type_name = type_name
         self.attribute_name = attribute_name
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         return textwrap.dedent(f'''\
             SELECT
                 attribute_name
@@ -108,58 +124,75 @@ class CompositeTypeAttributeExists(base.Condition):
 
 class CreateCompositeType(ddl.SchemaObjectOperation):
     def __init__(
-        self, type: CompositeType, *, conditions=None, neg_conditions=None
-    ):
+        self,
+        type: CompositeType,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         super().__init__(
             type.name, conditions=conditions, neg_conditions=neg_conditions
         )
         self.type = type
 
-    def code(self, block: base.PLBlock) -> str:
-        elems = [c.code(block, short=True) for c in self.type.iter_columns()]
+    def code(self) -> str:
+        elems = [c.code(short=True) for c in self.type.iter_columns()]
         name = qn(*self.type.name)
         cols = ', '.join(c for c in elems)
         return f'CREATE TYPE {name} AS ({cols})'
 
 
 class AlterCompositeTypeBaseMixin:
-    def __init__(self, name, **kwargs):
+    def __init__(self, name: CompositeTypeName, **kwargs: Any):
         self.name = name
 
     def prefix_code(self) -> str:
         return f'ALTER TYPE {qn(*self.name)}'
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return '<%s.%s %s>' % (
             self.__class__.__module__, self.__class__.__name__, self.name)
 
 
 class AlterCompositeTypeBase(AlterCompositeTypeBaseMixin, ddl.DDLOperation):
     def __init__(
-            self, name, *, conditions=None, neg_conditions=None):
+        self,
+        name: CompositeTypeName,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         ddl.DDLOperation.__init__(
             self, conditions=conditions, neg_conditions=neg_conditions)
         AlterCompositeTypeBaseMixin.__init__(self, name=name)
 
 
 class AlterCompositeTypeFragment(ddl.DDLOperation):
-    def get_attribute_term(self):
+    def get_attribute_term(self) -> str:
         return 'ATTRIBUTE'
 
 
 class AlterCompositeType(
-        AlterCompositeTypeBaseMixin, base.CompositeCommandGroup):
-    def __init__(self, name, *, conditions=None, neg_conditions=None):
+    AlterCompositeTypeBaseMixin, base.CompositeCommandGroup
+):
+    def __init__(
+        self,
+        name: CompositeTypeName,
+        *,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
+    ) -> None:
         base.CompositeCommandGroup.__init__(
             self, conditions=conditions, neg_conditions=neg_conditions)
         AlterCompositeTypeBaseMixin.__init__(self, name=name)
 
 
 class AlterCompositeTypeAddAttribute(  # type: ignore
-        composites.AlterCompositeAddAttribute, AlterCompositeTypeFragment):
-    def code(self, block: base.PLBlock) -> str:
+    composites.AlterCompositeAddAttribute, AlterCompositeTypeFragment
+):
+    def code(self) -> str:
         return 'ADD {} {}'.format(
-            self.get_attribute_term(), self.attribute.code(block, short=True))
+            self.get_attribute_term(), self.attribute.code(short=True))
 
 
 class AlterCompositeTypeDropAttribute(
@@ -176,16 +209,17 @@ class AlterCompositeTypeAlterAttributeType(
 class DropCompositeType(ddl.SchemaObjectOperation):
     def __init__(
         self,
-        name,
+        name: CompositeTypeName,
         *,
-        cascade=False,
-        conditions=None,
-        neg_conditions=None,
+        cascade: bool = False,
+        conditions: Optional[Iterable[str | base.Condition]] = None,
+        neg_conditions: Optional[Iterable[str | base.Condition]] = None,
     ):
         super().__init__(
-            name, conditions=conditions, neg_conditions=neg_conditions)
+            name, conditions=conditions, neg_conditions=neg_conditions
+        )
         self.cascade = cascade
 
-    def code(self, block: base.PLBlock) -> str:
+    def code(self) -> str:
         cascade = ' CASCADE' if self.cascade else ''
         return f'DROP TYPE {qn(*self.name)}{cascade}'

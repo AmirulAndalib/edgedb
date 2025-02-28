@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import List
 
 import asyncio
 import os.path
@@ -57,7 +57,9 @@ async def execute(tests_dir, conn, num_workers, include):
         argv=['unittest', 'discover', '-s', tests_dir, *include],
         testRunner=runner, exit=False)
 
-    await tb.setup_test_cases(runner.cases, conn, num_workers)
+    await tb.setup_test_cases(
+        runner.cases, conn, num_workers, skip_empty_databases=True
+    )
 
 
 def die(msg):
@@ -117,10 +119,9 @@ async def _inittestdb(
 
     try:
         if not update:
-            print(f'Bootstrapping test EdgeDB instance in {data_dir}...')
+            print(f'Bootstrapping test Gel instance in {data_dir}...')
             await cluster.init()
         await cluster.start(port=0)
-        await cluster.trust_local_connections()
     except BaseException:
         if not update:
             if os.path.exists(data_dir):
@@ -132,7 +133,7 @@ async def _inittestdb(
 
     try:
         await execute(tests_dir, conn, num_workers=jobs, include=include)
-        print(f'Initialized and populated test EdgeDB instance in {data_dir}')
+        print(f'Initialized and populated test Gel instance in {data_dir}')
     except BaseException:
         destroy_cluster = True
         raise

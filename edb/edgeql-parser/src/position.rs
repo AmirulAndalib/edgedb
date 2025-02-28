@@ -101,7 +101,7 @@ fn new_lines_in_fragment(data: &[u8]) -> u64 {
             }
         }
     }
-    return lines;
+    lines
 }
 
 impl InflatedPos {
@@ -124,7 +124,7 @@ impl InflatedPos {
             let prefix_s = from_utf8(prefix).map_err(InflatingError::Utf8)?;
             let line_offset;
             let line;
-            if let Some(loff) = prefix_s.rfind(|c| c == '\r' || c == '\n') {
+            if let Some(loff) = prefix_s.rfind(['\r', '\n']) {
                 line_offset = loff + 1;
                 let mut lines = &prefix[..loff];
                 if data[loff] == b'\n' && loff > 0 && data[loff - 1] == b'\r' {
@@ -144,7 +144,7 @@ impl InflatedPos {
                 char_offset: prefix_s.chars().count() as u64,
             });
         }
-        return Ok(result);
+        Ok(result)
     }
 
     pub fn deflate(self) -> Pos {

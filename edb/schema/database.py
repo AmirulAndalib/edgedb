@@ -33,24 +33,26 @@ from . import delta as sd
 from . import objects as so
 from . import schema as s_schema
 
+from typing import cast
 
-class Database(
+
+class Branch(
     so.ExternalObject,
     s_anno.AnnotationSubject,
-    s_abc.Database,
+    s_abc.Branch,
     qlkind=qltypes.SchemaObjectClass.DATABASE,
     data_safe=False,
 ):
     pass
 
 
-class DatabaseCommandContext(sd.ObjectCommandContext[Database]):
+class BranchCommandContext(sd.ObjectCommandContext[Branch]):
     pass
 
 
-class DatabaseCommand(
-    sd.ExternalObjectCommand[Database],
-    context_class=DatabaseCommandContext,
+class BranchCommand(
+    sd.ExternalObjectCommand[Branch],
+    context_class=BranchCommandContext,
 ):
 
     def _validate_name(
@@ -60,18 +62,20 @@ class DatabaseCommand(
     ) -> None:
         name = self.get_attribute_value('name')
         if len(str(name)) > s_def.MAX_NAME_LENGTH:
-            source_context = self.get_attribute_source_context('name')
+            span = self.get_attribute_span('name')
             raise errors.SchemaDefinitionError(
-                f'Database names longer than {s_def.MAX_NAME_LENGTH} '
+                f'Branch names longer than {s_def.MAX_NAME_LENGTH} '
                 f'characters are not supported',
-                context=source_context,
+                span=span,
             )
 
 
-class CreateDatabase(DatabaseCommand, sd.CreateExternalObject[Database]):
+class CreateBranch(BranchCommand, sd.CreateExternalObject[Branch]):
 
     astnode = qlast.CreateDatabase
     template = struct.Field(str, default=None)
+    branch_type = struct.Field(
+        qlast.BranchType, default=qlast.BranchType.EMPTY)
 
     @classmethod
     def _cmd_tree_from_ast(
@@ -79,18 +83,24 @@ class CreateDatabase(DatabaseCommand, sd.CreateExternalObject[Database]):
         schema: s_schema.Schema,
         astnode: qlast.DDLOperation,
         context: sd.CommandContext,
-    ) -> CreateDatabase:
+    ) -> CreateBranch:
         cmd = super()._cmd_tree_from_ast(schema, astnode, context)
-        assert isinstance(cmd, CreateDatabase)
+        assert isinstance(cmd, CreateBranch)
 
         assert isinstance(astnode, qlast.CreateDatabase)
         if astnode.template is not None:
-            if not context.testmode:
-                raise errors.EdgeQLSyntaxError(
-                    f'unexpected {astnode.template.name!r}',
-                    context=astnode.template.context,
-                )
             cmd.template = astnode.template.name
+
+        if (
+            astnode.branch_type == qlast.BranchType.TEMPLATE
+            and not context.testmode
+        ):
+            raise errors.EdgeQLSyntaxError(
+                f'unexpected TEMPLATE',
+                span=astnode.span,
+            )
+
+        cmd.branch_type = astnode.branch_type
 
         return cmd
 
@@ -104,7 +114,7 @@ class CreateDatabase(DatabaseCommand, sd.CreateExternalObject[Database]):
         self._validate_name(schema, context)
 
 
-class AlterDatabase(DatabaseCommand, sd.AlterObject[Database]):
+class AlterBranch(BranchCommand, sd.AlterExternalObject[Branch]):
     astnode = qlast.AlterDatabase
 
     def validate_alter(
@@ -116,7 +126,7 @@ class AlterDatabase(DatabaseCommand, sd.AlterObject[Database]):
         self._validate_name(schema, context)
 
 
-class DropDatabase(DatabaseCommand, sd.DeleteExternalObject[Database]):
+class DropBranch(BranchCommand, sd.DeleteExternalObject[Branch]):
     astnode = qlast.DropDatabase
 
     def _validate_legal_command(
@@ -129,3 +139,16 @@ class DropDatabase(DatabaseCommand, sd.DeleteExternalObject[Database]):
             raise errors.ExecutionError(
                 f"database {self.classname.name!r} cannot be dropped"
             )
+
+
+class RenameBranch(BranchCommand, sd.RenameObject[Branch]):
+    # databases are ExternalObjects, so they might not be properly
+    # present in the schema, so we can't do a proper rename.
+    def apply(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+    ) -> s_schema.Schema:
+        scls = self.get_parent_op(context).scls
+        self.scls = cast(Branch, scls)
+        return schema

@@ -16,6 +16,7 @@
 # limitations under the License.
 #
 
+include "./pgcon_sql.pxd"
 
 cimport cython
 cimport cpython
@@ -33,8 +34,6 @@ from edb.server.dbview cimport dbview
 from edb.server.pgproto.debug cimport PG_DEBUG
 
 from edb.server.cache cimport stmt_cache
-
-include "scram.pxd"
 
 
 cdef enum PGTransactionStatus:
@@ -59,40 +58,6 @@ cdef enum PGAuthenticationState:
     PGAUTH_SASL_FINAL = 12
 
 
-cdef enum PGAction:
-    START_IMPLICIT_TX = 0
-    PARSE = 1
-    BIND = 2
-    DESCRIBE_STMT = 3
-    DESCRIBE_STMT_ROWS = 4
-    DESCRIBE_PORTAL = 5
-    EXECUTE = 6
-    CLOSE_STMT = 7
-    CLOSE_PORTAL = 8
-    FLUSH = 9
-    SYNC = 10
-
-
-cdef class PGMessage:
-    cdef:
-        PGAction action
-        bytes stmt_name
-        bytes portal_name
-        str orig_portal_name
-        object args
-        object query_unit
-        bint frontend_only
-        bint valid
-        bint injected
-
-        object orig_query
-        object fe_settings
-
-    cdef inline bint is_frontend_only(self)
-    cdef inline bint is_valid(self)
-    cdef inline bint is_injected(self)
-
-
 @cython.final
 cdef class PGConnection:
 
@@ -111,9 +76,9 @@ cdef class PGConnection:
         int32_t waiting_for_sync
         PGTransactionStatus xact_status
 
-        readonly int32_t backend_pid
-        readonly int32_t backend_secret
-        readonly object parameter_status
+        public int32_t backend_pid
+        public int32_t backend_secret
+        public object parameter_status
 
         readonly object aborted_with_error
 
@@ -124,7 +89,8 @@ cdef class PGConnection:
 
         bint debug
 
-        object pgaddr
+        public object connection
+        public object addr
         object server
         object tenant
         bint is_system_db
@@ -139,10 +105,17 @@ cdef class PGConnection:
         public object pinned_by
 
         object last_state
+        bint state_reset_needs_commit
+        public object last_init_con_data
+
+        str last_indirect_return
+
+        PGSQLConnection _sql
 
     cdef before_command(self)
 
     cdef write(self, buf)
+    cdef write_sync(self, WriteBuffer outbuf)
 
     cdef parse_error_message(self)
     cdef char parse_sync_message(self)
@@ -155,13 +128,15 @@ cdef class PGConnection:
     cdef bint before_prepare(
         self, bytes stmt_name, int dbver, WriteBuffer outbuf)
     cdef write_sync(self, WriteBuffer outbuf)
+    cdef send_sync(self)
 
     cdef make_clean_stmt_message(self, bytes stmt_name)
-    cdef make_auth_password_md5_message(self, bytes salt)
     cdef send_query_unit_group(
         self, object query_unit_group, bint sync,
         object bind_datas, bytes state,
-        ssize_t start, ssize_t end, int dbver, object parse_array
+        ssize_t start, ssize_t end, int dbver, object parse_array,
+        object query_prefix,
+        bint needs_commit_state,
     )
 
     cdef _rewrite_copy_data(
@@ -183,7 +158,7 @@ cdef class PGConnection:
         dict type_id_map,
     )
 
-    cdef _rewrite_sql_error_response(self, PGMessage action, WriteBuffer buf)
-
     cdef inline str get_tenant_label(self)
     cpdef set_stmt_cache_size(self, int maxsize)
+
+cdef setting_to_sql(name, setting)

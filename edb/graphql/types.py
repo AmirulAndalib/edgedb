@@ -18,7 +18,18 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    ClassVar,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    Dict,
+    List,
+    Set,
+    cast,
+)
 
 from functools import partial
 from graphql import (
@@ -66,7 +77,7 @@ from . import errors as g_errors
 
 
 '''
-This module is responsible for mapping EdgeDB types onto the GraphQL
+This module is responsible for mapping Gel types onto the GraphQL
 types. However, this is an imperfect mapping because not all the types
 or relationships between them can be expressed.
 
@@ -89,7 +100,7 @@ link that targets __UserAlias__friends. This type gets reflected into
 a GraphQL _edb__UserAlias__friends that implements... what? We have 2
 options:
 
-    1) Implement interfaces mirroring the EdgeDB types: User, Object.
+    1) Implement interfaces mirroring the Gel types: User, Object.
 
     2) Implement it's own interface (or just omit interfaces here,
        since if the interface is unique it's not adding anything).
@@ -250,11 +261,11 @@ EDB_TO_GQL_SCALARS_MAP = {
     'std::duration': GraphQLString,
     'std::bytes': None,
 
-    'cal::local_datetime': GraphQLString,
-    'cal::local_date': GraphQLString,
-    'cal::local_time': GraphQLString,
-    'cal::relative_duration': GraphQLString,
-    'cal::date_duration': GraphQLString,
+    'std::cal::local_datetime': GraphQLString,
+    'std::cal::local_date': GraphQLString,
+    'std::cal::local_time': GraphQLString,
+    'std::cal::relative_duration': GraphQLString,
+    'std::cal::date_duration': GraphQLString,
 }
 
 
@@ -440,7 +451,7 @@ class GQLCoreSchema:
             return f'{inputtype}{name}'
 
     def gql_to_edb_name(self, name: str) -> str:
-        '''Convert the GraphQL field name into an EdgeDB type/view name.'''
+        '''Convert the GraphQL field name into an Gel type/view name.'''
         if '__' in name:
             return name.replace('__', '::')
         else:
@@ -695,6 +706,7 @@ class GQLCoreSchema:
                 pn = str(unqual_pn)
                 if pn == '__type__':
                     continue
+                assert isinstance(ptr, s_pointers.Pointer)
 
                 tgt = ptr.get_target(self.edb_schema)
                 assert tgt is not None
@@ -712,6 +724,7 @@ class GQLCoreSchema:
                     # We want to look at the pointer lineage because that
                     # will be reflected into GraphQL interface that is
                     # being extended and the type cannot be changed.
+                    ancestors: Tuple[s_pointers.Pointer, ...]
                     ancestors = ptr.get_ancestors(
                         self.edb_schema).objects(self.edb_schema)
 
@@ -723,7 +736,7 @@ class GQLCoreSchema:
                     # since we're inspecting the lineage of a pointer
                     # belonging to an actual type.
                     for ancestor in reversed((ptr,) + ancestors):
-                        if not ancestor.generic(self.edb_schema):
+                        if not ancestor.is_non_concrete(self.edb_schema):
                             ptr = ancestor
                             break
 
@@ -863,8 +876,17 @@ class GQLCoreSchema:
                     continue
 
                 if isinstance(target, GraphQLList):
-                    inobjtype = self._gql_inobjtypes.get(
-                        f'Insert{target.of_type.of_type.name}')
+                    # Check whether the edb_target is an array of enums,
+                    # because enums need slightly different handling.
+                    assert isinstance(edb_target, s_types.Array)
+                    el = edb_target.get_element_type(self.edb_schema)
+                    if el.is_enum(self.edb_schema):
+                        tname = el.get_name(self.edb_schema)
+                        assert isinstance(tname, s_name.QualName)
+                    else:
+                        tname = target.of_type.of_type.name
+
+                    inobjtype = self._gql_inobjtypes.get(f'Insert{tname}')
                     assert inobjtype is not None
                     intype = GraphQLList(GraphQLNonNull(inobjtype))
 
@@ -1242,16 +1264,24 @@ class GQLCoreSchema:
         )
 
     def define_generic_insert_types(self) -> None:
-        for itype in [GraphQLBoolean, GraphQLID, GraphQLInt, GraphQLInt64,
-                      GraphQLBigint, GraphQLFloat, GraphQLDecimal,
-                      GraphQLString, GraphQLJSON]:
+        for itype in [
+            GraphQLBoolean,
+            GraphQLID,
+            GraphQLInt,
+            GraphQLInt64,
+            GraphQLBigint,
+            GraphQLFloat,
+            GraphQLDecimal,
+            GraphQLString,
+            GraphQLJSON,
+        ]:
             self._gql_inobjtypes[f'Insert{itype.name}'] = itype
 
     def define_generic_order_types(self) -> None:
-        self._gql_ordertypes['directionEnum'] = \
-            self._gql_enums['directionEnum']
-        self._gql_ordertypes['nullsOrderingEnum'] = \
-            self._gql_enums['nullsOrderingEnum']
+        self._gql_ordertypes['directionEnum'] = self._gql_enums['directionEnum']
+        self._gql_ordertypes['nullsOrderingEnum'] = self._gql_enums[
+            'nullsOrderingEnum'
+        ]
         self._gql_ordertypes['Ordering'] = GraphQLInputObjectType(
             'Ordering',
             fields=dict(
@@ -1316,8 +1346,7 @@ class GQLCoreSchema:
         return fields
 
     def get_input_range_type(
-        self,
-        subtype: s_types.Type
+        self, subtype: s_types.Type
     ) -> GraphQLInputObjectType:
         sub_gqltype = self._convert_edb_type(subtype)
         assert isinstance(sub_gqltype, GraphQLScalarType)
@@ -1379,6 +1408,7 @@ class GQLCoreSchema:
                     description=self._get_description(t),
                 )
             else:
+
                 def _type_resolver(
                     obj: GraphQLObjectType,
                     info: GraphQLResolveInfo,
@@ -1502,7 +1532,7 @@ class GQLCoreSchema:
                 self._gql_inobjtypes[f'Insert{t_name}'] = gqlinserttype
 
     def get(self, name: str, *, dummy: bool = False) -> GQLBaseType:
-        '''Get a special GQL type either by name or based on EdgeDB type.'''
+        '''Get a special GQL type either by name or based on Gel type.'''
         # normalize name and possibly add 'edb_base' to kwargs
         edb_base = None
         kwargs: Dict[str, Any] = {'dummy': dummy}
@@ -1847,11 +1877,14 @@ class GQLBaseType(metaclass=GQLTypeMeta):
             return False
 
     def issubclass(self, other: Any) -> bool:
-        if (self.edb_base is not None and
-            other.edb_base is not None and
-                isinstance(other, GQLShadowType)):
-            return self.edb_base.issubclass(self._schema.edb_schema,
-                                            other.edb_base)
+        if (
+            self.edb_base is not None
+            and other.edb_base is not None
+            and isinstance(other, GQLShadowType)
+        ):
+            return self.edb_base.issubclass(
+                self._schema.edb_schema, other.edb_base
+            )
         else:
             return False
 

@@ -17,12 +17,13 @@
 #
 
 from __future__ import annotations
-from typing import *
+from typing import Optional, Iterable, Iterator
 
 import json
 import os.path
 import re
 import textwrap
+import unittest
 import uuid
 
 import edgedb
@@ -216,6 +217,7 @@ class EdgeQLDataMigrationTestCase(tb.DDLTestCase):
                 explicit_modules=explicit_modules,
             )
             await self.fast_forward_describe_migration(user_input=user_input)
+        await self.assert_last_migration()
 
     async def interact(self, parts, check_complete=True):
         for part in parts:
@@ -242,6 +244,25 @@ class EdgeQLDataMigrationTestCase(tb.DDLTestCase):
             await self.assert_describe_migration({
                 'complete': True
             })
+
+    async def assert_last_migration(self):
+        last_name = await self.con.query_single(
+            '''
+            select assert_single(
+                sys::Branch.last_migration
+                    filter sys::Branch.name = sys::get_current_database());
+            '''
+        )
+        last_mig = await self.con.query_single(
+            '''
+            select assert_single(
+                schema::Migration { name } filter not exists .<parents);
+            '''
+        )
+        if last_mig:
+            self.assertEqual(last_mig.name, last_name)
+        else:
+            self.assertIsNone(last_name)
 
 
 class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
@@ -1469,6 +1490,193 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
         })
         # Auto-complete migration
         await self.fast_forward_describe_migration()
+
+    async def test_edgeql_migration_describe_index_01(self):
+        # Migration that creates index.
+        await self.con.execute(r'''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        property a -> int64;
+                    };
+                };
+            };
+        ''')
+        # Auto-complete migration
+        await self.fast_forward_describe_migration()
+
+        await self.con.execute('''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        property a -> int64;
+                        index on (.a)
+                    };
+                };
+            };
+        ''')
+
+        await self.assert_describe_migration({
+            'confirmed': [],
+            'complete': False,
+            'proposed': {
+                'prompt': (
+                    "did you create index on (.a) "
+                    "of object type 'test::Foo'?"
+                )
+            }
+        })
+
+    async def test_edgeql_migration_describe_index_02(self):
+        # Migration that drops index expression.
+        await self.con.execute(r'''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        property a -> int64;
+                        index on (.a)
+                    };
+                };
+            };
+        ''')
+        # Auto-complete migration
+        await self.fast_forward_describe_migration()
+
+        await self.con.execute('''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        property a -> int64;
+                    };
+                };
+            };
+        ''')
+
+        await self.assert_describe_migration({
+            'confirmed': [],
+            'complete': False,
+            'proposed': {
+                'prompt': (
+                    "did you drop index on (.a) "
+                    "of object type 'test::Foo'?"
+                )
+            }
+        })
+
+    async def test_edgeql_migration_describe_index_03(self):
+        # Migration that creates index on link property
+        await self.con.execute(r'''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        link bar -> Bar {
+                            baz -> int64;
+                        }
+                    };
+                    type Bar;
+                };
+            };
+        ''')
+        # Auto-complete migration
+        await self.fast_forward_describe_migration()
+
+        await self.con.execute('''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        link bar -> Bar {
+                            baz -> int64;
+                            index on (@baz);
+                        }
+                    };
+                    type Bar;
+                };
+            };
+        ''')
+
+        await self.assert_describe_migration({
+            'confirmed': [],
+            'complete': False,
+            'proposed': {
+                'prompt': (
+                    "did you create index on (@baz) "
+                    "of link 'bar'?"
+                )
+            }
+        })
+
+    async def test_edgeql_migration_describe_index_04(self):
+        # Migration that drops index on link property
+        await self.con.execute(r'''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        link bar -> Bar {
+                            baz -> int64;
+                            index on (@baz);
+                        }
+                    };
+                    type Bar;
+                };
+            };
+        ''')
+        # Auto-complete migration
+        await self.fast_forward_describe_migration()
+
+        await self.con.execute('''
+            START MIGRATION TO {
+                module test {
+                    type Foo {
+                        link bar -> Bar {
+                            baz -> int64;
+                        }
+                    };
+                    type Bar;
+                };
+            };
+        ''')
+
+        await self.assert_describe_migration({
+            'confirmed': [],
+            'complete': False,
+            'proposed': {
+                'prompt': (
+                    "did you drop index on (@baz) "
+                    "of link 'bar'?"
+                )
+            }
+        })
+
+    async def test_edgeql_migration_describe_index_05(self):
+        # Migration that creates index.
+        await self.con.execute('''
+            START MIGRATION TO {
+                module default {
+                    type Foo {
+                        property x -> int64;
+                        index on (.x);
+                    };
+                };
+            };
+        ''')
+        # Auto-complete migration
+        await self.fast_forward_describe_migration()
+
+        await self.con.execute('''
+            START MIGRATION TO {
+                module default {
+                    type Foo {
+                        property y -> int64;
+                        index on (.y);
+                    };
+                };
+            };
+        ''')
+
+        await self.interact([
+            ("did you drop index on (.x) of object type 'default::Foo'?", "n"),
+            "did you rename property 'x' of object type 'default::Foo' to 'y'?",
+        ])
 
     async def test_edgeql_migration_describe_scalar_01(self):
         # Migration that renames a type.
@@ -2705,7 +2913,7 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
                 property name -> str;
                 multi link tweets := (
                     WITH U := User
-                    SELECT Tweet FILTER .author = U
+                    SELECT Tweet FILTER .author IN U
                 );
             }
             type Tweet {
@@ -2741,7 +2949,7 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
                 property name -> str;
                 multi link tweets := (
                     WITH U := DETACHED User
-                    SELECT Tweet FILTER .author = U
+                    SELECT Tweet FILTER .author IN U
                 );
             }
             type Tweet {
@@ -2852,6 +3060,7 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
             }],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_migration_computed_04(self):
         await self.migrate(r'''
             type User {
@@ -3342,6 +3551,46 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
             ("did you drop property 'name' of object type 'test::User'?", "n"),
         ], check_complete=False)
         await self.fast_forward_describe_migration()
+
+    async def test_edgeql_migration_vector_change_01(self):
+        await self.migrate('''
+            using extension pgvector;
+            module default {
+                scalar type Embedding extending ext::pgvector::vector<384>;
+                type Obj {
+                   embeddings: Embedding;
+                }
+            }
+        ''', explicit_modules=True)
+
+        await self.start_migration('''
+            using extension pgvector;
+            module default {
+                scalar type Embedding extending ext::pgvector::vector<768>;
+                type Obj {
+                   embeddings: Embedding;
+                }
+            }
+        ''', explicit_modules=True)
+
+        await self.assert_describe_migration({
+            'proposed': {
+                'statements': [{
+                    'text': """
+                        ALTER TYPE default::Obj {DROP PROPERTY embeddings;};
+                    """
+                }]
+            }
+        })
+
+        async with self.assertRaisesRegexTx(
+            edgedb.SchemaDefinitionError,
+            r"cannot produce migration because of a dependency cycle",
+        ):
+            await self.interact([
+                ("did you drop property 'embeddings' of object type "
+                 "'default::Obj'?", "n"),
+            ])
 
     async def test_edgeql_migration_force_delete_01(self):
         await self.migrate('''
@@ -4448,18 +4697,6 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
             }],
         )
 
-    @test.xerror('''
-        edgedb.errors.SchemaError: ObjectType 'test::Base' is already
-        present in the schema <Schema gen:3757 at 0x7fc3319fa820>
-
-        Exception: Error while processing
-        'CREATE ALIAS test::Base := (
-            SELECT
-                test::Child {
-                    bar := test::Child
-                }
-        );'
-    ''')
     async def test_edgeql_migration_eq_23(self):
         await self.migrate(r"""
             type Child {
@@ -6056,7 +6293,7 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
 
         await self.interact([
             "did you rename property 'asdf' of object type 'test::Foo' to "
-            "'womp'?" ,
+            "'womp'?",
 
             "did you create annotation 'std::title' of property 'womp'?",
         ])
@@ -10825,6 +11062,12 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
             alias X := (Bar { z := 10 }, 30);
         ''')
 
+        await self.migrate(r'''
+            type Foo;
+            type Bar;
+            alias X := ((Bar { z := 10 }, 30), 20);
+        ''')
+
         # delete it
         await self.migrate(r'''
             type Foo;
@@ -11296,33 +11539,6 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
         await self.migrate(schema)
         await self.migrate(schema)
 
-    async def test_edgeql_migration_dml_rewrites_01(self):
-        await self.migrate(r"""
-            type Post {
-              required title: str;
-              modified: datetime {
-                rewrite insert, update using (datetime_of_statement())
-              }
-            }
-        """)
-        await self.migrate(r"""
-            type BlogPost {
-              required title: str;
-              modified: datetime {
-                rewrite insert, update using (datetime_of_statement())
-              }
-            }
-        """)
-        await self.migrate(r"""
-            type BlogPost {
-              required title: str;
-              modified: datetime {
-                rewrite insert, update using (datetime_of_transaction())
-              }
-            }
-        """)
-        await self.migrate('')
-
     async def test_edgeql_migration_globals_02(self):
         await self.migrate(r"""
             global current_user_id -> uuid;
@@ -11357,6 +11573,83 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
         # Make sure it doesn't get into a wedged state
         await self.migrate(schema)
         await self.migrate(schema)
+
+    async def test_edgeql_migration_globals_03(self):
+        # Test modifying a computed global that is used in an access
+        # policy on the type it refers to.
+        await self.migrate(r"""
+            global cur -> uuid;
+            global scopes := ((select Foo filter .id = global cur).scopes);
+
+            type Foo {
+              multi scopes: str;
+              access policy s allow select using ('f' in global scopes);
+            };
+        """)
+        await self.migrate(r"""
+            global cur -> uuid;
+            global scopes := (
+                select (select Foo filter .id = global cur).scopes);
+
+            type Foo {
+              multi scopes: str;
+              access policy s allow select using ('f' in global scopes);
+            };
+        """)
+
+    @test.skip('''
+        This fails ~half the time depending on how it orders thing
+    ''')
+    async def test_edgeql_migration_globals_04(self):
+        await self.migrate(r"""
+            global cur := true;
+
+            type Foo {
+              access policy s allow select using (global cur);
+            };
+            type Bar {
+              access policy s allow select using (global cur);
+            };
+        """)
+
+        await self.migrate(r"""
+            global ok := (exists Foo);
+            global cur := global ok;
+
+            type Foo {
+              access policy s allow select using (global cur);
+            };
+            type Bar {
+              access policy s allow select using (global cur);
+            };
+        """)
+
+    async def test_edgeql_migration_dml_rewrites_01(self):
+        await self.migrate(r"""
+            type Post {
+              required title: str;
+              modified: datetime {
+                rewrite insert, update using (datetime_of_statement())
+              }
+            }
+        """)
+        await self.migrate(r"""
+            type BlogPost {
+              required title: str;
+              modified: datetime {
+                rewrite insert, update using (datetime_of_statement())
+              }
+            }
+        """)
+        await self.migrate(r"""
+            type BlogPost {
+              required title: str;
+              modified: datetime {
+                rewrite insert, update using (datetime_of_transaction())
+              }
+            }
+        """)
+        await self.migrate('')
 
     async def test_edgeql_migration_policies_and_collections(self):
         # An infinite recursion bug with this this was found by accident
@@ -11589,6 +11882,9 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
               multi foo: int64 {
                 constraint exclusive;
               }
+              bar: int64 {
+                constraint exclusive;
+              }
             }
             type Post;
         ''')
@@ -11597,11 +11893,78 @@ class TestEdgeQLDataMigration(EdgeQLDataMigrationTestCase):
             type User {
               multi link posts := .<user[is Post];
               multi property foo := Post.num;
+              property bar := -1;
             }
             type Post {
               user: User;
               num: int64;
             }
+        ''')
+
+    async def test_edgeql_migration_between_computeds_01(self):
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y {
+                    using (.x ++ "!");
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
+        ''')
+
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y -> str {
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
+        ''')
+
+    async def test_edgeql_migration_between_computeds_02(self):
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y {
+                    using (.x);
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
+        ''')
+
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y {
+                    using (.x ++ "!");
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
+        ''')
+
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y {
+                    using (.x);
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
+        ''')
+
+        await self.migrate(r'''
+            type Away {
+                x: str;
+                property y -> str {
+                    constraint exclusive;
+                }
+            };
+            type Away2 extending Away;
         ''')
 
     async def test_edgeql_migration_alias_new_computed_01(self):
@@ -11815,15 +12178,21 @@ class TestEdgeQLDataMigrationNonisolated(EdgeQLDataMigrationTestCase):
             ['wontfix'],
         )
 
-        await self.migrate('''
-            scalar type Status extending enum<
-                pending, in_progress, wontfix, again>;
-            scalar type ImportStatus extending Status;
-            scalar type ImportAnalyticsStatus extending Status;
+        # Retry for https://github.com/edgedb/edgedb/issues/7553
+        async for tr in self.try_until_succeeds(
+            ignore_regexp="cannot drop type .* "
+                          "because other objects depend on it",
+        ):
+            async with tr:
+                await self.migrate('''
+                    scalar type Status extending enum<
+                        pending, in_progress, wontfix, again>;
+                    scalar type ImportStatus extending Status;
+                    scalar type ImportAnalyticsStatus extending Status;
 
-            type Foo { property x -> ImportStatus };
-            function f(x: Status) -> str USING (<str>x);
-        ''')
+                    type Foo { property x -> ImportStatus };
+                    function f(x: Status) -> str USING (<str>x);
+                ''')
 
         await self.migrate('')
 
@@ -11965,6 +12334,7 @@ class TestEdgeQLDataMigrationNonisolated(EdgeQLDataMigrationTestCase):
         self.assertEqual(len(res), 2)
 
         await self.con.query('reset schema to initial')
+        await self.assert_last_migration()
 
         res = await self.con.query('''
             select schema::ObjectType { name } filter .name ilike 'test::%'
@@ -11988,8 +12358,6 @@ class TestEdgeQLDataMigrationNonisolated(EdgeQLDataMigrationTestCase):
     async def test_edgeql_migration_extension_01(self):
         # Test migrations getting from an array in integers to vector and then
         # revert to an array of floats.
-        if not self.is_superuser:
-            self.skipTest('the backend is not running with superuser')
 
         await self.migrate('''
             module default {
@@ -12008,7 +12376,7 @@ class TestEdgeQLDataMigrationNonisolated(EdgeQLDataMigrationTestCase):
         # Add vector and migrate automatically (because we have an assignment
         # cast available from array<int64> to vector).
         await self.migrate('''
-            using extension pgvector version '0.4';
+            using extension pgvector version '0.5';
 
             module default {
                 scalar type v3 extending ext::pgvector::vector<3>;
@@ -12047,6 +12415,529 @@ class TestEdgeQLDataMigrationNonisolated(EdgeQLDataMigrationTestCase):
         )
 
 
+class EdgeQLAIMigrationTestCase(EdgeQLDataMigrationTestCase):
+    # AI specific tests, just because creating the extension is so slow,
+    # so we want to skip doing that each time.
+
+    DEFAULT_MODULE = 'default'
+    PARALLELISM_GRANULARITY = 'default'
+
+    SETUP = '''
+        create extension pgvector;
+        create extension ai;
+        CONFIGURE CURRENT DATABASE
+        INSERT ext::ai::OpenAIProviderConfig {
+            secret := 'very secret',
+            api_url := '',
+        };
+
+        CONFIGURE CURRENT DATABASE
+            SET ext::ai::Config::indexer_naptime := <duration>'100ms';
+    '''
+
+    async def test_edgeql_migration_ai_01(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+              type Astronomy {
+                content: str;
+                deferred index ext::ai::index(
+                  embedding_model := 'text-embedding-3-small'
+                ) on (.content);
+              }
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_02(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+              type Astronomy {
+                content: str;
+                deferred index ext::ai::index(
+                  embedding_model := 'text-embedding-3-small'
+                ) on (.content);
+              }
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+              type Astronomy {
+                content: str;
+                deferred index ext::ai::index(
+                  embedding_model := 'text-embedding-3-large'
+                ) on (.content);
+              }
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+              type Astronomy {
+                content: str;
+                deferred index ext::ai::index(
+                  embedding_model := 'text-embedding-3-small'
+                ) on (.content);
+              }
+            };
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_03(self):
+        schema = '''
+        using extension ai;
+
+        module default {
+            type TestEmbeddingModel
+                extending ext::ai::EmbeddingModel
+            {
+                annotation ext::ai::model_name := "text-embedding-test";
+                annotation ext::ai::model_provider := "custom::test";
+                annotation ext::ai::embedding_model_max_batch_tokens := "16384";
+                annotation ext::ai::embedding_model_max_output_dimensions
+                  := "10";
+                annotation ext::ai::embedding_model_supports_shortening
+                  := "true";
+            };
+
+            type Astronomy {
+                content: str;
+                deferred index ext::ai::index(
+                    embedding_model := 'text-embedding-test'
+                ) on (.content);
+            };
+        };
+        '''
+
+        with self.assertRaisesRegex(
+            edgedb.SchemaDefinitionError,
+            "object type 'default::TestEmbeddingModel' is missing a value "
+            "for the 'ext::ai::embedding_model_max_input_tokens' annotation"
+        ):
+            await self.migrate(schema, explicit_modules=True)
+
+    @test.xfail('''
+        No more "proposed", but not "completed" either.
+
+        It would be OK if we produced a real error here too, though.
+    ''')
+    async def test_edgeql_migration_ai_04(self):
+        # Try changing embedding_model_max_output_dimensions on a
+        # custom EmbeddingModel
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type TestEmbeddingModel
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_batch_tokens
+                      := "16384";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "10";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-test'
+                    ) on (.content);
+                };
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type TestEmbeddingModel
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_batch_tokens
+                      := "16384";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "20";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-test'
+                    ) on (.content);
+                };
+            };
+        ''', explicit_modules=True)
+
+    @test.xerror('''
+        "undefined embedding model: no subtype of ext::ai::EmbeddingModel is
+        annotated as 'text-embedding-test'"
+    ''')
+    async def test_edgeql_migration_ai_05(self):
+        # Try changing the name of a model (and the type, too, though
+        # that is not hugely relevant.)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type TestEmbeddingModel
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_batch_tokens
+                      := "16384";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "10";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-test'
+                    ) on (.content);
+                };
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type TestEmbeddingModel2
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test-2";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_batch_tokens
+                      := "16384";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "10";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-test'
+                    ) on (.content);
+                };
+            };
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_06(self):
+        # Try putting the EmbeddingModel declaration below the type
+        # that uses it.
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-test'
+                    ) on (.content);
+                };
+
+                type TestEmbeddingModel
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_batch_tokens
+                      := "16384";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "10";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+            };
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_07a(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Astronomy {
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_07b(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Astronomy;
+
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_07c(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Astronomy {
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Astronomy {
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Astronomy {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Astronomy {
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        await self.migrate('''
+            using extension ai;
+        ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_08(self):
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Base {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Base {
+                    # deferred index ext::ai::index(
+                    #     embedding_model := 'text-embedding-3-small'
+                    # ) on (.content ++ '!');
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        arg = [0.0] * 1536
+        await self.con.query('''
+            select {
+                base := ext::ai::search(Base, <array<float32>>$0),
+                sub := ext::ai::search(Sub, <array<float32>>$0),
+            }
+        ''', arg)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Base {
+                    content: str;
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content);
+                };
+
+                type Sub extending Base {
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content ++ '!');
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        await self.con.query('''
+            select {
+                base := ext::ai::search(Base, <array<float32>>$0),
+                sub := ext::ai::search(Sub, <array<float32>>$0),
+            }
+        ''', arg)
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type Base {
+                    content: str;
+                };
+
+                type Sub extending Base {
+                    deferred index ext::ai::index(
+                        embedding_model := 'text-embedding-3-small'
+                    ) on (.content ++ '!');
+                };
+
+            };
+        ''', explicit_modules=True)
+
+        # Base lost the index, just select Sub
+        await self.con.query('''
+            select {
+                sub := ext::ai::search(Sub, <array<float32>>$0),
+            }
+        ''', arg)
+
+    async def test_edgeql_migration_ai_09(self):
+        with self.assertRaisesRegex(
+            edgedb.InvalidDefinitionError,
+            r"with different parameters than on base type",
+        ):
+            await self.migrate('''
+                using extension ai;
+
+                module default {
+                    type Base {
+                        content: str;
+                        deferred index ext::ai::index(
+                            embedding_model := 'text-embedding-3-small'
+                        ) on (.content);
+                    };
+
+                    type Sub extending Base {
+                        deferred index ext::ai::index(
+                            embedding_model := 'text-embedding-3-large'
+                        ) on (.content ++ '!');
+                    };
+
+                };
+            ''', explicit_modules=True)
+
+    async def test_edgeql_migration_ai_10(self):
+        # EmbeddingModel with default embedding_model_max_batch_tokens.
+
+        await self.migrate('''
+            using extension ai;
+
+            module default {
+                type TestEmbeddingModel
+                    extending ext::ai::EmbeddingModel
+                {
+                    annotation ext::ai::model_name := "text-embedding-test";
+                    annotation ext::ai::model_provider := "custom::test";
+                    annotation ext::ai::embedding_model_max_input_tokens
+                      := "8191";
+                    annotation ext::ai::embedding_model_max_output_dimensions
+                      := "10";
+                    annotation ext::ai::embedding_model_supports_shortening
+                      := "true";
+                };
+            };
+        ''', explicit_modules=True)
+
+        await self.assert_query_result(
+            r"""
+                with model := (
+                    select schema::ObjectType {
+                        x := (
+                            for ann in .annotations
+                            select ann@value
+                            filter ann.name
+                            = 'ext::ai::embedding_model_max_batch_tokens'
+                        )
+                    }
+                    filter .name = 'default::TestEmbeddingModel'
+                )
+                select model.x
+            """,
+            ['8191'],
+        )
+
+
 class EdgeQLMigrationRewriteTestCase(EdgeQLDataMigrationTestCase):
     DEFAULT_MODULE = 'default'
 
@@ -12057,7 +12948,7 @@ class EdgeQLMigrationRewriteTestCase(EdgeQLDataMigrationTestCase):
         res = await self.con.query(
             '''
             select schema::Migration {
-                id, name, script, parents: {name, id}, generated_by
+                id, name, script, sdl, parents: {name, id}, generated_by
             }
             '''
         )
@@ -12078,6 +12969,7 @@ class EdgeQLMigrationRewriteTestCase(EdgeQLDataMigrationTestCase):
         res = serutils.serialize(res)
         assert_data_shape.assert_data_shape(
             res, exp_result, self.fail)
+        await self.assert_last_migration()
 
 
 class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
@@ -12086,6 +12978,11 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
     # If that is a problem, a test case can be made to skip it
 
     async def test_edgeql_migration_rewrite_01(self):
+        await self.con.execute('''
+            CONFIGURE SESSION SET store_migration_sdl :=
+                cfg::StoreMigrationSDL.AlwaysStore;
+        ''')
+
         # Split one migration up into several
         await self.migrate(r"""
             type A;
@@ -12123,17 +13020,60 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
         """)
 
         await self.assert_migration_history([
-            {'script': 'CREATE TYPE default::A;', 'generated_by': None},
-            {'script': 'CREATE TYPE B;', 'generated_by': None},
-            {'script': 'create type C;', 'generated_by': None},
-            {'script': (
-                'SET generated_by '
-                ':= (schema::MigrationGeneratedBy.DDLStatement);\n'
-                'CREATE TYPE D;'
-            ), 'generated_by': 'DDLStatement'},
+            {
+                'script': 'CREATE TYPE default::A;',
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '};'
+                ),
+                'generated_by': None,
+            },
+            {
+                'script': 'CREATE TYPE B;',
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '    type B;\n'
+                    '};'
+                ),
+                'generated_by': None,
+            },
+            {
+                'script': 'create type C;',
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '    type B;\n'
+                    '    type C;\n'
+                    '};'
+                ),
+                'generated_by': None,
+            },
+            {
+                'script': (
+                    'SET generated_by '
+                    ':= (schema::MigrationGeneratedBy.DDLStatement);\n'
+                    'CREATE TYPE D;'
+                ),
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '    type B;\n'
+                    '    type C;\n'
+                    '    type D;\n'
+                    '};'
+                ),
+                'generated_by': 'DDLStatement',
+            },
         ])
 
     async def test_edgeql_migration_rewrite_02(self):
+        await self.con.execute('''
+            CONFIGURE SESSION SET store_migration_sdl :=
+                cfg::StoreMigrationSDL.AlwaysStore;
+        ''')
+
         # Simulate a potential migration squashing flow from the CLI,
         # where we generate a script using start migration and then apply it
         # later.
@@ -12176,10 +13116,25 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
         await self.con.execute(script)
 
         await self.assert_migration_history([
-            {'script': commands}
+            {
+                'script': commands,
+                'sdl': (
+                    'module default {\n'
+                    '    type Foo {\n'
+                    '        link tgt: default::Tgt;\n'
+                    '    };\n'
+                    '    type Tgt;\n'
+                    '};'
+                ),
+            }
         ])
 
     async def test_edgeql_migration_rewrite_03(self):
+        await self.con.execute('''
+            CONFIGURE SESSION SET store_migration_sdl :=
+                cfg::StoreMigrationSDL.AlwaysStore;
+        ''')
+
         # Test rolling back to a savepoint after a commit failure
         await self.con.execute(r"""
             create type A;
@@ -12220,8 +13175,23 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
             'SET generated_by := (schema::MigrationGeneratedBy.DDLStatement);'
         )
         await self.assert_migration_history([
-            {'script': gby + '\n' + 'CREATE TYPE B;'},
-            {'script': gby + '\n' + 'CREATE TYPE A;'},
+            {
+                'script': gby + '\n' + 'CREATE TYPE B;',
+                'sdl': (
+                    'module default {\n'
+                    '    type B;\n'
+                    '};'
+                ),
+            },
+            {
+                'script': gby + '\n' + 'CREATE TYPE A;',
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '    type B;\n'
+                    '};'
+                ),
+            },
         ])
 
     async def test_edgeql_migration_rewrite_05(self):
@@ -12245,6 +13215,11 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
         """)
 
     async def test_edgeql_migration_rewrite_06(self):
+        await self.con.execute('''
+            CONFIGURE SESSION SET store_migration_sdl :=
+                cfg::StoreMigrationSDL.AlwaysStore;
+        ''')
+
         # Test doing the interactive migration flow
         await self.con.execute(r"""
             create type A;
@@ -12266,7 +13241,15 @@ class TestEdgeQLMigrationRewrite(EdgeQLMigrationRewriteTestCase):
         """)
 
         await self.assert_migration_history([
-            {'script': 'CREATE TYPE default::A;\nCREATE TYPE default::B;'},
+            {
+                'script': 'CREATE TYPE default::A;\nCREATE TYPE default::B;',
+                'sdl': (
+                    'module default {\n'
+                    '    type A;\n'
+                    '    type B;\n'
+                    '};'
+                ),
+            },
         ])
 
     async def test_edgeql_migration_preexisting_01(self):
@@ -12312,4 +13295,16 @@ class TestEdgeQLMigrationRewriteNonisolated(TestEdgeQLMigrationRewrite):
                 };
                 POPULATE MIGRATION;
                 COMMIT MIGRATION;
+            """)
+
+    @unittest.skipIf(
+        True,
+        """
+        This test is still pretty slow
+        """
+    )
+    async def test_edgeql_migration_rewrite_raw_02(self):
+        for _ in range(1200):
+            await self.con.execute(r"""
+                create applied migration { }
             """)
