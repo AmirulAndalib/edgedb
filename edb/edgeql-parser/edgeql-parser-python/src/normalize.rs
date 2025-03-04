@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use edgeql_parser::keywords::Keyword;
@@ -7,7 +6,7 @@ use edgeql_parser::tokenizer::{Kind, Token, Tokenizer, Value};
 
 use blake2::{Blake2b512, Digest};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Variable {
     pub value: Value,
 }
@@ -19,6 +18,40 @@ pub struct Entry {
     pub variables: Vec<Vec<Variable>>,
     pub named_args: bool,
     pub first_arg: Option<usize>,
+}
+
+/// PackedEntry is a compact Entry for serialization purposes
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PackedEntry {
+    pub tokens: Vec<Token<'static>>,
+    pub variables: Vec<Vec<Variable>>,
+    pub named_args: bool,
+    pub first_arg: Option<usize>,
+}
+
+impl From<Entry> for PackedEntry {
+    fn from(val: Entry) -> Self {
+        PackedEntry {
+            tokens: val.tokens,
+            variables: val.variables,
+            named_args: val.named_args,
+            first_arg: val.first_arg,
+        }
+    }
+}
+
+impl From<PackedEntry> for Entry {
+    fn from(val: PackedEntry) -> Self {
+        let processed_source = serialize_tokens(&val.tokens[..]);
+        Entry {
+            hash: hash(&processed_source),
+            processed_source,
+            tokens: val.tokens,
+            variables: val.variables,
+            named_args: val.named_args,
+            first_arg: val.first_arg,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -77,45 +110,45 @@ pub fn normalize(text: &str) -> Result<Entry, Error> {
                     Some(Token { kind: Kind::Keyword(Keyword("limit")), .. })))
             && tok.text != "9223372036854775808"
             => {
-                rewritten_tokens.extend(arg_type_cast( "__std__", "int64",
-                    next_var(),
-                    tok.span));
+                rewritten_tokens.push(arg_type_cast(
+                    "int64", next_var(), tok.span
+                ));
                 variables.push(Variable {
                     value: tok.value.clone().unwrap(),
                 });
                 continue;
             }
             Kind::FloatConst => {
-                rewritten_tokens.extend(arg_type_cast( "__std__", "float64",
-                    next_var(),
-                    tok.span));
+                rewritten_tokens.push(arg_type_cast(
+                    "float64", next_var(), tok.span
+                ));
                 variables.push(Variable {
                     value: tok.value.clone().unwrap(),
                 });
                 continue;
             }
             Kind::BigIntConst => {
-                rewritten_tokens.extend(arg_type_cast( "__std__", "bigint",
-                    next_var(),
-                    tok.span));
+                rewritten_tokens.push(arg_type_cast(
+                    "bigint", next_var(), tok.span
+                ));
                 variables.push(Variable {
                     value: tok.value.clone().unwrap(),
                 });
                 continue;
             }
             Kind::DecimalConst => {
-                rewritten_tokens.extend(arg_type_cast( "__std__", "decimal",
-                    next_var(),
-                    tok.span));
+                rewritten_tokens.push(arg_type_cast(
+                    "decimal", next_var(), tok.span
+                ));
                 variables.push(Variable {
                     value: tok.value.clone().unwrap(),
                 });
                 continue;
             }
             Kind::Str => {
-                rewritten_tokens.extend(arg_type_cast( "__std__", "str",
-                    next_var(),
-                    tok.span));
+                rewritten_tokens.push(arg_type_cast(
+                    "str", next_var(), tok.span
+                ));
                 variables.push(Variable {
                     value: tok.value.clone().unwrap(),
                 });
@@ -155,8 +188,16 @@ pub fn normalize(text: &str) -> Result<Entry, Error> {
     }
 
     all_variables.push(variables);
+    // N.B: We always serialize the tokens to produce
+    // processed_source, even when no changes have been made. This is
+    // because when Source gets serialized, it always uses a
+    // PackedEntry, which will result in it being normalized *there*,
+    // and so if we don't do it *here*, then we won't be able to hit
+    // the persistent cache in cases where we didn't reserialize the
+    // tokens.
+    // TODO: Rework the caching to avoid needing to do this.
     let processed_source = serialize_tokens(&rewritten_tokens[..]);
-    return Ok(Entry {
+    Ok(Entry {
         hash: hash(&processed_source),
         processed_source,
         named_args,
@@ -167,7 +208,7 @@ pub fn normalize(text: &str) -> Result<Entry, Error> {
         },
         tokens: rewritten_tokens,
         variables: all_variables,
-    });
+    })
 }
 
 fn is_operator(token: &Token) -> bool {
@@ -178,29 +219,30 @@ fn is_operator(token: &Token) -> bool {
         | DistinctFrom | Comma | OpenParen | CloseParen | OpenBracket | CloseBracket
         | OpenBrace | CloseBrace | Dot | Semicolon | Colon | Add | Sub | Mul | Div | Modulo
         | Pow | Less | Greater | Eq | Ampersand | Pipe | At => true,
-        DecimalConst | FloatConst | IntConst | BigIntConst | BinStr | Argument | Str
-        | BacktickName | Keyword(_) | Ident | Substitution | EOF | EOI | Epsilon | StartBlock
-        | StartExtension | StartFragment | StartMigration | StartSDLDocument => false,
+        DecimalConst | FloatConst | IntConst | BigIntConst | BinStr | Parameter
+        | ParameterAndType | Str | BacktickName | Keyword(_) | Ident | Substitution | EOI
+        | Epsilon | StartBlock | StartExtension | StartFragment | StartMigration
+        | StartSDLDocument | StrInterpStart | StrInterpCont | StrInterpEnd => false,
     }
 }
 
 fn serialize_tokens(tokens: &[Token]) -> String {
-    use edgeql_parser::tokenizer::Kind::Argument;
+    use edgeql_parser::tokenizer::Kind::Parameter;
 
     let mut buf = String::new();
     let mut needs_space = false;
     for token in tokens {
-        if matches!(token.kind, Kind::EOF | Kind::EOI) {
+        if matches!(token.kind, Kind::EOI) {
             break;
         }
 
-        if needs_space && !is_operator(token) && token.kind != Argument {
+        if needs_space && !is_operator(token) && token.kind != Parameter {
             buf.push(' ');
         }
         buf.push_str(&token.text);
         needs_space = !is_operator(token);
     }
-    return buf;
+    buf
 }
 
 fn scan_vars<'x, 'y: 'x, I>(tokens: I) -> Option<(bool, usize)>
@@ -210,7 +252,7 @@ where
     let mut max_visited = None::<usize>;
     let mut names = BTreeSet::new();
     for t in tokens {
-        if t.kind == Kind::Argument {
+        if t.kind == Kind::Parameter {
             if let Ok(v) = t.text[1..].parse() {
                 if max_visited.map(|old| v > old).unwrap_or(true) {
                     max_visited = Some(v);
@@ -233,40 +275,19 @@ where
 fn hash(text: &str) -> [u8; 64] {
     let mut result = [0u8; 64];
     result.copy_from_slice(&Blake2b512::new_with_prefix(text.as_bytes()).finalize());
-    return result;
+    result
 }
 
-/// Produces tokens corresponding to (<module::typ>$var)
-fn arg_type_cast(
-    module: &'static str,
-    typ: &'static str,
-    var: String,
-    span: Span,
-) -> [Token<'static>; 8] {
-    fn tk(kind: Kind, text: Cow<'_, str>, span: Span) -> Token {
-        let value = if kind == Kind::Ident {
-            Some(Value::String(text.to_string()))
-        } else {
-            None
-        };
-        Token {
-            kind,
-            text,
-            value,
-            span,
-        }
+/// Produces tokens corresponding to (<lit typ>$var)
+fn arg_type_cast(typ: &'static str, var: String, span: Span) -> Token<'static> {
+    // the `lit` is required so these tokens have different text than an actual
+    // type cast and parameter, so their hashes don't clash.
+    Token {
+        kind: Kind::ParameterAndType,
+        text: format!("<lit {typ}>{var}").into(),
+        value: None,
+        span,
     }
-
-    [
-        tk(Kind::OpenParen, "(".into(), span),
-        tk(Kind::Less, "<".into(), span),
-        tk(Kind::Ident, module.into(), span),
-        tk(Kind::Namespace, "::".into(), span),
-        tk(Kind::Ident, typ.into(), span),
-        tk(Kind::Greater, ">".into(), span),
-        tk(Kind::Argument, var.into(), span),
-        tk(Kind::CloseParen, ")".into(), span),
-    ]
 }
 
 #[cfg(test)]
@@ -274,17 +295,17 @@ mod test {
     use super::scan_vars;
     use edgeql_parser::tokenizer::{Token, Tokenizer};
 
-    fn tokenize<'x>(s: &'x str) -> Vec<Token> {
+    fn tokenize(s: &str) -> Vec<Token> {
         let mut r = Vec::new();
         let mut s = Tokenizer::new(s);
         loop {
             match s.next() {
-                Some(Ok(x)) => r.push(x.into()),
+                Some(Ok(x)) => r.push(x),
                 None => break,
                 Some(Err(e)) => panic!("Parse error at {}: {}", s.current_pos(), e.message),
             }
         }
-        return r;
+        r
     }
 
     #[test]

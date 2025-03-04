@@ -126,8 +126,21 @@ dispatch.py
 
 
 from __future__ import annotations
-from typing import *
-from typing import overload
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    Tuple,
+    TypeVar,
+    AbstractSet,
+    Mapping,
+    Dict,
+    List,
+    Set,
+    cast,
+    overload,
+    TYPE_CHECKING,
+)
 
 # WARNING: this package is in a tight import loop with various modules
 # in edb.schema, so no direct imports from either this package or
@@ -222,7 +235,7 @@ def compile_ast_to_ir(
     script_info: Optional[irast.ScriptInfo] = None,
     options: Optional[CompilerOptions] = None,
 ) -> irast.Statement | irast.ConfigCommand:
-    """Compile given EdgeQL AST into EdgeDB IR.
+    """Compile given EdgeQL AST into Gel IR.
 
     This is the normal compiler entry point.  It assumes that *tree*
     represents a complete statement.
@@ -262,6 +275,10 @@ def compile_ast_to_ir(
 
     ctx = stmtctx_mod.init_context(schema=schema, options=options)
 
+    if isinstance(tree, qlast.Expr) and ctx.implicit_limit:
+        tree = qlast.SelectQuery(result=tree, implicit=True)
+        tree.limit = qlast.Constant.integer(ctx.implicit_limit)
+
     if not script_info:
         script_info = stmtctx_mod.preprocess_script([tree], ctx=ctx)
 
@@ -288,7 +305,7 @@ def compile_ast_to_ir(
         debug.dump(scopes)
 
     if debug.flags.edgeql_compile or debug.flags.edgeql_compile_ir:
-        debug.header('EdgeDB IR')
+        debug.header('Gel IR')
         debug.dump(ir_expr, schema=getattr(ir_expr, 'schema', None))
 
     return ir_expr
@@ -301,7 +318,7 @@ def compile_ast_fragment_to_ir(
     *,
     options: Optional[CompilerOptions] = None,
 ) -> irast.Statement:
-    """Compile given EdgeQL AST fragment into EdgeDB IR.
+    """Compile given EdgeQL AST fragment into Gel IR.
 
     Unlike :func:`~compile_ast_to_ir` above, this does not assume
     that the AST *tree* is a complete statement.  The expression
@@ -346,11 +363,11 @@ def compile_ast_fragment_to_ir(
         view_shapes_metadata={},
         schema_refs=frozenset(),
         schema_ref_exprs=None,
-        new_coll_types=frozenset(),
         scope_tree=ctx.path_scope,
         type_rewrites={},
         singletons=[],
         triggers=(),
+        warnings=tuple(ctx.env.warnings),
     )
 
 
@@ -396,6 +413,26 @@ def evaluate_to_python_val(
     """
     tree = qlparser.parse_fragment(expr)
     return evaluate_ast_to_python_val(tree, schema, modaliases=modaliases)
+
+
+def evaluate_ir_statement_to_python_val(
+    ir: irast.Statement,
+) -> Any:
+    """Evaluate the given EdgeQL IR AST as a constant expression.
+
+    Args:
+        ir:
+            EdgeQL IR Statement AST.
+
+    Returns:
+        The result of the evaluation as a Python value and the associated IR.
+
+    Raises:
+        If the expression is not constant, or is otherwise not supported by
+        the const evaluator, the function will raise
+        :exc:`ir.staeval.UnsupportedExpressionError`.
+    """
+    return ireval.evaluate_to_python_val(ir.expr, schema=ir.schema)
 
 
 def evaluate_ast_to_python_val_and_ir(

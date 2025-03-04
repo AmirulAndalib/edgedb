@@ -23,8 +23,22 @@ from typing import (
 )
 import immutables
 
+from edb import errors
 from edb.server import compiler
+from edb.server import defines as edbdef
+from edb.server.compiler import sertypes
 from edb.server.dbview import dbview
+
+async def describe(
+    db: dbview.Database,
+    query: str,
+    *,
+    query_cache_enabled: Optional[bool] = None,
+    allow_capabilities: compiler.Capability = (
+        compiler.Capability.MODIFICATIONS),
+    query_tag: str | None = None,
+) -> sertypes.TypeDesc:
+    ...
 
 async def parse_execute_json(
     db: dbview.Database,
@@ -35,6 +49,9 @@ async def parse_execute_json(
     output_format: compiler.OutputFormat = compiler.OutputFormat.JSON,
     query_cache_enabled: Optional[bool] = None,
     cached_globally: bool = False,
+    use_metrics: bool = True,
+    tx_isolation: edbdef.TxIsolationLevel | None = None,
+    query_tag: str | None = None,
 ) -> bytes:
     ...
 
@@ -45,5 +62,5 @@ async def interpret_error(
     global_schema_pickle: object=None,
     user_schema_pickle: object=None,
     from_graphql: bool=False,
-) -> Exception:
+) -> errors.EdgeDBError:
     ...

@@ -1,4 +1,4 @@
-<% from "tests.inc.yml" import build, calc_cache_key, restore_cache -%>
+<% from "tests.inc.yml" import init, build, calc_cache_key, install_python_requirements, restore_cache -%>
 name: Tests
 
 on:
@@ -6,8 +6,7 @@ on:
     branches:
       - master
       - ci
-      - "releases/*"
-      - "stable/*"
+      - "release/*"
   pull_request:
     branches:
       - '**'
@@ -31,7 +30,7 @@ jobs:
           -u edgedb-ci:$GIST_TOKEN \
           https://api.github.com/gists/8b722a65397f7c4c0df72f5394efa04c \
         | jq '.files."time_stats.csv".raw_url' \
-        | xargs curl > .tmp/time_stats.csv
+        | xargs curl > shared-artifacts/time_stats.csv
     <%- endcall %>
 
   cargo-test:
@@ -39,62 +38,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
-        submodules: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11.3'
-
-    - name: Handle virtualenv
-      uses: syphar/restore-virtualenv@v1.2
-      id: venv-cache
-      with:
-        requirement_files: |
-          setup.py
-          pyproject.toml
-        custom_cache_key_element: v2
-
-    - name: Stop if we cannot retrieve the cache
-      if: steps.venv-cache.outputs.cache-hit != 'true'
-      run: |
-        echo ::error::Cannot retrieve venv cache.
-        exit 1
+    << init() >>
+    << install_python_requirements() >>
 
     - name: Download cache key
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
       with:
         name: shared-artifacts
-        path: .tmp
+        path: shared-artifacts
 
     - name: Generate environment variables
       run: |
         echo BUILD_TEMP=$(python setup.py -q ci_helper --type build_temp) >> $GITHUB_ENV
 
     - name: Handle Rust extensions build cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       id: rust-cache
       with:
         path: ${{ env.BUILD_TEMP }}/rust/extensions
-        key: edb-rust-build-v1-${{ hashFiles('.tmp/rust_cache_key.txt') }}
+        key: edb-rust-build-v1-${{ hashFiles('shared-artifacts/rust_cache_key.txt') }}
 
-    - name: Install rust toolchain
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: stable
-        default: true
+    - name: Install Rust toolchain
+      uses: dsherret/rust-toolchain-file@v1
 
     - name: Cargo test
-      uses: actions-rs/cargo@v1
       env:
         CARGO_TARGET_DIR: ${{ env.BUILD_TEMP }}/rust/extensions
         CARGO_HOME: ${{ env.BUILD_TEMP }}/rust/extensions/cargo_home
-      with:
-        command: test
+      run:
+        cargo test --all-features
 
   python-test:
     needs: build
@@ -103,10 +75,10 @@ jobs:
       fail-fast: false
       matrix:
         shard: [
-             1/16,  2/16,  3/16,  4/16,
-             5/16,  6/16,  7/16,  8/16,
-             9/16, 10/16, 11/16, 12/16,
-            13/16, 14/16, 15/16, 16/16,
+           1,  2,  3,  4,
+           5,  6,  7,  8,
+           9, 10, 11, 12,
+          13, 14, 15, 16,
         ]
 
     steps:
@@ -114,66 +86,91 @@ jobs:
 
     # Run the test
 
+    - name: Install Rust toolchain
+      uses: dsherret/rust-toolchain-file@v1
+
     - name: Test
       env:
         SHARD: ${{ matrix.shard }}
+        EDGEDB_TEST_REPEATS: 1
       run: |
-        mkdir -p .results/
-        cp .tmp/time_stats.csv .results/shard_${SHARD/\//_}.csv
-        edb test -j2 -v -s ${SHARD} --running-times-log=.results/shard_${SHARD/\//_}.csv
+        mkdir -p results/
+        cp shared-artifacts/time_stats.csv results/running_times_${SHARD}.csv
+        edb test --jobs 2 --verbose --shard ${SHARD}/16 \
+          --running-times-log=results/running_times_${SHARD}.csv \
+          --result-log=results/result_${SHARD}.json
 
     - name: Upload test results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874  # v4.4.0
+      if: ${{ always() }}
       with:
-        name: python-test-results
-        path: .results
+        name: python-test-results-${{ matrix.shard }}
+        path: results
         retention-days: 1
 
-  collect:
+  python-test-list:
     needs: build
     runs-on: ubuntu-latest
     steps:
     <<- restore_cache() >>
 
-    # Collect tests and upload
+    # List tests and upload
 
     - name: Generate complete list of tests for verification
       env:
         SHARD: ${{ matrix.shard }}
+        EDGEDB_TEST_REPEATS: 1
       run: |
-        edb test --list > .tmp/all_tests.txt
+        edb test --list > shared-artifacts/all_tests.txt
 
-    - name: Update shared artifacts
-      uses: actions/upload-artifact@v3
+    - name: Upload list of tests
+      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874  # v4.4.0
       with:
-        name: shared-artifacts
-        path: .tmp
+        name: test-list
+        path: shared-artifacts
         retention-days: 1
 
   test-conclusion:
-    needs: [cargo-test, python-test, collect]
+    needs: [cargo-test, python-test, python-test-list]
     runs-on: ubuntu-latest
+    if: ${{ always() }}
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11.3'
+          python-version: '3.12.2'
 
       - name: Install Python deps
         run: |
-          python -m pip install requests
+          python -m pip install requests click
 
-      - name: Download shared artifacts
-        uses: actions/download-artifact@v3
+      - uses: actions/checkout@v4
         with:
-          name: shared-artifacts
-          path: .tmp
+          submodules: false
 
       - name: Download python-test results
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
         with:
-          name: python-test-results
-          path: .results
+          pattern: python-test-results-*
+          merge-multiple: true
+          path: results
+
+      # Render results and exit if they were unsuccessful
+      - name: Render results
+        run: |
+          python edb/tools/test/results.py 'results/result_*.json'
+
+      - name: Download shared artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        with:
+          name: shared-artifacts
+          path: shared-artifacts
+
+      - name: Download test list
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16  # v4.1.8
+        with:
+          name: test-list
+          path: shared-artifacts
 
       - name: Merge stats and verify tests completion
         shell: python
@@ -190,17 +187,17 @@ jobs:
           orig = {}
           new = {}
           all_tests = set()
-          with open(".tmp/time_stats.csv") as f:
+          with open("shared-artifacts/time_stats.csv") as f:
               for name, t, c in csv.reader(f):
                   assert name not in orig, "duplicate test name in original stats!"
                   orig[name] = (t, int(c))
 
-          with open(".tmp/all_tests.txt") as f:
+          with open("shared-artifacts/all_tests.txt") as f:
               for line in f:
                   assert line not in all_tests, "duplicate test name in this run!"
                   all_tests.add(line.strip())
 
-          for new_file in glob.glob(".results/*.csv"):
+          for new_file in glob.glob("results/running_times_*.csv"):
               with open(new_file) as f:
                   for name, t, c in csv.reader(f):
                       if int(c) > orig.get(name, (0, 0))[1]:

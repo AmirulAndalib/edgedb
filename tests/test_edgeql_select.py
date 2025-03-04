@@ -26,6 +26,7 @@ from edb.tools import test
 
 
 class TestEdgeQLSelect(tb.QueryTestCase):
+    NO_FACTOR = False
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas',
                           'issues.esdl')
 
@@ -681,6 +682,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 FILTER Issue.number = '1';
             """)
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_computable_30(self):
         await self.assert_query_result(
             r"""
@@ -703,6 +705,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_computable_32(self):
         await self.assert_query_result(
             r"""
@@ -1290,8 +1293,10 @@ class TestEdgeQLSelect(tb.QueryTestCase):
 
     async def test_edgeql_select_limit_08(self):
         with self.assertRaisesRegex(
-                edgedb.QueryError,
-                r'could not resolve partial path'):
+            edgedb.QueryError,
+            r'could not resolve partial path',
+            _hint=None
+        ):
 
             await self.con.query("""
                 SELECT
@@ -1301,8 +1306,10 @@ class TestEdgeQLSelect(tb.QueryTestCase):
 
     async def test_edgeql_select_limit_09(self):
         with self.assertRaisesRegex(
-                edgedb.QueryError,
-                r'could not resolve partial path'):
+            edgedb.QueryError,
+            r'could not resolve partial path',
+            _hint=None
+        ):
 
             await self.con.query("""
                 SELECT
@@ -1318,6 +1325,23 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             await self.con.query("""
                 SELECT 1 LIMIT -1
             """)
+
+    async def test_edgeql_select_limit_11(self):
+        await self.assert_query_result(
+            r'''
+            SELECT (SELECT {<optional str>$0, 'x'} LIMIT 1)
+            ''',
+            ['x'],
+            variables=(None,),
+        )
+
+        await self.assert_query_result(
+            r'''
+            SELECT (SELECT {<optional str>$0, 'x'} OFFSET 1)
+            ''',
+            [],
+            variables=(None,),
+        )
 
     async def test_edgeql_select_offset_01(self):
         with self.assertRaisesRegex(
@@ -1410,7 +1434,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             }],
         )
 
-    async def test_edgeql_select_polymorphic_04(self):
+    async def test_edgeql_select_polymorphic_04a(self):
         # Since using a polymorphic shape element means that sometimes
         # that element may be empty, it is prohibited to access
         # protected property such as `id` on it as that would be
@@ -1445,6 +1469,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             },
         )
 
+    @tb.needs_factoring
+    async def test_edgeql_select_polymorphic_04b(self):
         await self.assert_query_result(
             r'''
             SELECT Object[IS Status].name ?? Object[IS Priority].name;
@@ -1457,7 +1483,6 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             },
         )
 
-    @test.not_implemented('type expressions are not implemented')
     async def test_edgeql_select_polymorphic_07(self):
         await self.assert_query_result(
             r'''
@@ -1921,6 +1946,29 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 order by .name;
             ''')
 
+    async def test_edgeql_select_splat_06(self):
+        # Target property and link property with same name
+        await self.con.execute('''
+            CREATE TYPE X {
+                CREATE PROPERTY a: int64;
+            };
+            CREATE TYPE Y {
+                CREATE LINK x: X {
+                    CREATE PROPERTY a: int64;
+                };
+            };
+            insert Y { x := ( insert X { a := 1 } ){ @a := 2 } };
+        ''')
+
+        await self.assert_query_result(
+            r'''
+            select Y {**}
+            ''',
+            tb.bag([
+                {'x': {'a': 1, '@a': 2}}
+            ]),
+        )
+
     async def test_edgeql_select_id_01(self):
         # allow assigning id to a computed (#4781)
         await self.con.query('SELECT schema::Type { XYZ := .id};')
@@ -1979,6 +2027,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 ''',
             )
 
+    @tb.needs_factoring
     async def test_edgeql_select_reverse_link_05(self):
         await self.assert_query_result(
             r'''
@@ -2223,6 +2272,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_tvariant_09(self):
         await self.assert_query_result(
             r"""
@@ -2482,12 +2532,14 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             }],
         )
 
+    @tb.needs_factoring_weakly  # XXX(factor): WE WOULD PREFER NOT
     async def test_edgeql_select_setops_04(self):
+        # XXX(factor): need to follow multiple steps in warn analysis
         await self.assert_query_result(
             r"""
             # equivalent to ?=
             SELECT Issue {number}
-            FILTER
+            FILTER any((
                 # Issue.priority.name ?= 'High'
                 # equivalent to this via an if/else translation
                 (SELECT Issue.priority.name = 'High'
@@ -2495,6 +2547,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 UNION
                 (SELECT EXISTS Issue.priority.name = TRUE
                  FILTER NOT EXISTS Issue.priority.name)
+            ))
             ORDER BY Issue.number;
             """,
             [{'number': '2'}],
@@ -2649,6 +2702,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_setops_10(self):
         await self.assert_query_result(
             r"""
@@ -2701,6 +2755,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_setops_13a(self):
         await self.assert_query_result(
             r"""
@@ -2724,6 +2779,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_setops_13b(self):
         # This should be equivalent to the above test, but actually we
         # end up deduplicating.
@@ -2835,6 +2891,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             {'1', '2', '3', '4'},
         )
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_setops_20(self):
         res = await self.con.query(r'''
             SELECT (
@@ -2846,6 +2903,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         for row in res:
             self.assertNotEqual(row[1].id, None)
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_setops_21(self):
         res = await self.con.query(r'''
             SELECT (
@@ -2857,6 +2915,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         for row in res:
             self.assertNotEqual(row[1].id, None)
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_setops_22(self):
         res = await self.con.query(r'''
             SELECT (
@@ -3138,6 +3197,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 ORDER BY User.<owner[IS Issue].number;
             """)
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_where_01(self):
         await self.assert_query_result(
             r'''
@@ -3149,6 +3209,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': '1'}, {'number': '4'}],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_where_02(self):
         await self.assert_query_result(
             r'''
@@ -3187,7 +3248,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             }],
         )
 
-    async def test_edgeql_select_func_01(self):
+    @tb.needs_factoring
+    async def test_edgeql_select_func_01a(self):
         await self.assert_query_result(
             r'''
             SELECT std::len(User.name) ORDER BY User.name;
@@ -3195,6 +3257,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [5, 4],
         )
 
+    async def test_edgeql_select_func_01b(self):
         await self.assert_query_result(
             r'''
             SELECT std::sum(<std::int64>Issue.number);
@@ -3708,7 +3771,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             }],
         )
 
-    async def test_edgeql_select_equivalence_02(self):
+    @tb.needs_factoring
+    async def test_edgeql_select_equivalence_02a(self):
         await self.assert_query_result(
             r'''
             # get Issues such that there's another Issue with
@@ -3716,10 +3780,32 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             WITH
                 I2 := Issue
             SELECT Issue {number}
-            FILTER
+            FILTER any(
                 I2 != Issue
                 AND
                 I2.priority.name ?= Issue.priority.name
+            )
+            ORDER BY Issue.number;
+            ''',
+            [{'number': '1'}, {'number': '4'}],
+        )
+
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
+    async def test_edgeql_select_equivalence_02b(self):
+        await self.assert_query_result(
+            r'''
+            # get Issues such that there's another Issue with
+            # equivalent priority
+            WITH
+                I2 := Issue
+            SELECT Issue {number}
+            FILTER (
+                FOR I2 IN I2
+                SELECT
+                I2 != Issue
+                AND
+                I2.priority.name ?= Issue.priority.name
+            )
             ORDER BY Issue.number;
             ''',
             [{'number': '1'}, {'number': '4'}],
@@ -3979,6 +4065,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             }],
         )
 
+    @tb.needs_factoring_weakly  # XXX(factor): WE WOULD PREFER NOT
     async def test_edgeql_select_or_01(self):
         issues_h = await self.con.query(r'''
             SELECT Issue{number}
@@ -3994,6 +4081,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ORDER BY Issue.number;
         ''')
 
+        # XXX(factor): need to follow multiple steps in warn analysis
         await self.assert_query_result(
             r'''
             SELECT Issue{number}
@@ -4006,7 +4094,9 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': o.number} for o in [*issues_h, *issues_l]]
         )
 
+    @tb.needs_factoring_weakly  # XXX(factor): WE WOULD PREFER NOT
     async def test_edgeql_select_or_04(self):
+        # XXX(factor): need to follow multiple steps in warn analysis
         await self.assert_query_result(
             r'''
             SELECT Issue{number}
@@ -4572,16 +4662,21 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         )
 
     async def test_edgeql_select_empty_05(self):
-        with self.assertRaisesRegex(
-                edgedb.QueryError,
-                r'expression returns value of indeterminate type'):
-            await self.con.query(r"""
-                SELECT Issue {
-                    number,
-                    # the empty set is of an unspecified type
-                    time_estimate := {}
-                } ORDER BY .number;
-                """)
+        await self.assert_query_result(
+            r"""
+            SELECT Issue {
+                number,
+                # the empty set is of an unspecified type
+                time_estimate := {}
+            } ORDER BY .number;
+            """,
+            [
+                {'number': '1', 'time_estimate': None},
+                {'number': '2', 'time_estimate': None},
+                {'number': '3', 'time_estimate': None},
+                {'number': '4', 'time_estimate': None},
+            ],
+        )
 
     async def test_edgeql_select_empty_object_01(self):
         await self.assert_query_result(
@@ -4615,6 +4710,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [True],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_01(self):
         await self.assert_query_result(
             r"""
@@ -4625,6 +4721,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['ClosedHigh', 'ClosedLow', 'OpenHigh', 'OpenLow'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_02(self):
         await self.assert_query_result(
             r"""
@@ -4635,6 +4732,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['OpenHigh', 'ClosedLow'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_03(self):
         await self.assert_query_result(
             r"""
@@ -4646,6 +4744,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
              'Yury1', 'Yury2', 'Yury3', 'Yury4'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_04(self):
         await self.assert_query_result(
             r"""
@@ -4656,6 +4755,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['Elvis1', 'Elvis4', 'Yury2', 'Yury3'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross05(self):
         await self.assert_query_result(
             r"""
@@ -4666,6 +4766,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [['Elvis', 'Yury'], ['Yury', 'Elvis'], ['Yury', 'Elvis']],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross06(self):
         await self.assert_query_result(
             r"""
@@ -4676,6 +4777,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['ElvisYury', 'YuryElvis', 'YuryElvis'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_07(self):
         await self.assert_query_result(
             r"""
@@ -4692,6 +4794,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [2],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross08(self):
         await self.assert_query_result(
             r"""
@@ -4701,6 +4804,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['Elvis0', 'Elvis1', 'Yury1', 'Yury1'],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_09(self):
         await self.assert_query_result(
             r"""
@@ -4710,6 +4814,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [4],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_10(self):
         await self.assert_query_result(
             r"""
@@ -4724,6 +4829,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [4],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_11(self):
         await self.assert_query_result(
             r"""
@@ -4736,6 +4842,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [4],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_cross_12(self):
         # Same as cross11, but without coalescing the time_estimate,
         # which should collapse the counted set to a single element.
@@ -4750,6 +4857,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [1],
         )
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_cross_13(self):
         await self.assert_query_result(
             r"""
@@ -4767,6 +4875,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [4],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_subqueries_01(self):
         await self.assert_query_result(
             r"""
@@ -4836,6 +4945,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': '2'}, {'number': '3'}, {'number': '4'}],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_subqueries_05(self):
         await self.assert_query_result(
             r"""
@@ -4847,17 +4957,19 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 Issue {
                     number
                 }
-            FILTER
+            FILTER any(
                 Issue != Issue2
                 AND
                 # NOTE: this condition is false when one of the sides is empty
                 Issue.priority = Issue2.priority
+            )
             ORDER BY
                 Issue.number;
             """,
             [],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_subqueries_06(self):
         await self.assert_query_result(
             r"""
@@ -4869,14 +4981,16 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 Issue {
                     number
                 }
-            FILTER
+            FILTER any(
                 Issue != Issue2 AND Issue.priority ?= Issue2.priority
+            )
             ORDER BY
                 Issue.number;
             """,
             [{'number': '1'}, {'number': '4'}],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_subqueries_07(self):
         await self.assert_query_result(
             r"""
@@ -4900,6 +5014,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': '2'}, {'number': '3'}],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_subqueries_08(self):
         await self.assert_query_result(
             r"""
@@ -4924,6 +5039,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': '2'}, {'number': '3'}],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_subqueries_09(self):
         await self.assert_query_result(
             r"""
@@ -5039,6 +5155,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'name': 'Elvis'}],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_subqueries_15(self):
         await self.assert_query_result(
             r"""
@@ -5087,6 +5204,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'body': 'EdgeDB needs to happen soon.'}],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_subqueries_17(self):
         await self.assert_query_result(
             r"""
@@ -5106,6 +5224,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'body': 'EdgeDB needs to happen soon.'}],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_subqueries_18(self):
         await self.assert_query_result(
             r"""
@@ -5913,6 +6032,15 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ['[]'],
         )
 
+    async def test_edgeql_select_multi_property_shape_01(self):
+        await self.assert_query_result(
+            r"""
+            select (BooleanTest { tags }).tags
+            """,
+            tb.bag(['red', 'black', 'red', 'green', 'red']),
+        )
+
+    @tb.needs_factoring
     async def test_edgeql_select_tuple_01(self):
         await self.assert_query_result(
             r"""
@@ -5923,6 +6051,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [['Closed', 2], ['Open', 2]]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_tuple_02(self):
         await self.assert_query_result(
             r"""
@@ -5948,6 +6077,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_select_tuple_03(self):
         await self.assert_query_result(
             r"""
@@ -5996,6 +6126,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'statuses': 2, 'issues': 4}],
         )
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_tuple_06(self):
         # Tuple in a common set expr.
         await self.assert_query_result(
@@ -6011,6 +6142,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [6],
         )
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_tuple_07(self):
         # Object in a tuple.
         await self.assert_query_result(
@@ -6088,6 +6220,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [False],
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_linkproperty_01(self):
         await self.assert_query_result(
             r"""
@@ -6097,6 +6230,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [43, 44, 45, 46]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_linkproperty_02(self):
         await self.assert_query_result(
             r"""
@@ -6324,12 +6458,24 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [{'number': '1'}, {'number': '3'}, {'number': '4'}],
         )
 
+    @tb.needs_factoring_weakly
     async def test_edgeql_select_if_else_07(self):
         await self.assert_query_result(
             r'''
             WITH a := (SELECT Issue FILTER .number = '2'),
                  b := (SELECT Issue FILTER .number = '1'),
             SELECT a.number IF a.time_estimate < b.time_estimate ELSE b.number;
+            ''',
+            [],
+        )
+
+    @tb.needs_factoring_weakly  # XXX(factor): WE WOULD PREFER NOT
+    async def test_edgeql_select_if_else_07_b(self):
+        await self.assert_query_result(
+            r'''
+            WITH a := (SELECT Issue FILTER .number = '2'),
+                 b := (SELECT Issue FILTER .number = '1'),
+            SELECT (a IF a.time_estimate < b.time_estimate ELSE b).number;
             ''',
             [],
         )
@@ -6418,6 +6564,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 SELECT Issue.number FILTER .number > '1';
             ''')
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_union_target_01(self):
         await self.assert_query_result(
             r'''
@@ -6595,7 +6742,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
-    async def test_edgeql_select_json_01(self):
+    @tb.needs_factoring
+    async def test_edgeql_select_json_01a(self):
         await self.assert_query_result(
             r'''
             # cast a type variant into a set of json
@@ -6613,6 +6761,32 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             r'''
             SELECT (
                 SELECT <json>Issue {
+                    number,
+                    time_estimate
+                } FILTER Issue.number = '2'
+            ) = to_json('{"number": "2", "time_estimate": null}');
+            ''',
+            [True],
+        )
+
+    async def test_edgeql_select_json_01b(self):
+        await self.assert_query_result(
+            r'''
+            # cast a type variant into a set of json
+            SELECT <json>(
+                SELECT Issue {
+                    number,
+                    time_estimate
+                } FILTER Issue.number = '1'
+            ) = to_json('{"number": "1", "time_estimate": 3000}');
+            ''',
+            [True],
+        )
+
+        await self.assert_query_result(
+            r'''
+            SELECT <json>(
+                SELECT Issue {
                     number,
                     time_estimate
                 } FILTER Issue.number = '2'
@@ -7047,6 +7221,27 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             [True],
         )
 
+    async def test_edgeql_select_is_incompatible_union_01(self):
+        await self.con.execute('''
+            CREATE TYPE Dummy1 {
+                CREATE PROPERTY foo -> int64;
+            };
+            CREATE TYPE Dummy2 {
+                CREATE PROPERTY foo -> str;
+            };
+        ''')
+
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"cannot create union \(default::Dummy1 \| default::Dummy2\) "
+                r"with property 'foo' using incompatible types std::int64, "
+                r"std::str"):
+            await self.con.query(
+                r'''
+                    SELECT Object is Dummy1 | Dummy2;
+                ''',
+            )
+
     async def test_edgeql_select_duplicate_definition_01(self):
         with self.assertRaisesRegex(
             edgedb.QueryError,
@@ -7240,7 +7435,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         "Known collation issue on Heroku Postgres",
         unless=os.getenv("EDGEDB_TEST_BACKEND_VENDOR") != "heroku-postgres"
     )
-    async def test_edgeql_select_expr_objects_04(self):
+    @tb.needs_factoring_weakly
+    async def test_edgeql_select_expr_objects_04a(self):
         await self.assert_query_result(
             r'''
                 WITH items := array_agg((SELECT Named ORDER BY .name))
@@ -7261,6 +7457,8 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ],
         )
 
+    @tb.needs_factoring
+    async def test_edgeql_select_expr_objects_04b(self):
         await self.assert_query_result(
             r'''
                 WITH items := (User.name, array_agg(User.todo ORDER BY .name))
@@ -7280,6 +7478,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_expr_objects_05(self):
         await self.assert_query_result(
             r"""
@@ -7293,6 +7492,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_expr_objects_06(self):
         await self.assert_query_result(
             r"""
@@ -7304,6 +7504,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_expr_objects_07(self):
         # get the User names and ids
         res = await self.con.query(r'''
@@ -7343,6 +7544,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_select_expr_objects_08(self):
         await self.assert_query_result(
             r'''
@@ -7504,6 +7706,75 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             await self.con.query(
                 r'''
                     SELECT User.<whatever
+                ''',
+            )
+
+    async def test_edgeql_select_incompatible_union_01(self):
+        await self.con.execute('''
+            CREATE TYPE Dummy1 {
+                CREATE PROPERTY foo -> int64;
+            };
+            CREATE TYPE Dummy2 {
+                CREATE PROPERTY foo -> str;
+            };
+        ''')
+
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"cannot create union \(default::Dummy1 \| default::Dummy2\) "
+                r"with property 'foo' using incompatible types std::int64, "
+                r"std::str"):
+            await self.con.query(
+                r'''
+                    SELECT Dummy1 union Dummy2;
+                ''',
+            )
+
+    async def test_edgeql_select_incompatible_union_02(self):
+        await self.con.execute('''
+            CREATE TYPE Bar;
+            CREATE TYPE Dummy1 {
+                CREATE PROPERTY foo -> int64;
+            };
+            CREATE TYPE Dummy2 {
+                CREATE LINK foo -> Bar;
+            };
+        ''')
+
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"cannot create union \(default::Dummy1 \| default::Dummy2\) "
+                r"with link 'foo' using incompatible types default::Bar, "
+                r"std::int64"):
+            await self.con.query(
+                r'''
+                    SELECT Dummy1 union Dummy2;
+                ''',
+            )
+
+    async def test_edgeql_select_incompatible_union_03(self):
+        await self.con.execute('''
+            CREATE TYPE Bar;
+            CREATE TYPE Dummy1 {
+                CREATE LINK foo -> Bar {
+                    CREATE PROPERTY baz -> int64
+                }
+            };
+            CREATE TYPE Dummy2 {
+                CREATE LINK foo -> Bar {
+                    CREATE PROPERTY baz -> str
+                }
+            };
+        ''')
+
+        with self.assertRaisesRegex(
+                edgedb.SchemaError,
+                r"cannot create union \(default::Dummy1 \| default::Dummy2\) "
+                r"with link 'foo' with property 'baz' using incompatible types "
+                r"std::int64, std::str"):
+            await self.con.query(
+                r'''
+                    SELECT Dummy1 union Dummy2;
                 ''',
             )
 
@@ -7736,6 +8007,7 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ]
         )
 
+    @tb.needs_factoring
     async def test_edgeql_collection_shape_07(self):
         await self.assert_query_result(
             r'''
@@ -8051,16 +8323,10 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         )
 
     async def test_edgeql_select_free_object_distinct_01(self):
-        foo, bar = await self.con.query_single('''
-            select ({foo := "test"}, {bar := 1000})
+        foo = await self.con.query_single('''
+            select {foo := "test"}
         ''')
-        self.assertNotEqual(foo.id, bar.id)
-
-    async def test_edgeql_select_free_object_distinct_02(self):
-        vals = await self.con.query('''
-            for x in {1,2,3} union { asdf := 10*x };
-        ''')
-        self.assertEqual(len(vals), len({v.id for v in vals}))
+        self.assertFalse(hasattr(foo, 'id'))
 
     async def test_edgeql_select_shadow_computable_01(self):
         # The thing this is testing for
@@ -8074,13 +8340,6 @@ class TestEdgeQLSelect(tb.QueryTestCase):
                 {"is_elvis": True, "name": "Elvis"}
             ]
         )
-
-    async def test_edgeql_select_free_object_distinct_03(self):
-        vals = await self.con.query('''
-            with w := {x := 10}
-            for x in {1,2,3} union w
-        ''')
-        self.assertEqual(1, len({v.id for v in vals}))
 
     async def test_edgeql_select_card_blowup_01(self):
         # This used to really blow up cardinality inference
@@ -8195,6 +8454,11 @@ class TestEdgeQLSelect(tb.QueryTestCase):
         with self.assertRaisesRegex(edgedb.QueryError, "missing a type cast"):
             await self.con.query("select ($0, <std::int64>$0)")
 
+    async def test_edgeql_select_params_04(self):
+        with self.assertRaisesRegex(edgedb.QueryError,
+                                    "cannot apply a shape to the parameter"):
+            await self.con.query("select <std::int64>$0 { id }")
+
     async def test_edgeql_type_pointer_inlining_01(self):
         await self.con._fetchall(
             r'''
@@ -8223,3 +8487,21 @@ class TestEdgeQLSelect(tb.QueryTestCase):
             ''',
             __typenames__=True
         )
+
+    async def test_edgeql_type_pointer_backlink_01(self):
+        # Type injection on bare backlinks was broken in 3.x (#5930)
+        await self.con._fetchall(
+            r'''
+            select schema::Type {name, refs := .<target[is schema::Pointer]};
+            ''',
+            __typenames__=True
+        )
+
+
+class TestEdgeQLSelectNoFactor(TestEdgeQLSelect):
+    NO_FACTOR = True
+
+
+class TestEdgeQLSelectWarnFactor(TestEdgeQLSelect):
+    NO_FACTOR = False
+    WARN_FACTOR = True

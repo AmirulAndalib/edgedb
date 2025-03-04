@@ -15,8 +15,19 @@ cython: build-reqs
 	BUILD_EXT_MODE=py-only python setup.py build_ext --inplace
 
 
+# Just rebuild actually changed cython. This *should* work, since
+# that is how build systems are supposed to be, but it sometimes
+# fails in annoying ways.
+cython-fast: build-reqs
+	BUILD_EXT_MODE=py-only python setup.py build_ext --inplace
+
+
 rust: build-reqs
 	BUILD_EXT_MODE=rust-only python setup.py build_ext --inplace
+
+
+cli: build-reqs
+	python setup.py build_cli
 
 
 docs: build-reqs
@@ -26,6 +37,14 @@ docs: build-reqs
 
 postgres: build-reqs
 	python setup.py build_postgres
+
+
+parsers:
+	python setup.py build_parsers --inplace
+
+
+libpg-query:
+	python setup.py build_libpg_query
 
 
 ui: build-reqs
@@ -44,7 +63,7 @@ casts: build-reqs
 
 build: build-reqs
 	find edb -name '*.pyx' | xargs touch
-	pip install -Ue .[docs,test]
+	pip install --upgrade --editable .[docs,test,language-server]
 
 
 clean:

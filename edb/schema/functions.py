@@ -22,10 +22,26 @@ from __future__ import annotations
 import abc
 import types
 import uuid
-from typing import *
+from typing import (
+    Any,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    Iterable,
+    Mapping,
+    Sequence,
+    Dict,
+    List,
+    Set,
+    cast,
+    TYPE_CHECKING,
+)
 
 from edb import errors
 
+from edb.common import ast
 from edb.common import parsing
 from edb.common import struct
 from edb.common import verutils
@@ -50,6 +66,7 @@ from . import utils
 
 
 if TYPE_CHECKING:
+    from edb.edgeql.compiler import context as qlcontext
     from edb.ir import ast as irast
     from . import schema as s_schema
 
@@ -211,7 +228,6 @@ class ParameterDesc(ParameterLike):
                 subtypes=[paramt_ast],
             )
 
-        assert isinstance(paramt_ast, qlast.TypeName)
         paramt = utils.ast_to_type_shell(
             paramt_ast,
             metaclass=s_types.Type,
@@ -310,7 +326,8 @@ class ParameterDesc(ParameterLike):
 
 
 def _params_are_all_required_singletons(
-    params: Sequence[ParameterLike], schema: s_schema.Schema,
+    params: Sequence[ParameterLike],
+    schema: s_schema.Schema,
 ) -> bool:
     return all(
         param.get_kind(schema) is not ft.ParameterKind.VariadicParam
@@ -415,13 +432,18 @@ class Parameter(
         fullname = self.get_name(schema)
         return self.paramname_from_fullname(fullname)
 
-    def get_ir_default(self, *, schema: s_schema.Schema) -> irast.Statement:
+    def get_ir_default(
+        self, *, schema: s_schema.Schema, context: sd.CommandContext,
+    ) -> irast.Statement:
         from edb.ir import utils as irutils
 
         defexpr = self.get_default(schema)
         assert defexpr is not None
         defexpr = defexpr.compiled(
-            as_fragment=True, schema=schema)
+            as_fragment=True,
+            schema=schema,
+            context=context,
+        )
         ir = defexpr.irast
         if not irutils.is_const(ir.expr):
             raise ValueError('expression not constant')
@@ -469,7 +491,7 @@ class Parameter(
             type=utils.typeref_to_ast(schema, self.get_type(schema)),
             typemod=self.get_typemod(schema),
             kind=kind,
-            default=default.qlast if default else None,
+            default=default.parse() if default else None,
         )
 
 
@@ -530,10 +552,24 @@ class ParameterCommand(
                     apply_query_rewrites=not context.stable_ids,
                     track_schema_ref_exprs=track_schema_ref_exprs,
                 ),
+                context=context,
             )
         else:
             return super().compile_expr_field(
                 schema, context, field, value, track_schema_ref_exprs)
+
+    def get_dummy_expr_field_value(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+        field: so.Field[Any],
+        value: Any,
+    ) -> Optional[s_expr.Expression]:
+        if field.name == 'default':
+            type = self.scls.get_type(schema)
+            return s_types.type_dummy_expr(type, schema)
+        else:
+            raise NotImplementedError(f'unhandled field {field.name!r}')
 
 
 class CreateParameter(ParameterCommand, sd.CreateObject[Parameter]):
@@ -562,7 +598,8 @@ class DeleteParameter(ParameterCommand, sd.DeleteObject[Parameter]):
     ) -> s_schema.Schema:
         schema = super()._delete_begin(schema, context)
         if not context.canonical:
-            if op := self.scls.get_type(schema).as_type_delete_if_dead(schema):
+            typ = self.scls.get_type(schema)
+            if op := typ.as_type_delete_if_unused(schema):
                 self.add_caused(op)
         return schema
 
@@ -656,19 +693,23 @@ class FuncParameterList(so.ObjectList[Parameter], ParameterLikeList):
         return '(' + ', '.join(ret) + ')'
 
     def has_polymorphic(self, schema: s_schema.Schema) -> bool:
-        return any(p.get_type(schema).is_polymorphic(schema)
-                   for p in self.objects(schema))
+        return any(
+            p.get_type(schema).is_polymorphic(schema)
+            for p in self.objects(schema)
+        )
 
     def has_type_mod(
-            self, schema: s_schema.Schema, mod: ft.TypeModifier) -> bool:
+        self, schema: s_schema.Schema, mod: ft.TypeModifier
+    ) -> bool:
         return any(p.get_typemod(schema) is mod for p in self.objects(schema))
 
     def has_set_of(self, schema: s_schema.Schema) -> bool:
         return self.has_type_mod(schema, ft.TypeModifier.SetOfType)
 
     def has_objects(self, schema: s_schema.Schema) -> bool:
-        return any(p.get_type(schema).is_object_type()
-                   for p in self.objects(schema))
+        return any(
+            p.get_type(schema).is_object_type() for p in self.objects(schema)
+        )
 
     def find_named_only(
         self,
@@ -802,11 +843,15 @@ class CallableObject(
     prefer_subquery_args = so.SchemaField(
         bool, default=False, compcoef=0.9)
 
+    # Some set of calls are allowed in singleton expressions
+    is_singleton_set_of = so.SchemaField(
+        bool, default=False, compcoef=0.4)
+
     def as_create_delta(
         self: CallableObjectT,
         schema: s_schema.Schema,
         context: so.ComparisonContext,
-    ) -> sd.ObjectCommand[CallableObjectT]:
+    ) -> sd.CreateObject[CallableObjectT]:
         delta = super().as_create_delta(schema, context)
 
         new_params = self.get_params(schema).objects(schema)
@@ -1150,13 +1195,13 @@ class CreateCallableObject(
                 continue
 
             num: int = props['num']
-            default = props.get('default')
+            default: Optional[s_expr.Expression] = props.get('default')
             param = make_func_param(
                 name=Parameter.paramname_from_fullname(props['name']),
                 type=utils.typeref_to_ast(schema, props['type']),
                 typemod=props['typemod'],
                 kind=props['kind'],
-                default=default.qlast if default is not None else None,
+                default=default.parse() if default is not None else None,
             )
             params.append((num, param))
 
@@ -1198,7 +1243,7 @@ class DeleteCallableObject(
                 self.add(param.init_delta_command(schema, sd.DeleteObject))
 
             return_type = scls.get_return_type(schema)
-            if op := return_type.as_type_delete_if_dead(schema):
+            if op := return_type.as_type_delete_if_unused(schema):
                 self.add_caused(op)
 
         return schema
@@ -1269,9 +1314,6 @@ class Function(
     initial_value = so.SchemaField(
         s_expr.Expression, default=None, compcoef=0.4, coerce=True)
 
-    has_dml = so.SchemaField(
-        bool, default=False)
-
     # This flag indicates that this function is intended to be used as
     # a generic fallback implementation for a particular polymorphic
     # function. The fallback implementation is exempted from the
@@ -1287,6 +1329,8 @@ class Function(
         inheritable=False,
         compcoef=0.909,
     )
+
+    is_inlined = so.SchemaField(bool, default=False)
 
     def has_inlined_defaults(self, schema: s_schema.Schema) -> bool:
         # This can be relaxed to just `language is EdgeQL` when we
@@ -1310,30 +1354,11 @@ class Function(
     ) -> str:
         return f"function '{self.get_signature_as_str(schema)}'"
 
-    def get_dummy_body(self, schema: s_schema.Schema) -> s_expr.Expression:
-        """Return a minimal function body that satisfies its return type."""
-        rt = self.get_return_type(schema)
-
-        if rt.is_scalar():
-            # scalars and enums can be cast from a string
-            text = f'SELECT <{rt.get_displayname(schema)}>""'
-        elif rt.is_object_type():
-            # just grab an object of the appropriate type
-            text = f'SELECT {rt.get_displayname(schema)} LIMIT 1'
-        else:
-            # Can't easily create a valid cast, so just cast empty set
-            # into the given type. Technically this potentially breaks
-            # cardinality requirement, but since this is a dummy
-            # expression it doesn't matter at the moment.
-            text = f'SELECT <{rt.get_displayname(schema)}>{{}}'
-
-        return s_expr.Expression(text=text)
-
     def find_object_param_overloads(
         self,
         schema: s_schema.Schema,
         *,
-        srcctx: Optional[parsing.ParserContext] = None,
+        span: Optional[parsing.Span] = None,
     ) -> Optional[Tuple[List[Function], int]]:
         """Find if this function overloads another in object parameter.
 
@@ -1410,7 +1435,7 @@ class Function(
                         f'overloading an object type-receiving '
                         f'function with differences in the remaining '
                         f'parameters is not supported',
-                        context=srcctx,
+                        span=span,
                         details=(
                             f"Other function is defined as `{other_sig}`"
                         )
@@ -1430,7 +1455,7 @@ class Function(
                         f'function: overloading an object type-receiving '
                         f'function with differences in the names of '
                         f'parameters is not supported',
-                        context=srcctx,
+                        span=span,
                         details=(
                             f"Other function is defined as `{other_sig}`"
                         )
@@ -1450,7 +1475,7 @@ class Function(
                         f'function: overloading an object type-receiving '
                         f'function with differences in the type modifiers of '
                         f'parameters is not supported',
-                        context=srcctx,
+                        span=span,
                         details=(
                             f"Other function is defined as `{other_sig}`"
                         )
@@ -1466,7 +1491,7 @@ class Function(
                         f'object type-receiving '
                         f'functions may not be overloaded on an OPTIONAL '
                         f'parameter',
-                        context=srcctx,
+                        span=span,
                     )
 
                 diff_param = this_diff_param
@@ -1491,10 +1516,10 @@ class FunctionCommand(
     def _classname_from_ast(
         cls,
         schema: s_schema.Schema,
-        astnode: qlast.NamedDDL,
+        astnode: qlast.ObjectDDL,
         context: sd.CommandContext,
     ) -> sn.QualName:
-        # _classname_from_ast signature expects qlast.NamedDDL,
+        # _classname_from_ast signature expects qlast.ObjectDDL,
         # but _get_param_desc_from_ast expects a ObjectDDL,
         # which is more specific
         assert isinstance(astnode, qlast.ObjectDDL)
@@ -1532,6 +1557,7 @@ class FunctionCommand(
                     apply_query_rewrites=not context.stdmode,
                     track_schema_ref_exprs=track_schema_ref_exprs,
                 ),
+                context=context,
             )
         elif field.name == 'nativecode':
             return self.compile_this_function(
@@ -1553,7 +1579,8 @@ class FunctionCommand(
     ) -> Optional[s_expr.Expression]:
         if field.name == 'nativecode':
             func = schema.get(self.classname, type=Function)
-            return func.get_dummy_body(schema)
+            rt = func.get_return_type(schema)
+            return s_types.type_dummy_expr(rt, schema)
         else:
             raise NotImplementedError(f'unhandled field {field.name!r}')
 
@@ -1635,24 +1662,11 @@ class FunctionCommand(
 
         ir = expr.irast
 
-        if ir.dml_exprs:
-            if context.allow_dml_in_functions:
-                # DML inside function body detected. Right now is a good
-                # opportunity to raise exceptions or give warnings.
-                self.set_attribute_value('has_dml', True)
-            else:
-                raise errors.InvalidFunctionDefinitionError(
-                    'data-modifying statements are not allowed in function'
-                    ' bodies',
-                    context=ir.dml_exprs[0].context,
-                )
-
         spec_volatility: Optional[ft.Volatility] = (
             self.get_specified_attribute_value('volatility', schema, context))
 
         if spec_volatility is None:
-            self.set_attribute_value('volatility', ir.volatility,
-                                     computed=True)
+            self.set_attribute_value('volatility', ir.volatility, computed=True)
 
         # If a volatility is specified, it can be more volatile than the
         # inferred volatility but not less.
@@ -1669,7 +1683,7 @@ class FunctionCommand(
                     f'{str(spec_volatility).lower()}',
                     details=f'Actual volatility is '
                             f'{str(ir.volatility).lower()}',
-                    context=body.qlast.context,
+                    span=body.parse().span,
                 )
 
         globs = {schema.get(glob.global_name, type=s_globals.Global)
@@ -1714,7 +1728,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                 f'cannot create the `{signature}` function: '
                 f'a function with the same signature '
                 f'is already defined',
-                context=self.source_context)
+                span=self.span)
 
         if not context.canonical:
             fullname = self.classname
@@ -1771,14 +1785,14 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                 f'cannot create `{signature}` function: '
                 f'"preserves_optionality" makes no sense '
                 f'in a non-aggregate function',
-                context=self.source_context)
+                span=self.span)
 
         if preserves_upper_card and not has_set_of:
             raise errors.InvalidFunctionDefinitionError(
                 f'cannot create `{signature}` function: '
                 f'"preserves_upper_cardinality" makes no sense '
                 f'in a non-aggregate function',
-                context=self.source_context)
+                span=self.span)
 
         if preserves_upper_card and (
             return_typemod is not ft.TypeModifier.SetOfType
@@ -1787,7 +1801,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                 f'cannot create `{signature}` function: '
                 f'"preserves_upper_cardinality" makes no sense '
                 f'in a function not returning SET OF',
-                context=self.source_context)
+                span=self.span)
 
         # Certain syntax is only allowed in "EdgeDB developer" mode,
         # i.e. when populating std library, etc.
@@ -1797,26 +1811,26 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'cannot create `{signature}` function: '
                     f'generic types are not supported in '
                     f'user-defined functions',
-                    context=self.source_context)
+                    span=self.span)
             elif from_function:
                 raise errors.InvalidFunctionDefinitionError(
                     f'cannot create `{signature}` function: '
                     f'"USING SQL FUNCTION" is not supported in '
                     f'user-defined functions',
-                    context=self.source_context)
+                    span=self.span)
             elif language != qlast.Language.EdgeQL:
                 raise errors.InvalidFunctionDefinitionError(
                     f'cannot create `{signature}` function: '
                     f'"USING {language}" is not supported in '
                     f'user-defined functions',
-                    context=self.source_context)
+                    span=self.span)
 
         if polymorphic_return_type and not has_polymorphic:
             raise errors.InvalidFunctionDefinitionError(
                 f'cannot create `{signature}` function: '
                 f'function returns a generic type but has no '
                 f'generic parameters',
-                context=self.source_context)
+                span=self.span)
 
         overloaded_funcs = schema.get_functions(shortname, ())
         has_from_function = from_function
@@ -1835,7 +1849,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'overloading another function with different '
                     f'named only parameters: '
                     f'"{func.get_signature_as_str(schema)}"',
-                    context=self.source_context)
+                    span=self.span)
 
             if ((has_polymorphic or func_params.has_polymorphic(schema)) and (
                     func.get_return_typemod(schema) != return_typemod)):
@@ -1848,7 +1862,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'function: overloading another function with different '
                     f'return type {func_return_typemod.to_edgeql()} '
                     f'{func.get_return_type(schema).get_displayname(schema)}',
-                    context=self.source_context)
+                    span=self.span)
 
             if fallback and func.get_fallback(schema) and self.scls != func:
                 raise errors.InvalidFunctionDefinitionError(
@@ -1857,7 +1871,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'{return_type.get_displayname(schema)}` '
                     f'function: only one generic fallback per polymorphic '
                     f'function is allowed',
-                    context=self.source_context)
+                    span=self.span)
 
             if func_from_function:
                 has_from_function = func_from_function
@@ -1868,7 +1882,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'overloading another function with different '
                     f'"preserves_optionality" attribute: '
                     f'`{func.get_signature_as_str(schema)}`',
-                    context=self.source_context)
+                    span=self.span)
 
             if func_preserves_upper_card != preserves_upper_card:
                 raise errors.InvalidFunctionDefinitionError(
@@ -1876,11 +1890,11 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'overloading another function with different '
                     f'"preserves_upper_cardinality" attribute: '
                     f'`{func.get_signature_as_str(schema)}`',
-                    context=self.source_context)
+                    span=self.span)
 
         if has_objects:
             self.scls.find_object_param_overloads(
-                schema, srcctx=self.source_context)
+                schema, span=self.span)
 
         if has_from_function:
             # Ignore the generic fallback when considering
@@ -1894,7 +1908,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                     f'overloading "USING SQL FUNCTION" functions is '
                     f'allowed only when all functions point to the same '
                     f'SQL function',
-                    context=self.source_context)
+                    span=self.span)
 
         if (language == qlast.Language.EdgeQL and
                 any(p.get_typemod(schema) is ft.TypeModifier.SetOfType
@@ -1903,7 +1917,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                 f'cannot create the `{signature}` function: '
                 f'SET OF parameters in user-defined EdgeQL functions are '
                 f'not supported',
-                context=self.source_context)
+                span=self.span)
 
         # check that params of type 'anytype' don't have defaults
         for p in params.objects(schema):
@@ -1914,13 +1928,13 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
             p_type = p.get_type(schema)
 
             try:
-                ir_default = p.get_ir_default(schema=schema)
+                ir_default = p.get_ir_default(schema=schema, context=context)
             except Exception as ex:
                 raise errors.InvalidFunctionDefinitionError(
                     f'cannot create the `{signature}` function: '
                     f'invalid default value {p_default.text!r} of parameter '
                     f'{p.get_displayname(schema)!r}: {ex}',
-                    context=self.source_context)
+                    span=self.span)
 
             check_default_type = True
             if p_type.is_polymorphic(schema):
@@ -1932,22 +1946,25 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                         f'polymorphic parameter of type '
                         f'{p_type.get_displayname(schema)} cannot '
                         f'have a non-empty default value',
-                        context=self.source_context)
+                        span=self.span)
             elif (p.get_typemod(schema) is ft.TypeModifier.OptionalType and
                     irutils.is_empty(ir_default.expr)):
                 check_default_type = False
 
             if check_default_type:
                 default_type = ir_default.stype
-                if not default_type.assignment_castable_to(p_type, schema):
+                if not default_type.assignment_castable_to(
+                    p_type, ir_default.schema
+                ):
                     raise errors.InvalidFunctionDefinitionError(
                         f'cannot create the `{signature}` function: '
                         f'invalid declaration of parameter '
                         f'{p.get_displayname(schema)!r}: '
                         f'unexpected type of the default expression: '
-                        f'{default_type.get_displayname(schema)}, expected '
+                        f'{default_type.get_displayname(ir_default.schema)}, '
+                        f'expected '
                         f'{p_type.get_displayname(schema)}',
-                        context=self.source_context)
+                        span=self.span)
 
         # Make sure variadic parameters do not contain optional types in
         # user-defined functions
@@ -1961,7 +1978,7 @@ class CreateFunction(CreateCallableObject[Function], FunctionCommand):
                         f'`{variadic.get_displayname(schema)}` '
                         f'illegally declared with optional type in '
                         f'user-defined function',
-                        context=self.source_context)
+                        span=self.span)
 
         return schema
 
@@ -2073,7 +2090,7 @@ class RenameFunction(RenameCallableObject[Function], FunctionCommand):
     def _classname_from_ast(
         cls,
         schema: s_schema.Schema,
-        astnode: qlast.NamedDDL,
+        astnode: qlast.ObjectDDL,
         context: sd.CommandContext,
     ) -> sn.QualName:
         ctx = context.current()
@@ -2107,7 +2124,7 @@ class RenameFunction(RenameCallableObject[Function], FunctionCommand):
         if len(existing) > 1:
             raise errors.SchemaError(
                 'renaming an overloaded function is not allowed',
-                context=self.source_context)
+                span=self.span)
 
         target = schema.get_functions(new_name, ())
         if target:
@@ -2115,7 +2132,7 @@ class RenameFunction(RenameCallableObject[Function], FunctionCommand):
                 f"can not rename function to '{new_name!s}' because "
                 f"a function with the same name already exists, and "
                 f"renaming into an overload is not supported",
-                context=self.source_context)
+                span=self.span)
 
 
 class AlterFunction(AlterCallableObject[Function], FunctionCommand):
@@ -2144,7 +2161,7 @@ class AlterFunction(AlterCallableObject[Function], FunctionCommand):
                     f'{self.scls.get_verbosename(schema)}: '
                     f'only one generic fallback per polymorphic '
                     f'function is allowed',
-                    context=self.source_context)
+                    span=self.span)
 
         # If volatility or nativecode changed, propagate that to
         # referring exprs
@@ -2173,7 +2190,7 @@ class AlterFunction(AlterCallableObject[Function], FunctionCommand):
 
         vn = scls.get_verbosename(schema, with_parent=True)
         schema = self._propagate_if_expr_refs(
-            schema, context, metadata_only=False, extra_refs=extra_refs,
+            schema, context, extra_refs=extra_refs,
             action=f'alter the definition of {vn}')
 
         return schema
@@ -2197,7 +2214,7 @@ class AlterFunction(AlterCallableObject[Function], FunctionCommand):
                 raise errors.EdgeQLSyntaxError(
                     'altering function code is only supported for '
                     'pure EdgeQL functions',
-                    context=astnode.context
+                    span=astnode.span
                 )
 
             nativecode_expr: Optional[qlast.Expr] = None
@@ -2354,13 +2371,13 @@ def get_params_symtable(
                     func=('std', 'bytes_get_bit'),
                     args=[
                         defaults_mask,
-                        qlast.IntegerConstant(value=str(pi)),
+                        qlast.Constant.integer(pi),
                     ]),
                 op='=',
-                right=qlast.IntegerConstant(value='0'),
+                right=qlast.Constant.integer(0),
             ),
             if_expr=anchors[p_shortname],
-            else_expr=qlast._Optional(expr=p_default.qlast),
+            else_expr=qlast.OptionalExpr(expr=p_default.parse()),
         )
 
     return anchors
@@ -2380,23 +2397,16 @@ def compile_function(
 ) -> s_expr.CompiledExpression:
     assert language is qlast.Language.EdgeQL
 
-    has_inlined_defaults = bool(params.find_named_only(schema))
-
-    param_anchors = get_params_symtable(
-        params,
-        schema,
-        inlined_defaults=has_inlined_defaults,
-    )
-
     compiled = body.compiled(
         schema,
-        options=qlcompiler.CompilerOptions(
-            anchors=param_anchors,
+        options=get_compiler_options(
+            schema,
+            context,
             func_name=func_name,
-            func_params=params,
-            apply_query_rewrites=not context.stdmode,
+            params=params,
             track_schema_ref_exprs=track_schema_ref_exprs,
         ),
+        context=context,
     )
 
     ir = compiled.irast
@@ -2409,7 +2419,7 @@ def compile_function(
             f'{return_type.get_verbosename(schema)}',
             details=f'Actual return type is '
                     f'{ir.stype.get_verbosename(schema)}',
-            context=body.qlast.context,
+            span=body.parse().span,
         )
 
     if (return_typemod is not ft.TypeModifier.SetOfType
@@ -2420,7 +2430,7 @@ def compile_function(
             details=(
                 f'Function may return a set with more than one element.'
             ),
-            context=body.qlast.context,
+            span=body.parse().span,
         )
     elif (return_typemod is ft.TypeModifier.SingletonType
             and ir.cardinality.can_be_zero()):
@@ -2430,7 +2440,187 @@ def compile_function(
             details=(
                 f'Function may return an empty set.'
             ),
-            context=body.qlast.context,
+            span=body.parse().span,
         )
 
     return compiled
+
+
+def compile_function_inline(
+    schema: s_schema.Schema,
+    context: sd.CommandContext,
+    *,
+    body: s_expr.Expression,
+    func_name: sn.QualName,
+    params: FuncParameterList,
+    language: qlast.Language,
+    return_type: s_types.Type,
+    return_typemod: ft.TypeModifier,
+    track_schema_ref_exprs: bool=False,
+    inlining_context: qlcontext.ContextLevel,
+) -> irast.Set:
+    """Compile a function body to be inlined."""
+    assert language is qlast.Language.EdgeQL
+
+    from edb.edgeql.compiler import dispatch
+    from edb.edgeql.compiler import pathctx
+    from edb.edgeql.compiler import setgen
+    from edb.edgeql.compiler import stmtctx
+
+    ctx = stmtctx.init_context(
+        schema=schema,
+        options=get_compiler_options(
+            schema,
+            context,
+            func_name=func_name,
+            params=params,
+            track_schema_ref_exprs=track_schema_ref_exprs,
+            inlining_context=inlining_context,
+        ),
+        inlining_context=inlining_context,
+    )
+
+    ql_expr = body.parse()
+
+    # Wrap argument paths
+    param_names: set[str] = {
+        param.get_parameter_name(inlining_context.env.schema)
+        for param in params.objects(inlining_context.env.schema)
+    }
+    argument_path_wrapper = ArgumentPathWrapper(param_names)
+    ql_expr = argument_path_wrapper.visit(ql_expr)
+
+    # Add implicit limit if present
+    if ctx.implicit_limit:
+        ql_expr = qlast.SelectQuery(result=ql_expr, implicit=True)
+        ql_expr.limit = qlast.Constant.integer(ctx.implicit_limit)
+
+    ir_set: irast.Set = dispatch.compile(ql_expr, ctx=ctx)
+
+    # Copy schema back to inlining context
+    if inlining_context:
+        inlining_context.env.schema = ctx.env.schema
+
+    # Create scoped set if necessary
+    if pathctx.get_set_scope(ir_set, ctx=ctx) is None:
+        ir_set = setgen.scoped_set(ir_set, ctx=ctx)
+
+    return ir_set
+
+
+class ArgumentPathWrapper(ast.NodeTransformer):
+    # Wrap paths based on the inlined arguments which are arguments to other
+    # inlined functions.
+    #
+    # Given the functions:
+    #   function inner(x: int64) -> int64 using (x);
+    #   function outer(x: int64) -> int64 using (inner(x));
+    #
+    # Before inlining the outer function, the irast may look like this:
+    #   FunctionCall outer
+    #     CallArg: Set expr~1: Parameter x
+    #     Body
+    #       Set: FunctionCall inner
+    #         CallArg: Set expr~2: Parameter x
+    #         Body
+    #           SelectStmt: Set expr~2: InlinedParameterExpr
+    #
+    # The outer function will then inline, `Parameter x`:
+    #   FunctionCall outer
+    #     CallArg: Set expr~1: Parameter x
+    #     Body
+    #       Set: FunctionCall inner
+    #         CallArg: Set expr~1: InlinedParameterExpr
+    #         Body
+    #           SelectStmt: Set expr~2: InlinedParameterExpr
+    #
+    # And the definition of `Set expr~2` will be removed.
+    #
+    # To ensure outer function inlines `Parameter x` while keeping the path id
+    # of the inner function, wrap the parameter with a Select:
+    #   FunctionCall outer
+    #     CallArg: Set expr~1: Parameter x
+    #     Body
+    #       Set: FunctionCall inner
+    #         CallArg: Set expr~2: SelectStmt: Set expr~1: Parameter x
+    #         Body
+    #           SelectStmt: Set expr~2: InlinedParameterExpr
+
+    def __init__(
+        self,
+        param_names: set[str],
+    ) -> None:
+        super().__init__()
+        self.param_names = param_names
+
+    def visit_FunctionCall(self, node: qlast.FunctionCall) -> qlast.Base:
+        has_direct_args = False
+        new_args: list[qlast.Expr] = []
+        new_kwargs: dict[str, qlast.Expr] = {}
+
+        for arg in node.args:
+            if (
+                isinstance(arg, qlast.Path)
+                and isinstance(arg.steps[0], qlast.ObjectRef)
+                and arg.steps[0].name in self.param_names
+            ):
+                has_direct_args = True
+                new_args.append(qlast.SelectQuery(result=arg))
+
+            else:
+                new_args.append(arg)
+
+        for arg_name, arg in node.kwargs.items():
+            if (
+                isinstance(arg, qlast.Path)
+                and isinstance(arg.steps[0], qlast.ObjectRef)
+                and arg.steps[0].name in self.param_names
+            ):
+                has_direct_args = True
+                new_kwargs[arg_name] = qlast.SelectQuery(result=arg)
+
+            else:
+                new_kwargs[arg_name] = arg
+
+        if has_direct_args:
+            node = node.replace(args=new_args, kwargs=new_kwargs)
+
+        return cast(qlast.Base, self.generic_visit(node))
+
+
+def get_compiler_options(
+    schema: s_schema.Schema,
+    context: sd.CommandContext,
+    *,
+    func_name: sn.QualName,
+    params: FuncParameterList,
+    track_schema_ref_exprs: bool,
+    inlining_context: Optional[qlcontext.ContextLevel] = None,
+) -> qlcompiler.CompilerOptions:
+
+    has_inlined_defaults = (
+        bool(params.find_named_only(schema))
+        and inlining_context is None
+    )
+
+    param_anchors = get_params_symtable(
+        params,
+        schema,
+        inlined_defaults=has_inlined_defaults,
+    )
+
+    return qlcompiler.CompilerOptions(
+        anchors=param_anchors,
+        func_name=(
+            inlining_context.env.options.func_name
+            if inlining_context is not None else
+            func_name
+        ),
+        func_params=(
+            inlining_context.env.options.func_params
+            if inlining_context is not None else
+            params
+        ),
+        apply_query_rewrites=not context.stdmode,
+        track_schema_ref_exprs=track_schema_ref_exprs,
+    )

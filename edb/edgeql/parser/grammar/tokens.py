@@ -22,27 +22,22 @@ from __future__ import annotations
 import re
 import sys
 import types
+import typing
 
 from edb.common import parsing
 
 from . import keywords
-from . import precedence
 
 
 clean_string = re.compile(r"'(?:\s|\n)+'")
 string_quote = re.compile(r'\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$')
 
 
-class TokenMeta(parsing.TokenMeta):
+class Token(parsing.Token, is_internal=True):
     pass
 
 
-class Token(parsing.Token, metaclass=TokenMeta,
-            precedence_class=precedence.PrecedenceMeta):
-    pass
-
-
-class GrammarToken(Token):
+class GrammarToken(Token, is_internal=True):
     """
     Instead of having different grammars, we prefix each query with a special
     grammar token which directs the parser to appropriate grammar.
@@ -69,6 +64,18 @@ class T_STARTMIGRATION(GrammarToken):
 
 
 class T_STARTSDLDOCUMENT(GrammarToken):
+    pass
+
+
+class T_STRINTERPSTART(GrammarToken):
+    pass
+
+
+class T_STRINTERPCONT(GrammarToken):
+    pass
+
+
+class T_STRINTERPEND(GrammarToken):
     pass
 
 
@@ -164,7 +171,12 @@ class T_AT(Token, lextoken='@'):
     pass
 
 
-class T_ARGUMENT(Token):
+class T_PARAMETER(Token):
+    pass
+
+
+class T_PARAMETERANDTYPE(Token):
+    # A special token produced by normalization
     pass
 
 
@@ -208,10 +220,6 @@ class T_NAMEDONLY(Token, lextoken='named only'):
     pass
 
 
-class T_SETANNOTATION(Token, lextoken='set annotation'):
-    pass
-
-
 class T_SETTYPE(Token, lextoken='set type'):
     pass
 
@@ -248,10 +256,6 @@ class T_SCONST(Token):
     pass
 
 
-class T_RSCONST(Token):
-    pass
-
-
 class T_DISTINCTFROM(Token, lextoken="?!="):
     pass
 
@@ -276,12 +280,12 @@ class T_IDENT(Token):
     pass
 
 
-class T_SUBSTITUTION(Token):
+class T_EOI(Token):
     pass
 
 
-class T_EOF(Token):
-    pass
+# explicitly define tokens which are referenced elsewhere
+T_THEN: typing.Optional[Token] = None
 
 
 def _gen_keyword_tokens():
@@ -295,7 +299,7 @@ def _gen_keyword_tokens():
 
     for token, _ in keywords.edgeql_keywords.values():
         clsname = 'T_{}'.format(token)
-        clskwds = dict(metaclass=parsing.TokenMeta, token=token)
+        clskwds = dict(token=token)
         cls = types.new_class(clsname, (Token,), clskwds, clsexec)
         setattr(mod, clsname, cls)
 

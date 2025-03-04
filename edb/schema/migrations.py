@@ -21,7 +21,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Optional, TYPE_CHECKING
 
 from edb import errors
 
@@ -67,6 +67,10 @@ class Migration(
     )
 
     script = so.SchemaField(
+        str,
+    )
+
+    sdl = so.SchemaField(
         str,
     )
 
@@ -130,12 +134,14 @@ class CreateMigration(MigrationCommand, sd.CreateObject[Migration]):
         hasher.add_source(ddl_text)
         name = hasher.make_migration_id()
 
+        sdl_text: Optional[str] = astnode.target_sdl
+
         if specified_name is not None and name != specified_name:
             raise errors.SchemaDefinitionError(
                 f'specified migration name does not match the name derived '
                 f'from the migration contents: {specified_name!r}, expected '
                 f'{name!r}',
-                context=astnode.name.context,
+                span=astnode.name.span,
             )
 
         if specified_name is not None and schema.has_migration(specified_name):
@@ -144,7 +150,7 @@ class CreateMigration(MigrationCommand, sd.CreateObject[Migration]):
             # parent (and you can't specify parent without a name).
             raise errors.DuplicateMigrationError(
                 f'migration {name!r} is already applied',
-                context=astnode.name.context,
+                span=astnode.name.span,
             )
 
         if astnode.parent is not None:
@@ -152,7 +158,7 @@ class CreateMigration(MigrationCommand, sd.CreateObject[Migration]):
                 if astnode.parent.name.lower() != 'initial':
                     raise errors.SchemaDefinitionError(
                         f'specified migration parent does not exist',
-                        context=astnode.parent.context,
+                        span=astnode.parent.span,
                     )
             else:
                 astnode_parent = s_utils.ast_objref_to_object_shell(
@@ -167,11 +173,12 @@ class CreateMigration(MigrationCommand, sd.CreateObject[Migration]):
                     raise errors.SchemaDefinitionError(
                         f'specified migration parent is not the most recent '
                         f'migration, expected {str(actual_parent_name)!r}',
-                        context=astnode.parent.context,
+                        span=astnode.parent.span,
                     )
 
         cmd = cls(classname=sn.UnqualName(name))
         cmd.set_attribute_value('script', ddl_text)
+        cmd.set_attribute_value('sdl', sdl_text)
         cmd.set_attribute_value('builtin', False)
         cmd.set_attribute_value('internal', False)
         if parent is not None:
@@ -199,6 +206,43 @@ class CreateMigration(MigrationCommand, sd.CreateObject[Migration]):
         assert isinstance(cmd, CreateMigration)
 
         return cmd
+
+    def apply(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+    ) -> s_schema.Schema:
+        from . import ddl as s_ddl
+
+        new_schema = super().apply(schema, context)
+
+        if (
+            context.store_migration_sdl
+            and not self.get_attribute_value('sdl')
+        ):
+            # If target sdl was not known in advance, compute it now.
+            new_sdl: str = s_ddl.sdl_text_from_schema(new_schema)
+            new_schema = self.scls.set_field_value(new_schema, 'sdl', new_sdl)
+            self.set_attribute_value('sdl', new_sdl)
+
+        return new_schema
+
+    def apply_subcommands(
+        self,
+        schema: s_schema.Schema,
+        context: sd.CommandContext,
+    ) -> s_schema.Schema:
+        assert not self.get_prerequisites() and not self.get_caused()
+        # Renames shouldn't persist between commands in a migration script.
+        context.renames.clear()
+        for op in self.get_subcommands(
+            include_prerequisites=False,
+            include_caused=False,
+        ):
+            if not isinstance(op, sd.AlterObjectProperty):
+                schema = op.apply(schema, context=context)
+                context.renames.clear()
+        return schema
 
     def _get_ast(
         self,
@@ -243,3 +287,27 @@ class AlterMigration(MigrationCommand, sd.AlterObject[Migration]):
 class DeleteMigration(MigrationCommand, sd.DeleteObject[Migration]):
 
     astnode = qlast.DropMigration
+
+
+def get_ordered_migrations(
+    schema: s_schema.Schema,
+) -> list[Migration]:
+    '''Get all the migrations, in order.
+
+    It would be nice if our toposort could do this for us, but
+    toposort is implemented recursively, and it would be a pain to
+    change that.
+
+    '''
+    output = []
+    mig = schema.get_last_migration()
+    while mig:
+        output.append(mig)
+
+        parents = mig.get_parents(schema).objects(schema)
+        assert len(parents) <= 1, "only one parent supported currently"
+        mig = parents[0] if parents else None
+
+    output.reverse()
+
+    return output

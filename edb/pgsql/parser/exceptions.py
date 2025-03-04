@@ -16,27 +16,51 @@
 # limitations under the License.
 #
 
-
+import re
 from typing import Any, Optional
 
 
 class PSqlParseError(Exception):
-    def __init__(self, message, lineno, cursorpos):
+    pass
+
+
+class PSqlSyntaxError(PSqlParseError):
+    def __init__(
+        self,
+        message: str,
+        cursor_pos: int,  # 0-based
+        query_source: str,
+    ):
         self.message = message
-        self.lineno = lineno
-        self.cursorpos = cursorpos
+        self.cursor_pos = cursor_pos
+        self.query_source = query_source
 
     def __str__(self):
         return self.message
 
 
-class PSqlUnsupportedError(Exception):
+class PSqlUnsupportedError(PSqlParseError):
+    node: Optional[Any]
+    location: Optional[int]
+    message: str
+
     def __init__(self, node: Optional[Any] = None, feat: Optional[str] = None):
         self.node = node
         self.location = None
-        self.message = "unsupported SQL feature"
+        self.message = "not supported"
         if feat:
-            self.message += f" `{feat}`"
+            self.message += f": {feat}"
 
     def __str__(self):
         return self.message
+
+
+def get_node_name(name: str) -> str:
+    """
+    Given a node name (CreateTableStmt), this function tries to guess the SQL
+    command text (CREATE TABLE).
+    """
+
+    name = name.removesuffix('Stmt').removesuffix('Expr')
+    name = re.sub(r'(?<!^)(?=[A-Z])', ' ', name)
+    return name.upper()

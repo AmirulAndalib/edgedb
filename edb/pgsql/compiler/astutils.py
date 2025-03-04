@@ -22,11 +22,12 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Optional, Union, Iterator, Sequence, List, TYPE_CHECKING
 
 from edb.ir import typeutils as irtyputils
 
 from edb.pgsql import ast as pgast
+from edb.pgsql import common
 from edb.pgsql import types as pg_types
 
 if TYPE_CHECKING:
@@ -41,12 +42,14 @@ def tuple_element_for_shape_el(
     *,
     ctx: context.CompilerContextLevel
 ) -> pgast.TupleElementBase:
+    from edb.ir import ast as irast
+
     if shape_el.path_id.is_type_intersection_path():
-        assert shape_el.rptr is not None
-        rptr = shape_el.rptr.source.rptr
+        assert isinstance(shape_el.expr, irast.Pointer)
+        rptr = shape_el.expr.source.expr
     else:
-        rptr = shape_el.rptr
-    assert rptr is not None
+        rptr = shape_el.expr
+    assert isinstance(rptr, irast.Pointer)
     ptrref = rptr.ptrref
     ptrname = ptrref.shortname
 
@@ -249,10 +252,7 @@ def extend_select_op(
 
 
 def new_unop(op: str, expr: pgast.BaseExpr) -> pgast.Expr:
-    return pgast.Expr(
-        name=op,
-        rexpr=expr
-    )
+    return pgast.Expr(name=op, rexpr=expr)
 
 
 def join_condition(
@@ -276,6 +276,7 @@ def safe_array_expr(
     elements: List[pgast.BaseExpr],
     *,
     ser_safe: bool = False,
+    ctx: context.CompilerContextLevel,
 ) -> pgast.BaseExpr:
     result: pgast.BaseExpr = pgast.ArrayExpr(
         elements=elements,
@@ -283,7 +284,7 @@ def safe_array_expr(
     )
     if any(el.nullable for el in elements):
         result = pgast.FuncCall(
-            name=('edgedb', '_nullif_array_nulls'),
+            name=edgedb_func('_nullif_array_nulls', ctx=ctx),
             args=[result],
             ser_safe=ser_safe,
         )
@@ -306,10 +307,12 @@ def find_column_in_subselect_rvar(
 
 
 def get_column(
-        rvar: pgast.BaseRangeVar,
-        colspec: Union[str, pgast.ColumnRef], *,
-        is_packed_multi: bool=True,
-        nullable: Optional[bool]=None) -> pgast.ColumnRef:
+    rvar: pgast.BaseRangeVar,
+    colspec: Union[str, pgast.ColumnRef],
+    *,
+    is_packed_multi: bool = True,
+    nullable: Optional[bool] = None,
+) -> pgast.ColumnRef:
 
     if isinstance(colspec, pgast.ColumnRef):
         colname = colspec.name[-1]
@@ -364,8 +367,8 @@ def get_column(
 
 
 def get_rvar_var(
-        rvar: pgast.BaseRangeVar,
-        var: pgast.OutputVar) -> pgast.OutputVar:
+    rvar: pgast.BaseRangeVar, var: pgast.OutputVar
+) -> pgast.OutputVar:
 
     fieldref: pgast.OutputVar
 
@@ -399,9 +402,11 @@ def get_rvar_var(
 
 
 def strip_output_var(
-        var: pgast.OutputVar, *,
-        optional: Optional[bool]=None,
-        nullable: Optional[bool]=None) -> pgast.OutputVar:
+    var: pgast.OutputVar,
+    *,
+    optional: Optional[bool] = None,
+    nullable: Optional[bool] = None,
+) -> pgast.OutputVar:
 
     result: pgast.OutputVar
 
@@ -448,7 +453,7 @@ def select_is_simple(stmt: pgast.SelectStmt) -> bool:
         not stmt.distinct_clause
         and not stmt.where_clause
         and not stmt.group_clause
-        and not stmt.having
+        and not stmt.having_clause
         and not stmt.window_clause
         and not stmt.values
         and not stmt.sort_clause
@@ -563,3 +568,14 @@ def maybe_unpack_row(expr: pgast.Base) -> Sequence[pgast.BaseExpr]:
         case pgast.RowExpr():
             return expr.args
     return (expr,)
+
+
+def edgedb_func(
+    name: str,
+    *,
+    ctx: context.CompilerContextLevel
+) -> tuple[str, ...]:
+    return common.maybe_versioned_name(
+        ('edgedb', name),
+        versioned=ctx.env.versioned_stdlib,
+    )

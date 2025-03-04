@@ -14,7 +14,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Mapping, NamedTuple
 
 import enum
 import functools
@@ -40,6 +40,8 @@ class BackendCapabilities(enum.IntFlag):
     CREATE_ROLE = 1 << 3
     #: Whether CREATE DATABASE is allowed
     CREATE_DATABASE = 1 << 4
+    #: Whether extension "edb_stat_statements" is available
+    STAT_STATEMENTS = 1 << 5
 
 
 ALL_BACKEND_CAPABILITIES = (
@@ -48,6 +50,7 @@ ALL_BACKEND_CAPABILITIES = (
     | BackendCapabilities.C_UTF8_LOCALE
     | BackendCapabilities.CREATE_ROLE
     | BackendCapabilities.CREATE_DATABASE
+    | BackendCapabilities.STAT_STATEMENTS
 )
 
 
@@ -111,6 +114,13 @@ class BackendRuntimeParams(NamedTuple):
             & BackendCapabilities.CREATE_DATABASE
         )
 
+    @property
+    def has_stat_statements(self) -> bool:
+        return self.has_superuser_access and bool(
+            self.instance_params.capabilities
+            & BackendCapabilities.STAT_STATEMENTS
+        )
+
 
 @functools.lru_cache
 def get_default_runtime_params(
@@ -126,8 +136,24 @@ def get_default_runtime_params(
             **instance_params,
         )
     if 'version' not in instance_params:
+        try:
+            version = buildmeta.get_pg_version()
+        except buildmeta.MetadataError as _:
+            # HACK: if get_pg_version fails, this means we have no pg_config,
+            # which happens for edgedb-ls. It is invoking pg compiler from
+            # schema delta. Ideally, schema delta would not need pg compiler,
+            # but that would require a lot of cleanups.
+            version = BackendVersion(
+                major=100,
+                minor=0,
+                micro=0,
+                releaselevel='final',
+                serial=0,
+                string='100.0'
+            )
+
         instance_params = dict(
-            version=buildmeta.get_pg_version(),
+            version=version,
             **instance_params,
         )
 

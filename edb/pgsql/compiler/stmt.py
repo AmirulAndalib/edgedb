@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Optional
 
 from edb import errors
 
@@ -32,15 +32,17 @@ from . import astutils
 from . import clauses
 from . import context
 from . import dispatch
+from . import enums as pgce
 from . import group
 from . import dml
+from . import output
 from . import pathctx
 
 
 @dispatch.compile.register(irast.SelectStmt)
 def compile_SelectStmt(
-        stmt: irast.SelectStmt, *,
-        ctx: context.CompilerContextLevel) -> pgast.BaseExpr:
+    stmt: irast.SelectStmt, *, ctx: context.CompilerContextLevel
+) -> pgast.BaseExpr:
 
     if ctx.singleton_mode:
         if not irutils.is_trivial_select(stmt):
@@ -52,7 +54,7 @@ def compile_SelectStmt(
     parent_ctx = ctx
     with parent_ctx.substmt() as ctx:
         # Common setup.
-        clauses.compile_dml_bindings(stmt, ctx=ctx)
+        clauses.compile_volatile_bindings(stmt, ctx=ctx)
 
         query = ctx.stmt
 
@@ -78,8 +80,8 @@ def compile_SelectStmt(
                 with ctx.new() as ictx:
                     clauses.setup_iterator_volatility(last_iterator, ctx=ictx)
                     iterator_rvar = clauses.compile_iterator_expr(
-                        query, iterator_set, ctx=ictx)
-                for aspect in {'identity', 'value'}:
+                        query, iterator_set, is_dml=False, ctx=ictx)
+                for aspect in {pgce.PathAspect.IDENTITY, pgce.PathAspect.VALUE}:
                     pathctx.put_path_rvar(
                         query,
                         path_id=iterator_set.path_id,
@@ -111,19 +113,20 @@ def compile_SelectStmt(
                     query.sort_clause = clauses.compile_orderby_clause(
                         stmt.orderby, ctx=octx)
 
-        if outvar.nullable and query is ctx.toplevel_stmt:
-            # A nullable var has bubbled up to the top,
-            # filter out NULLs.
-            valvar: pgast.BaseExpr = pathctx.get_path_value_var(
+        # Need to filter out NULLs in certain cases:
+        if outvar.nullable and (
+            # A nullable var has bubbled up to the top
+            query is ctx.toplevel_stmt
+            # The cardinality is being overridden, so we need to make
+            # sure there aren't extra NULLs in single set
+            or stmt.card_inference_override
+            # There is a LIMIT or OFFSET clause and NULLs would interfere
+            or stmt.limit
+            or stmt.offset
+        ):
+            valvar = pathctx.get_path_value_var(
                 query, stmt.result.path_id, env=ctx.env)
-            if isinstance(valvar, pgast.TupleVar):
-                valvar = pgast.ImplicitRowExpr(
-                    args=[e.val for e in valvar.elements])
-
-            query.where_clause = astutils.extend_binop(
-                query.where_clause,
-                pgast.NullTest(arg=valvar, negated=True)
-            )
+            output.add_null_test(valvar, query)
 
         # The OFFSET clause
         query.limit_offset = clauses.compile_limit_offset_clause(
@@ -138,15 +141,15 @@ def compile_SelectStmt(
 
 @dispatch.compile.register(irast.GroupStmt)
 def compile_GroupStmt(
-        stmt: irast.GroupStmt, *,
-        ctx: context.CompilerContextLevel) -> pgast.BaseExpr:
+    stmt: irast.GroupStmt, *, ctx: context.CompilerContextLevel
+) -> pgast.BaseExpr:
     return group.compile_group(stmt, ctx=ctx)
 
 
 @dispatch.compile.register(irast.InsertStmt)
 def compile_InsertStmt(
-        stmt: irast.InsertStmt, *,
-        ctx: context.CompilerContextLevel) -> pgast.Query:
+    stmt: irast.InsertStmt, *, ctx: context.CompilerContextLevel
+) -> pgast.Query:
 
     parent_ctx = ctx
     with parent_ctx.substmt() as ctx:
@@ -172,8 +175,8 @@ def compile_InsertStmt(
 
 @dispatch.compile.register(irast.UpdateStmt)
 def compile_UpdateStmt(
-        stmt: irast.UpdateStmt, *,
-        ctx: context.CompilerContextLevel) -> pgast.Query:
+    stmt: irast.UpdateStmt, *, ctx: context.CompilerContextLevel
+) -> pgast.Query:
 
     parent_ctx = ctx
     with parent_ctx.substmt() as ctx:
@@ -200,8 +203,8 @@ def compile_UpdateStmt(
 
 @dispatch.compile.register(irast.DeleteStmt)
 def compile_DeleteStmt(
-        stmt: irast.DeleteStmt, *,
-        ctx: context.CompilerContextLevel) -> pgast.Query:
+    stmt: irast.DeleteStmt, *, ctx: context.CompilerContextLevel
+) -> pgast.Query:
 
     parent_ctx = ctx
     with parent_ctx.substmt() as ctx:

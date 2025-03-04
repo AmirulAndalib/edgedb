@@ -277,6 +277,7 @@ class TestTriggers(tb.QueryTestCase):
 
     # MULTI!
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_triggers_multi_insert_01(self):
         await self.con.execute('''
             alter type InsertTest {
@@ -295,6 +296,7 @@ class TestTriggers(tb.QueryTestCase):
             {'name': "insert", 'notes': set("abcdef")},
         ])
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_triggers_multi_mixed_01(self):
         # Install triggers for everything
         await self.con.execute('''
@@ -331,6 +333,7 @@ class TestTriggers(tb.QueryTestCase):
             {'name': "update", 'notes': set(f'{x} -> {x}!' for x in "abcdef")},
         ])
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_triggers_multi_mixed_02(self):
         # Install double and triple triggers
         await self.con.execute('''
@@ -466,7 +469,7 @@ class TestTriggers(tb.QueryTestCase):
             {"name": "old", "notes": {"b!"}},
             {"name": "old", "notes": {"d"}},
             {"name": "old", "notes": {"c", "e"}},
-            {"name": "old", "notes": ["c!", "e!", "f!"]},
+            {"name": "old", "notes": {"c!", "e!", "f!"}},
         ])
 
         await self.assert_query_result(
@@ -1077,7 +1080,7 @@ class TestTriggers(tb.QueryTestCase):
     async def test_edgeql_triggers_chain_02(self):
         async with self.assertRaisesRegexTx(
                 edgedb.SchemaDefinitionError,
-                'trigger on default::InsertTest is recursive'):
+                'trigger on default::InsertTest after insert is recursive'):
             await self.con.execute('''
                 alter type InsertTest {
                   create trigger log after insert for each do (
@@ -1102,13 +1105,75 @@ class TestTriggers(tb.QueryTestCase):
 
         async with self.assertRaisesRegexTx(
                 edgedb.QueryError,
-                'would need to be executed in multiple stages'):
+                'would need to be executed in multiple stages on default::Note '
+                'after insert'):
             await self.con.execute('''
                 select {
                     (insert InsertTest { name := "foo" }),
                     (insert Note { name := "foo" }),
                 }
             ''')
+
+    async def test_edgeql_triggers_chain_04(self):
+        await self.con.execute('''
+            alter type InsertTest {
+              create trigger log after update for each do (
+                insert InsertTest { name := __new__.name ++ "!" }
+              );
+            };
+        ''')
+
+        await self.con.execute('''
+            insert InsertTest { name := "test" }
+        ''')
+
+        await self.con.execute('''
+            update InsertTest
+            filter InsertTest.name = "test"
+            set { name := "updated" }
+        ''')
+
+        await self.assert_query_result(
+            '''
+            select InsertTest { name }
+            ''',
+            [{'name': 'updated'}, {'name': 'updated!'}],
+        )
+
+    async def test_edgeql_triggers_chain_05(self):
+        await self.con.execute('''
+            alter type InsertTest {
+              create trigger log after insert for each do (
+                insert Note { name := "insert", note := __new__.name }
+              );
+            };
+        ''')
+
+        await self.con.execute('''
+            select {
+                (insert Note { name := "foo" }),
+            }
+        ''')
+
+        await self.assert_notes([
+            {'name': "foo", 'notes': set()},
+        ])
+
+        await self.con.execute('''
+            select {
+                (insert InsertTest { name := "foo_insert" }),
+                (
+                  update Note
+                  filter Note.name = "foo"
+                  set { name := "foo_update" }
+                ),
+            }
+        ''')
+
+        await self.assert_notes([
+            {'name': "foo_update", 'notes': set()},
+            {'name': "insert", 'notes': set(["foo_insert"])},
+        ])
 
     async def test_edgeql_triggers_tricky_01(self):
         await self.con.execute('''
@@ -1219,6 +1284,7 @@ class TestTriggers(tb.QueryTestCase):
             tb.bag(['a!', 'b', 'b!', 'c', 'c!', 'd', 'd!', 'e', 'e!', 'f']),
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_triggers_when_02(self):
         await self.con.execute('''
             alter type InsertTest {
@@ -1304,7 +1370,7 @@ class TestTriggers(tb.QueryTestCase):
             ['c'],
         )
 
-    async def test_edgeql_triggers_when_bad(self):
+    async def test_edgeql_triggers_when_bad_01(self):
         async with self.assertRaisesRegexTx(
                 edgedb.SchemaDefinitionError,
                 r"data-modifying statements are not allowed"):
@@ -1317,3 +1383,48 @@ class TestTriggers(tb.QueryTestCase):
                   );
                 };
             ''')
+
+    async def test_edgeql_triggers_when_bad_02(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.SchemaDefinitionError,
+                r"when expression.*is of invalid type"):
+            await self.con.query('''
+                alter type InsertTest {
+                  create trigger log_new after insert, update for each
+                  when (())
+                  do (
+                    insert Note { name := "new", note := __new__.name }
+                  );
+                };
+            ''')
+
+    async def test_edgeql_triggers_cached_global_01(self):
+        # Install FOR ALL triggers for everything
+        await self.con.execute('''
+            create alias CA := count(InsertTest);
+            create global CG := count(InsertTest);
+            create type X {
+                create access policy asdf allow all using (global CG > 0)
+            };
+            alter type InsertTest {
+              create trigger log after insert for each
+              do (
+                insert Note {
+                    name := <str>assert_single(CA),
+                    note := <str>(global CG),
+                }
+              );
+            };
+        ''')
+
+        await self.con.execute('''
+            insert InsertTest { name := <str>((global CG)) };
+        ''')
+        await self.assert_query_result(
+            '''
+            select Note { name, note }
+            ''',
+            [
+                {'name': '1', 'note': '1'},
+            ],
+        )

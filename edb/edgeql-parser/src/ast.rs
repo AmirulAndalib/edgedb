@@ -4,6 +4,7 @@
 
 //! Abstract Syntax Tree for EdgeQL
 #![allow(non_camel_case_types)]
+#![cfg(never)] // TODO: migrate cpython-rust to pyo3
 
 use indexmap::IndexMap;
 
@@ -1018,6 +1019,7 @@ pub enum CreateObjectKind {
     CreateFunction(CreateFunction),
     CreateOperator(CreateOperator),
     CreateCast(CreateCast),
+    CreateIndexMatch(CreateIndexMatch),
 }
 
 #[derive(Debug, Clone)]
@@ -1095,6 +1097,7 @@ pub enum DropObjectKind {
     DropFunction(DropFunction),
     DropOperator(DropOperator),
     DropCast(DropCast),
+    DropIndexMatch(DropIndexMatch),
 }
 
 #[derive(Debug, Clone)]
@@ -1211,6 +1214,7 @@ pub struct CommitMigrationRewrite {}
 #[cfg_attr(feature = "python", derive(IntoPython))]
 pub struct CreateDatabase {
     pub template: Option<ObjectRef>,
+    pub branch_type: BranchType,
 }
 
 #[derive(Debug, Clone)]
@@ -1519,6 +1523,14 @@ pub struct AlterConcreteIndex {}
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "python", derive(IntoPython))]
 pub struct DropConcreteIndex {}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "python", derive(IntoPython))]
+pub struct CreateIndexMatch {}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "python", derive(IntoPython))]
+pub struct DropIndexMatch {}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "python", derive(IntoPython))]
@@ -1908,6 +1920,7 @@ pub enum Volatility {
     Immutable,
     Stable,
     Volatile,
+    Modifying,
 }
 
 #[derive(Debug, Clone)]
@@ -2042,4 +2055,13 @@ pub enum ConfigScope {
     DATABASE,
     SESSION,
     GLOBAL,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "python", derive(IntoPython))]
+#[cfg_attr(feature = "python", py_enum(qlast.BranchType))]
+pub enum BranchType {
+    EMPTY,
+    SCHEMA,
+    DATA,
 }

@@ -200,6 +200,19 @@ class TestEdgeQLFor(tb.QueryTestCase):
             }
         )
 
+    async def test_edgeql_for_implicit_limit_01(self):
+        await self.assert_query_result(
+            r'''
+                select sum((
+                  for i in range_unpack(range(0, 10000)) union
+                    1
+                ));
+            ''',
+            [10000],
+            implicit_limit=100,
+        )
+
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_for_filter_02(self):
         await self.assert_query_result(
             r'''
@@ -223,6 +236,7 @@ class TestEdgeQLFor(tb.QueryTestCase):
             }
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_for_filter_03(self):
         await self.assert_query_result(
             r'''
@@ -341,16 +355,12 @@ class TestEdgeQLFor(tb.QueryTestCase):
                     select_deck := ((
                         WITH cards := (
                             FOR letter IN {'I', 'B'}
-                            UNION (
-                                FOR copy IN {'1', '2'}
-                                UNION (
-                                    SELECT User.deck {
-                                        name,
-                                        letter := letter ++ copy
-                                    }
-                                    FILTER User.deck.name[0] = letter
-                                )
-                            )
+                            FOR copy IN {'1', '2'}
+                            SELECT User.deck {
+                                name,
+                                letter := letter ++ copy
+                            }
+                            FILTER User.deck.name[0] = letter
                         )
                         SELECT cards ORDER BY .name THEN .letter
                     ),)
@@ -382,9 +392,9 @@ class TestEdgeQLFor(tb.QueryTestCase):
                 } FILTER .name = 'Alice'
             """,
             [{
-                "select_deck" : [
-                    {"name" : "Imp", "count" : 1},
-                    {"name" : "Dragon", "count" : 2},
+                "select_deck": [
+                    {"name": "Imp", "count": 1},
+                    {"name": "Dragon", "count": 2},
                 ],
             }],
         )
@@ -682,14 +692,16 @@ class TestEdgeQLFor(tb.QueryTestCase):
                         {
                             "name": "Bog monster",
                             "letter": {"B!!", "B!?"},
-                            "correlated": {("!", "!"), ("?", "?")},
+                            "correlated": {("!", "!"), ("!", "?"),
+                                           ("?", "!"), ("?", "?")},
                             "uncorrelated": {("!", "!"), ("!", "?"),
                                              ("?", "!"), ("?", "?")}
                         },
                         {
                             "name": "Imp",
                             "letter": {"I!!", "I!?"},
-                            "correlated": {("!", "!"), ("?", "?")},
+                            "correlated": {("!", "!"), ("!", "?"),
+                                           ("?", "!"), ("?", "?")},
                             "uncorrelated": {("!", "!"), ("!", "?"),
                                              ("?", "!"), ("?", "?")}
                         },
@@ -986,7 +998,7 @@ class TestEdgeQLFor(tb.QueryTestCase):
                     SELECT (X, (FOR x in {X} UNION (SELECT x)))
                 ));
             ''',
-            [2],
+            [4],
         )
 
         await self.assert_query_result(
@@ -996,7 +1008,7 @@ class TestEdgeQLFor(tb.QueryTestCase):
                     SELECT ((FOR x in {X} UNION (SELECT x)), X)
                 ));
             ''',
-            [2],
+            [4],
         )
 
     async def test_edgeql_for_correlated_02(self):
@@ -1006,7 +1018,7 @@ class TestEdgeQLFor(tb.QueryTestCase):
                               (FOR x in {Card} UNION (SELECT x.name)),
                 ));
             ''',
-            [9],
+            [81],
         )
 
     async def test_edgeql_for_correlated_03(self):
@@ -1016,7 +1028,7 @@ class TestEdgeQLFor(tb.QueryTestCase):
                                Card.name,
                 ));
             ''',
-            [9],
+            [81],
         )
 
     async def test_edgeql_for_empty_01(self):
@@ -1068,6 +1080,8 @@ class TestEdgeQLFor(tb.QueryTestCase):
             [{"key": {"element": "Earth"}}, {"key": {"element": "Water"}}]
         )
 
+    # XXX: This is *wrong*, I think
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_for_fake_group_01c(self):
         await self.assert_query_result(
             r'''
@@ -1105,6 +1119,25 @@ class TestEdgeQLFor(tb.QueryTestCase):
             order by .key;
             ''',
             [{"key": "Earth"}, {"key": "Water"}]
+        )
+
+    async def test_edgeql_for_tuple_optional_01(self):
+        await self.assert_query_result(
+            r'''
+                for user in User union (
+                  ((select (1,) filter false) ?? (2,)).0
+                );
+            ''',
+            [2, 2, 2, 2],
+        )
+
+        await self.assert_query_result(
+            r'''
+                for user in User union (
+                  ((select (1,) filter user.name = 'Alice') ?? (2,)).0
+                );
+            ''',
+            tb.bag([1, 2, 2, 2]),
         )
 
     async def test_edgeql_for_optional_01(self):
@@ -1163,9 +1196,39 @@ class TestEdgeQLFor(tb.QueryTestCase):
             [{}],
         )
 
-    @test.xerror('''
-        FOR OPTIONAL is disabled for object-type iterators
-    ''')
+        await self.assert_query_result(
+            r'''
+                for user in (select User filter .name = 'Alice') union (
+                  for optional x in (<Card>{},) union (
+                    1
+                  )
+                );
+            ''',
+            [1],
+        )
+
+        await self.assert_query_result(
+            r'''
+                for user in (select User filter .name = 'Alice') union (
+                  for optional x in (<Card>{},) union (
+                    user.name
+                  )
+                );
+            ''',
+            ['Alice'],
+        )
+
+        await self.assert_query_result(
+            r'''
+                for user in (select User filter .name = 'Alice') union (
+                  for optional x in (<Card>{},) union (
+                    user.name ++ (x.0.name ?? "!")
+                  )
+                );
+            ''',
+            ['Alice!'],
+        )
+
     async def test_edgeql_for_optional_02(self):
         await self.assert_query_result(
             r'''
@@ -1193,3 +1256,97 @@ class TestEdgeQLFor(tb.QueryTestCase):
             ''',
             [{}],
         )
+
+    async def test_edgeql_for_optional_03(self):
+        Q = '''
+        for dummy in "1"
+        for optional x in (delete Card filter .name = 'Yolanda Swaggins')
+        select x.cost ?? 420;
+        '''
+
+        await self.assert_query_result(
+            Q,
+            [420],
+        )
+
+    async def test_edgeql_for_lprop_01(self):
+        await self.assert_query_result(
+            '''
+            SELECT User {
+                cards := (
+                    SELECT (FOR d IN .deck SELECT (d.name, d@count))
+                    ORDER BY .0
+                ),
+            }
+            filter .name = 'Carol';
+            ''',
+            [
+                {
+                    "cards": [
+                        ["Bog monster", 3],
+                        ["Djinn", 1],
+                        ["Dwarf", 4],
+                        ["Giant eagle", 3],
+                        ["Giant turtle", 2],
+                        ["Golem", 2],
+                        ["Sprite", 4]
+                    ]
+                }
+            ]
+        )
+
+        await self.assert_query_result(
+            '''
+            SELECT User {
+                cards := (
+                    SELECT (FOR d IN .deck[is SpecialCard]
+                            SELECT (d.name, d@count))
+                    ORDER BY .0
+                ),
+            }
+            filter .name = 'Carol';
+            ''',
+            [
+                {
+                    "cards": [
+                        ["Djinn", 1],
+                    ]
+                }
+            ]
+        )
+
+    async def test_edgeql_for_lprop_02(self):
+        await self.assert_query_result(
+            '''
+            SELECT Card {
+                users := (
+                    SELECT (FOR u IN .<deck[is User] SELECT (u.name, u@count))
+                    ORDER BY .0
+                ),
+            }
+            filter .name = 'Dragon'
+            ''',
+            [{"users": [["Alice", 2], ["Dave", 1]]}],
+        )
+
+        await self.assert_query_result(
+            '''
+            SELECT Card {
+                users := (
+                    SELECT (FOR u IN .owners SELECT (u.name, u@count))
+                    ORDER BY .0
+                ),
+            }
+            filter .name = 'Dragon'
+            ''',
+            [{"users": [["Alice", 2], ["Dave", 1]]}],
+        )
+
+    async def test_edgeql_for_lprop_03(self):
+        with self.assertRaisesRegex(
+            edgedb.errors.QueryError,
+            "",
+        ):
+            await self.con.query('''
+                FOR d IN User.deck SELECT (d.name, d@count);
+            ''')

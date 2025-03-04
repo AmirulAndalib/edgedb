@@ -46,11 +46,11 @@ TYPES = [
     'std::uuid',
     'std::datetime',
     'std::duration',
-    'cal::local_date',
-    'cal::local_datetime',
-    'cal::local_time',
-    'cal::relative_duration',
-    'cal::date_duration',
+    'std::cal::local_date',
+    'std::cal::local_datetime',
+    'std::cal::local_time',
+    'std::cal::relative_duration',
+    'std::cal::date_duration',
     'std::anyenum',
     'std::BaseObject',
 ]
@@ -195,7 +195,7 @@ def gen_cast_table():
         ], capture_output=True)
 
         if res.returncode != 0:
-            die('Could not connect to the dev EdgeDB instance')
+            die('Could not connect to the dev Gel instance')
 
         main(json.loads(res.stdout))
     except Exception as ex:

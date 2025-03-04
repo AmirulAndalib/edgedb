@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Type, TypeVar, List, NamedTuple, TYPE_CHECKING
 
 import abc
 import functools
@@ -48,6 +48,9 @@ if TYPE_CHECKING:
             ...
 
         def get_local_name(self) -> UnqualName:
+            ...
+
+        def get_root_module_name(self) -> UnqualName:
             ...
 
         def __lt__(self, other: Any) -> bool:
@@ -113,7 +116,7 @@ if TYPE_CHECKING:
 
 else:
 
-    class Name(abc.ABC):
+    class Name(abc.ABC):  # noqa: B024
         pass
 
     class QualName(NamedTuple):
@@ -147,6 +150,9 @@ else:
         def get_module_name(self) -> Name:
             return UnqualName(self.module)
 
+        def get_root_module_name(self) -> UnqualName:
+            return UnqualName(self.module.partition('::')[0])
+
         def __str__(self) -> str:
             return f'{self.module}::{self.name}'
 
@@ -166,6 +172,9 @@ else:
 
         def get_local_name(self) -> UnqualName:
             return self
+
+        def get_root_module_name(self) -> UnqualName:
+            return UnqualName(self.name.partition('::')[0])
 
         def __str__(self) -> str:
             return self.name

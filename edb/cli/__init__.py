@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *  # NoQA
+from typing import Optional, List, NoReturn
 
 import os
 import pathlib
@@ -31,4 +31,4 @@ def rustcli(*, args: Optional[List[str]]=None) -> NoReturn:
     if args is None:
         args = [*sys.argv]
 
-    os.execve(str(thisdir / 'edgedb'), args, os.environ)
+    os.execve(str(thisdir / 'gel'), args, os.environ)

@@ -29,7 +29,6 @@ import edgedb
 from edb import errors
 from edb.common import assert_data_shape
 from edb.testbase import server as tb
-from edb.tools import test
 
 
 class value(typing.NamedTuple):
@@ -76,17 +75,17 @@ VALUES = {
               datetime=True, signed=False, anynumeric=False),
 
     '<cal::local_datetime>"2018-05-07T00:00:00"':
-        value(typename='cal::local_datetime',
+        value(typename='std::cal::local_datetime',
               anyreal=False, anyint=False, anyfloat=False,
               datetime=True, signed=False, anynumeric=False),
 
     '<cal::local_date>"2018-05-07"':
-        value(typename='cal::local_date',
+        value(typename='std::cal::local_date',
               anyreal=False, anyint=False, anyfloat=False,
               datetime=True, signed=False, anynumeric=False),
 
     '<cal::local_time>"20:01:22.306916"':
-        value(typename='cal::local_time',
+        value(typename='std::cal::local_time',
               anyreal=False, anyint=False, anyfloat=False,
               datetime=True, signed=False, anynumeric=False),
 
@@ -151,14 +150,14 @@ VALUES = {
               datetime=False, signed=True, anynumeric=True),
 
     '<cal::relative_duration>"P1Y2M3D"':
-        value(typename='cal::relative_duration',
+        value(typename='std::cal::relative_duration',
               anyreal=False, anyint=False, anyfloat=False,
               datetime=True, signed=True, anynumeric=False),
 
     # Much like integer and float values are all setup to be 1 and equal to
     # each other, so are relative_duration and date_duration equal.
     '<cal::date_duration>"P1Y2M3D"':
-        value(typename='cal::date_duration',
+        value(typename='std::cal::date_duration',
               anyreal=False, anyint=False, anyfloat=False,
               datetime=True, signed=True, anynumeric=False),
 }
@@ -185,6 +184,7 @@ def get_test_items(**flags):
 
 
 class TestExpressions(tb.QueryTestCase):
+
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas',
                           'issues.esdl')
 
@@ -731,8 +731,10 @@ class TestExpressions(tb.QueryTestCase):
                 FILTER _ IN (
                     # Lengths of names for schema::Map, Type, and Array are
                     # 11, 12, and 13, respectively.
-                    SELECT len(ObjectType.name)
-                    FILTER ObjectType.name LIKE 'schema::%'
+                    len((
+                      SELECT ObjectType
+                      FILTER ObjectType.name LIKE 'schema::%'
+                    ).name)
                 );
             """,
             {13},
@@ -755,8 +757,10 @@ class TestExpressions(tb.QueryTestCase):
                 FILTER _ NOT IN (
                     # Lengths of names for schema::Map, Type, and Array are
                     # 11, 12, and 13, respectively.
-                    SELECT len(ObjectType.name)
-                    FILTER ObjectType.name LIKE 'schema::%'
+                    len((
+                      SELECT ObjectType
+                      FILTER ObjectType.name LIKE 'schema::%'
+                    ).name)
                 );
             """,
             {9, 1},
@@ -962,7 +966,7 @@ class TestExpressions(tb.QueryTestCase):
                         N := <array<int64>>$nums,
                         A1 := <array<{tname}>>$arr1,
                         A2 := <array<{tname}>>$arr2,
-                        X := array_unpack(N)
+                    for X in array_unpack(N)
                     select _ := [X, A1[X], A2[X], A1[X] // A2[X]]
                     order by _[0];
                 ''',
@@ -1003,7 +1007,7 @@ class TestExpressions(tb.QueryTestCase):
                         N := <array<int64>>$nums,
                         A1 := <array<{tname}>>$arr1,
                         A2 := <array<{tname}>>$arr2,
-                        X := array_unpack(N)
+                    for X in array_unpack(N)
                     select _ := [X, A1[X], A2[X], A1[X] % A2[X]]
                     order by _[0];
                 ''',
@@ -1227,8 +1231,8 @@ class TestExpressions(tb.QueryTestCase):
                                     ldesc.typename,
                                     rdesc.typename
                                 } == {
-                                    'cal::relative_duration',
-                                    'cal::date_duration'
+                                    'std::cal::relative_duration',
+                                    'std::cal::date_duration'
                                 }
                             )
                             or
@@ -1240,8 +1244,8 @@ class TestExpressions(tb.QueryTestCase):
                                     ldesc.typename,
                                     rdesc.typename
                                 } == {
-                                    'cal::local_date',
-                                    'cal::local_datetime'
+                                    'std::cal::local_date',
+                                    'std::cal::local_datetime'
                                 }
                             )
                         ) else expected_error_msg
@@ -1267,8 +1271,8 @@ class TestExpressions(tb.QueryTestCase):
                                     ldesc.typename,
                                     rdesc.typename
                                 } == {
-                                    'cal::relative_duration',
-                                    'cal::date_duration'
+                                    'std::cal::relative_duration',
+                                    'std::cal::date_duration'
                                 }
                             )
                             or
@@ -1280,8 +1284,8 @@ class TestExpressions(tb.QueryTestCase):
                                     ldesc.typename,
                                     rdesc.typename
                                 } == {
-                                    'cal::local_date',
-                                    'cal::local_datetime'
+                                    'std::cal::local_date',
+                                    'std::cal::local_datetime'
                                 }
                             )
                         ) else expected_error_msg
@@ -1678,39 +1682,41 @@ class TestExpressions(tb.QueryTestCase):
                 argtypes = {ldesc.typename, rdesc.typename}
 
                 if argtypes == {
-                    'cal::local_date',
-                    'cal::date_duration'
+                    'std::cal::local_date',
+                    'std::cal::date_duration'
                 }:
                     # whole day arithmetic
-                    restype = 'cal::local_date'
-                elif ldesc.typename == rdesc.typename == 'cal::date_duration':
+                    restype = 'std::cal::local_date'
+                elif {ldesc.typename, rdesc.typename} == {
+                    'std::cal::date_duration',
+                }:
                     # whole day arithmetic
-                    restype = 'cal::date_duration'
+                    restype = 'std::cal::date_duration'
                 elif argtypes.intersection({
                     'duration',
-                    'cal::relative_duration',
-                    'cal::date_duration'
+                    'std::cal::relative_duration',
+                    'std::cal::date_duration'
                 }):
                     # Whole day arithemtic is accounted for, so what's left is
                     # fractional date arithemtic. The result is always some
                     # kind of fractional datetime scalar.
                     otherarg = argtypes - {
                         'duration',
-                        'cal::relative_duration',
-                        'cal::date_duration'
+                        'std::cal::relative_duration',
+                        'std::cal::date_duration'
                     }
                     if ldesc.typename == rdesc.typename:
                         # duration flavour is preserved
                         restype = ldesc.typename
                     elif len(otherarg) == 0:
                         # Some combo of durations make relative_duration.
-                        restype = 'cal::relative_duration'
+                        restype = 'std::cal::relative_duration'
                     else:
                         othertype = otherarg.pop()
-                        if othertype == 'cal::local_date':
+                        if othertype == 'std::cal::local_date':
                             # local_date + fractional durarion makes
                             # local_datetime
-                            restype = 'cal::local_datetime'
+                            restype = 'std::cal::local_datetime'
                         else:
                             # Everything else is laready fractional, so just
                             # use the type of the other argument.
@@ -1745,33 +1751,37 @@ class TestExpressions(tb.QueryTestCase):
                         restype = rdesc.typename
                     else:
                         # mixing duration types makes relative_duration
-                        restype = 'cal::relative_duration'
-                elif (ldesc.typename == 'cal::local_date' and
-                        rdesc.typename == 'cal::local_date'):
-                    restype = 'cal::date_duration'
-                elif (ldesc.typename == 'cal::local_date' and
-                        rdesc.typename == 'cal::date_duration'):
-                    restype = 'cal::local_date'
+                        restype = 'std::cal::relative_duration'
+                elif (ldesc.typename == 'std::cal::local_date' and
+                        rdesc.typename == 'std::cal::local_date'):
+                    restype = 'std::cal::date_duration'
+                elif (ldesc.typename == 'std::cal::local_date' and
+                        rdesc.typename == 'std::cal::date_duration'):
+                    restype = 'std::cal::local_date'
                 elif rdesc.signed:
                     # Subtracting some flavour of duration.
-                    if ldesc.typename == 'cal::local_date':
-                        restype = 'cal::local_datetime'
+                    if ldesc.typename == 'std::cal::local_date':
+                        restype = 'std::cal::local_datetime'
                     else:
                         # Preserve the [fractional] date/time type of the left
                         # argument.
                         restype = ldesc.typename
                 elif rdesc.typename == ldesc.typename == 'datetime':
                     restype = 'duration'
-                elif rdesc.typename == ldesc.typename == 'cal::local_datetime':
-                    restype = 'cal::relative_duration'
-                elif rdesc.typename == ldesc.typename == 'cal::local_time':
-                    restype = 'cal::relative_duration'
                 elif {rdesc.typename, ldesc.typename} == {
-                    'cal::local_datetime',
-                    'cal::local_date',
+                    'std::cal::local_datetime'
+                }:
+                    restype = 'std::cal::relative_duration'
+                elif {rdesc.typename, ldesc.typename} == {
+                    'std::cal::local_time'
+                }:
+                    restype = 'std::cal::relative_duration'
+                elif {rdesc.typename, ldesc.typename} == {
+                    'std::cal::local_datetime',
+                    'std::cal::local_date',
                 }:
                     # mix of local_date and local_datetime
-                    restype = 'cal::relative_duration'
+                    restype = 'std::cal::relative_duration'
 
                 if restype:
                     await self.assert_query_result(query, [1])
@@ -2025,8 +2035,8 @@ class TestExpressions(tb.QueryTestCase):
                     # casting
                     (
                         argtypes == {
-                            'cal::relative_duration',
-                            'cal::date_duration'
+                            'std::cal::relative_duration',
+                            'std::cal::date_duration'
                         }
                     )
                     or
@@ -2035,8 +2045,8 @@ class TestExpressions(tb.QueryTestCase):
                     # casting
                     (
                         argtypes == {
-                            'cal::local_date',
-                            'cal::local_datetime'
+                            'std::cal::local_date',
+                            'std::cal::local_datetime'
                         }
                     )
                 ):
@@ -2048,17 +2058,17 @@ class TestExpressions(tb.QueryTestCase):
                         SELECT (INTROSPECT TYPEOF ({left} UNION {right})).name
                     """
                     # this operation should always be valid
-                    if 'cal::relative_duration' in argtypes:
+                    if 'std::cal::relative_duration' in argtypes:
                         # This is possible when relative_duration and
                         # date_duration mix and the result is implicitly cast
                         # to relative_duration.
-                        desc_typename = 'cal::relative_duration'
-                    elif 'cal::local_datetime' in argtypes:
+                        desc_typename = 'std::cal::relative_duration'
+                    elif 'std::cal::local_datetime' in argtypes:
                         # This is possible when local_datetime and
                         # local_date mix and the result is implicitly cast
                         # to local_datetime.
-                        desc_typename = 'cal::local_datetime'
-                    elif rdesc.typename.startswith('cal::'):
+                        desc_typename = 'std::cal::local_datetime'
+                    elif rdesc.typename.startswith('std::cal::'):
                         desc_typename = rdesc.typename
                     else:
                         desc_typename = 'std::' + rdesc.typename
@@ -2204,8 +2214,8 @@ class TestExpressions(tb.QueryTestCase):
                         # casting
                         (
                             argtypes == {
-                                'cal::relative_duration',
-                                'cal::date_duration'
+                                'std::cal::relative_duration',
+                                'std::cal::date_duration'
                             }
                         )
                         or
@@ -2214,8 +2224,8 @@ class TestExpressions(tb.QueryTestCase):
                         # casting
                         (
                             argtypes == {
-                                'cal::local_date',
-                                'cal::local_datetime'
+                                'std::cal::local_date',
+                                'std::cal::local_datetime'
                             }
                         )
                     ):
@@ -2224,17 +2234,17 @@ class TestExpressions(tb.QueryTestCase):
                         await self.assert_query_result(query, [1])
 
                         # this operation should always be valid
-                        if 'cal::relative_duration' in argtypes:
+                        if 'std::cal::relative_duration' in argtypes:
                             # This is possible when relative_duration and
                             # date_duration mix and the result is implicitly
                             # cast to relative_duration.
-                            desc_typename = 'cal::relative_duration'
-                        elif 'cal::local_datetime' in argtypes:
+                            desc_typename = 'std::cal::relative_duration'
+                        elif 'std::cal::local_datetime' in argtypes:
                             # This is possible when local_datetime and
                             # local_date mix and the result is implicitly cast
                             # to local_datetime.
-                            desc_typename = 'cal::local_datetime'
-                        elif rdesc.typename.startswith('cal::'):
+                            desc_typename = 'std::cal::local_datetime'
+                        elif rdesc.typename.startswith('std::cal::'):
                             desc_typename = rdesc.typename
                         else:
                             desc_typename = 'std::' + rdesc.typename
@@ -2598,7 +2608,10 @@ class TestExpressions(tb.QueryTestCase):
         # syntactically legal (see test_edgeql_syntax_constants_09),
         # but will fail to resolve to anything.
         with self.assertRaisesRegex(
-                edgedb.QueryError, r'could not resolve partial path'):
+            edgedb.QueryError,
+            r'could not resolve partial path',
+            _hint=None
+        ):
             await self.con.execute(r"""
                 SELECT .1;
             """)
@@ -3058,7 +3071,7 @@ class TestExpressions(tb.QueryTestCase):
     async def test_edgeql_expr_introspect_bad_02(self):
         with self.assertRaisesRegex(
                 edgedb.QueryError,
-                r'cannot introspect transient type variant'):
+                r"type 'A' does not exist"):
             await self.assert_query_result(
                 r"""
                     WITH A := (SELECT schema::Type { foo := 'bar' })
@@ -5425,6 +5438,48 @@ aa \
             [],
         )
 
+        # check that return type of sql is correct
+        # https://github.com/edgedb/edgedb/issues/6786
+        await self.assert_query_result(
+            f'''select <str>(range_get_upper(
+                    range(
+                        <cal::local_datetime>'2024-01-11T00:00:00',
+                        <cal::local_datetime>'2025-01-11T00:00:00'
+                    )
+                ) - <cal::date_duration>"1 day");''',
+            ['2025-01-10T00:00:00'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_lower(
+                    range(
+                        <cal::local_datetime>'2024-01-11T00:00:00',
+                        <cal::local_datetime>'2025-01-11T00:00:00'
+                    )
+                ) - <cal::date_duration>"1 day");''',
+            ['2024-01-10T00:00:00'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_upper(
+                    multirange([range(
+                        <cal::local_datetime>'2024-01-11T00:00:00',
+                        <cal::local_datetime>'2025-01-11T00:00:00'
+                    )])
+                ) - <cal::date_duration>"1 day");''',
+            ['2025-01-10T00:00:00'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_lower(
+                    multirange([range(
+                        <cal::local_datetime>'2024-01-11T00:00:00',
+                        <cal::local_datetime>'2025-01-11T00:00:00'
+                    )])
+                ) - <cal::date_duration>"1 day");''',
+            ['2024-01-10T00:00:00'],
+        )
+
     async def test_edgeql_expr_range_18(self):
         # Test bound for datetime ranges and multiranges.
         await self.assert_query_result(
@@ -5885,6 +5940,48 @@ aa \
                     range(<cal::local_date>{{}},
                           <cal::local_date>'2022-06-15')]));''',
             [],
+        )
+
+        # check that return type of sql is correct
+        # https://github.com/edgedb/edgedb/issues/6786
+        await self.assert_query_result(
+            f'''select <str>(range_get_upper(
+                    range(
+                        <cal::local_date>'2024-01-11',
+                        <cal::local_date>'2025-01-11'
+                    )
+                ) - <cal::date_duration>"1 day");''',
+            ['2025-01-10'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_lower(
+                    range(
+                        <cal::local_date>'2024-01-11',
+                        <cal::local_date>'2025-01-11'
+                    )
+                ) - <cal::date_duration>"1 day");''',
+            ['2024-01-10'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_upper(
+                    multirange([range(
+                        <cal::local_date>'2024-01-11',
+                        <cal::local_date>'2025-01-11'
+                    )])
+                ) - <cal::date_duration>"1 day");''',
+            ['2025-01-10'],
+        )
+
+        await self.assert_query_result(
+            f'''select <str>(range_get_lower(
+                    multirange([range(
+                        <cal::local_date>'2024-01-11',
+                        <cal::local_date>'2025-01-11'
+                    )])
+                ) - <cal::date_duration>"1 day");''',
+            ['2024-01-10'],
         )
 
     async def test_edgeql_expr_range_25(self):
@@ -6712,8 +6809,8 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_upper"'
-            r' boolean property'
+            r"JSON object representing a range must include an 'inc_upper'"
+            r" boolean property"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('{
@@ -6726,8 +6823,8 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"JSON object representing a range must include an 'inc_lower'"
+            r" boolean property"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('{
@@ -6739,8 +6836,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"expected JSON object or null; got JSON array"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('["bad", null]');
@@ -6748,8 +6844,8 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"JSON object representing a range must include an 'inc_lower'"
+            r" boolean property"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('{"bad": null}');
@@ -6757,8 +6853,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"expected JSON object or null; got JSON string"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('"bad"');
@@ -6766,8 +6861,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"expected JSON object or null; got JSON number"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('1312');
@@ -6775,8 +6869,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r'JSON object representing a range must include an "inc_lower"'
-            r' boolean property'
+            r"expected JSON object or null; got JSON boolean"
         ):
             await self.con.execute(r"""
                 select <range<int64>>to_json('true');
@@ -6784,7 +6877,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r"invalid input syntax for type cal::local_date: "
+            r"invalid input syntax for type std::cal::local_date: "
             r"'2022.06.10'"
         ):
             await self.con.execute(r"""
@@ -6798,7 +6891,7 @@ aa \
 
         async with self.assertRaisesRegexTx(
             edgedb.InvalidValueError,
-            r"invalid input syntax for type cal::local_date: "
+            r"invalid input syntax for type std::cal::local_date: "
             r"'12022-06-17'"
         ):
             await self.con.execute(r"""
@@ -6945,7 +7038,7 @@ aa \
             ranges = [edgedb.Range(empty=True)]
             if desc.datetime:
                 val = val.strip('"')
-                if desc.typename == 'cal::local_date':
+                if desc.typename == 'std::cal::local_date':
                     ranges.append(edgedb.Range(
                         datetime.date.fromisoformat(val)))
                 else:
@@ -6992,7 +7085,7 @@ aa \
             query = f'select <array<multirange<{desc.typename}>>>$0'
             if desc.datetime:
                 val = val.strip('"')
-                if desc.typename == 'cal::local_date':
+                if desc.typename == 'std::cal::local_date':
                     ranges = [
                         edgedb.Range(datetime.date.fromisoformat(val))
                     ]
@@ -8059,6 +8152,7 @@ aa \
             sort=True
         )
 
+    @tb.needs_factoring
     async def test_edgeql_expr_if_else_04(self):
         await self.assert_query_result(
             r'''
@@ -8201,6 +8295,7 @@ aa \
             sort=True
         )
 
+    @tb.needs_factoring
     async def test_edgeql_expr_if_else_06(self):
         await self.assert_query_result(
             r"""
@@ -8291,6 +8386,47 @@ aa \
                 select test if false else [];
             """,
             [[]],
+        )
+
+    async def test_edgeql_expr_if_else_11(self):
+        await self.assert_query_result(
+            r"""
+                select if 1 = <int64>$x then 2 else 3
+            """,
+            [2],
+            variables=dict(x=1),
+        )
+
+        await self.assert_query_result(
+            r"""
+                select if 1 = <int64>$x then 2 else 3
+            """,
+            [3],
+            variables=dict(x=-1),
+        )
+
+        await self.assert_query_result(
+            r"""
+                select 2 if 1 = <int64>$x else 3
+            """,
+            [2],
+            variables=dict(x=1),
+        )
+
+        await self.assert_query_result(
+            r"""
+                select 2 if 1 = <int64>$x else 3
+            """,
+            [3],
+            variables=dict(x=-1),
+        )
+
+    async def test_edgeql_expr_if_else_toplevel(self):
+        await self.assert_query_result(
+            r"""
+                if true then 10 else 11
+            """,
+            [10],
         )
 
     async def test_edgeql_expr_setop_01(self):
@@ -8697,6 +8833,7 @@ aa \
             [5],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_expr_alias_01(self):
         await self.assert_query_result(
             r"""
@@ -8709,6 +8846,7 @@ aa \
             [2],
         )
 
+    @tb.ignore_warnings('more than one.* in a FILTER clause')
     async def test_edgeql_expr_alias_02(self):
         await self.assert_query_result(
             r"""
@@ -8856,110 +8994,6 @@ aa \
             {2, 3, 4, 5},
         )
 
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_01(self):
-        await self.assert_query_result(
-            r"""
-                WITH I := {1, 2, 3, 4}
-                GROUP I
-                USING _ := I % 2 = 0
-                BY _
-                INTO I
-                UNION _r := (
-                    values := array_agg(I ORDER BY I)
-                ) ORDER BY _r.values;
-            """,
-            [
-                {'values': [1, 3]},
-                {'values': [2, 4]}
-            ]
-        )
-
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_02(self):
-        await self.assert_query_result(
-            r'''
-                # handle a number of different aliases
-                WITH x := {(1, 2), (3, 4), (4, 2)}
-                GROUP y := x
-                USING _ := y.1
-                BY _
-                INTO y
-                UNION array_agg(y.0 ORDER BY y.0);
-            ''',
-            [[1, 4], [3]],
-            sort=True
-        )
-
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_03(self):
-        await self.assert_query_result(
-            r'''
-                WITH x := {(1, 2), (3, 4), (4, 2)}
-                GROUP x
-                USING _ := x.1
-                BY _
-                INTO x
-                UNION array_agg(x.0 ORDER BY x.0);
-            ''',
-            [[1, 4], [3]],
-            sort=True
-        )
-
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_04(self):
-        await self.assert_query_result(
-            r'''
-                WITH x := {(1, 2), (3, 4), (4, 2)}
-                GROUP x
-                USING B := x.1
-                BY B
-                INTO x
-                UNION (B, array_agg(x.0 ORDER BY x.0))
-                ORDER BY
-                    B;
-            ''',
-            [[2, [1, 4]], [4, [3]]],
-        )
-
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_05(self):
-        await self.assert_query_result(
-            r'''
-                # handle the case where the value to be computed depends
-                # on both, the grouped subset and the original set
-                WITH
-                    x1 := {(1, 0), (1, 0), (1, 0), (2, 0), (3, 0), (3, 0)},
-                    x2 := x1
-                GROUP y := x1
-                USING z := y.0
-                BY z
-                INTO y
-                UNION (
-                    # we expect that count(x1) and count(x2) will be
-                    # identical in this context, whereas count(y) will
-                    # represent the size of each subset
-                    z, count(y), count(x1), count(x2)
-                )
-                ORDER BY z;
-            ''',
-            [[1, 3, 6, 6], [2, 1, 6, 6], [3, 2, 6, 6]]
-        )
-
-    @test.not_implemented('GROUP statement is not yet implemented')
-    async def test_edgeql_expr_group_06(self):
-        await self.assert_query_result(
-            r'''
-                GROUP X := {1, 1, 1, 2, 3, 3}
-                USING y := X
-                BY y
-                INTO y
-                UNION (y, count(X))
-                ORDER BY y;
-            ''',
-            [[1, 3], [2, 1], [3, 2]]
-        )
-
     async def test_edgeql_expr_slice_01(self):
         with self.assertRaisesRegex(
                 edgedb.QueryError,
@@ -9050,11 +9084,10 @@ aa \
             await self.con.query('SELECT <tuple<"">>1;')
 
     async def test_edgeql_typeop_01(self):
-        with self.assertRaisesRegex(
-                edgedb.UnsupportedFeatureError,
-                "type operator '&' is not implemented",
-        ):
-            await self.con.query('select <Named & Owned>{};')
+        await self.assert_query_result(
+            "select <Named & Owned>{};",
+            [],
+        )
 
     async def test_edgeql_typeop_02(self):
         with self.assertRaisesRegex(
@@ -9109,6 +9142,10 @@ aa \
         )
         await self.assert_query_result(
             'select {x := 1} is (typeof Issue.references | BaseObject);',
+            {False}
+        )
+        await self.assert_query_result(
+            'select {x := 1} is (typeof Issue.references | FreeObject);',
             {True}
         )
 
@@ -9146,6 +9183,15 @@ aa \
                 SELECT assert_single(x)
             );
         """)
+
+        await self.con.query("""
+            select {
+                xy := assert_single({<optional str>$0, <optional str>$1}) };
+        """, None, None)
+        await self.con.query("""
+            select {
+                xy := assert_single({<optional str>$0, <optional str>$1}) };
+        """, None, 'test')
 
     async def test_edgeql_assert_single_02(self):
         await self.con.execute("""
@@ -9419,9 +9465,9 @@ aa \
         await self.assert_query_result(
             """
                 SELECT assert_distinct((
-                    (SELECT Issue FILTER .references[IS File].name = "File 1")
+                    (SELECT Issue FILTER "File 1" IN .references[IS File].name)
                     UNION
-                    (SELECT Issue FILTER .references[IS File].name = "File 2")
+                    (SELECT Issue FILTER "File 2" IN .references[IS File].name)
                 )) {
                     number
                 }
@@ -9744,3 +9790,746 @@ aa \
             await self.con.query(f'''
                 with x := 1337, select {body}
             ''')
+
+    async def test_edgeql_cast_to_function_01(self):
+        async with self.assertRaisesRegexTx(
+            edgedb.errors.InvalidReferenceError,
+            "does not exist",
+            _hint="did you mean to call 'to_str'?"
+        ):
+            await self.con.execute(f"""
+                select <to_str>1;
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.errors.InvalidReferenceError,
+            "does not exist",
+            _hint="did you mean to call 'round'?"
+        ):
+            await self.con.execute(f"""
+                select <round>1;
+            """)
+
+        async with self.assertRaisesRegexTx(
+            edgedb.errors.InvalidReferenceError,
+            "does not exist",
+            _hint="did you mean to call 'std::cal::to_local_date'?"
+        ):
+            await self.con.execute(f"""
+                select <cal::to_local_date>1;
+            """)
+
+    async def test_edgeql_expr_with_module_01(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create module A;
+            create type A::Foo;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+        with_mod = 'WITH MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+        with_mod = 'WITH MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+        with_mod = 'WITH MODULE A '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+        with_mod = 'WITH dum as MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dum::Foo>{}'),
+        ]
+        with_mod = 'WITH AAA as MODULE A '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <AAA::Foo>{}'),
+        ]
+        with_mod = 'WITH s as MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <s::Foo>{}'),
+        ]
+        with_mod = 'WITH std as MODULE A '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (NO_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+        with_mod = 'WITH A as MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT <Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <std::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <dummy::Foo>{}'),
+            (REF_ERR, with_mod + 'SELECT <A::Foo>{}'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "Foo' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_02(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create module A;
+            create function A::abs(x: int64) -> int64 using (x);
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+        with_mod = 'WITH MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+        with_mod = 'WITH MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+        with_mod = 'WITH MODULE A '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+        with_mod = 'WITH dum as MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dum::abs(1)'),
+        ]
+        with_mod = 'WITH AAA as MODULE A '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT AAA::abs(1)'),
+        ]
+        with_mod = 'WITH s as MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT s::abs(1)'),
+        ]
+        with_mod = 'WITH std as MODULE A '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (NO_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (NO_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+        with_mod = 'WITH A as MODULE std '
+        queries += [
+            (REF_ERR, with_mod + 'SELECT abs(1)'),
+            (REF_ERR, with_mod + 'SELECT std::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT dummy::abs(1)'),
+            (REF_ERR, with_mod + 'SELECT A::abs(1)'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "abs' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_03(self):
+        await self.con.execute(f"""
+            create module dummy;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH MODULE dummy '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH MODULE std '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH dum as MODULE dummy '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dum::int64>{} = 1'),
+        ]
+        with_mod = 'WITH def as MODULE default '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <def::int64>{} = 1'),
+        ]
+        with_mod = 'WITH s as MODULE std '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <s::int64>{} = 1'),
+        ]
+        with_mod = 'WITH std as MODULE dummy '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "int64' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_04(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create type default::int64;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+        TYPE_ERR = 3
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH MODULE dummy '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH MODULE std '
+        queries += [
+            (NO_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH dum as MODULE dummy '
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dum::int64>{} = 1'),
+        ]
+        with_mod = 'WITH def as MODULE default '
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <def::int64>{} = 1'),
+        ]
+        with_mod = 'WITH s as MODULE std '
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+            (NO_ERR, with_mod + 'SELECT <s::int64>{} = 1'),
+        ]
+        with_mod = 'WITH std as MODULE dummy '
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+        with_mod = 'WITH std as MODULE default '
+        queries += [
+            (TYPE_ERR, with_mod + 'SELECT <int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <std::int64>{} = 1'),
+            (TYPE_ERR, with_mod + 'SELECT <default::int64>{} = 1'),
+            (REF_ERR, with_mod + 'SELECT <dummy::int64>{} = 1'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "int64' does not exist",
+                ):
+                    await self.con.execute(query)
+
+            elif error == TYPE_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidTypeError,
+                    "operator '=' cannot be applied",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_05(self):
+        await self.con.execute(f"""
+            create module dummy;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module _test '
+        queries += [
+            (NO_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module std '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module std::_test '
+        queries += [
+            (NO_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with t as module _test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (NO_ERR, with_mod + 'select t::abs(1)'),
+        ]
+        with_mod = 'with s as module std '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (REF_ERR, with_mod + 'select s::abs(1)'),
+        ]
+        with_mod = 'with st as module std::_test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (NO_ERR, with_mod + 'select st::abs(1)'),
+        ]
+        with_mod = 'with std as module _test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (NO_ERR, with_mod + 'select _test::abs(1)'),
+            (REF_ERR, with_mod + 'select std::_test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::abs(1)'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "abs' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_06(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create module _test;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module _test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module std '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with module std::_test '
+        queries += [
+            (NO_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+        ]
+        with_mod = 'with t as module _test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (REF_ERR, with_mod + 'select t::abs(1)'),
+        ]
+        with_mod = 'with s as module std '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (REF_ERR, with_mod + 'select s::abs(1)'),
+        ]
+        with_mod = 'with st as module std::_test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::_test::abs(1)'),
+            (NO_ERR, with_mod + 'select st::abs(1)'),
+        ]
+        with_mod = 'with std as module _test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (REF_ERR, with_mod + 'select std::_test::abs(1)'),
+            (REF_ERR, with_mod + 'select std::abs(1)'),
+        ]
+        with_mod = 'with std as module std::_test '
+        queries += [
+            (REF_ERR, with_mod + 'select abs(1)'),
+            (REF_ERR, with_mod + 'select _test::abs(1)'),
+            (REF_ERR, with_mod + 'select std::_test::abs(1)'),
+            (NO_ERR, with_mod + 'select std::abs(1)'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "abs' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_07(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create module std::test;
+            create scalar type std::test::Foo extending int64;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module test '
+        queries += [
+            (NO_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module std '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module std::test '
+        queries += [
+            (NO_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with t as module test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (NO_ERR, with_mod + 'select <t::Foo>1'),
+        ]
+        with_mod = 'with s as module std '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <s::Foo>1'),
+        ]
+        with_mod = 'with st as module std::test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (NO_ERR, with_mod + 'select <st::Foo>1'),
+        ]
+        with_mod = 'WITH std as MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::Foo>1'),
+        ]
+        with_mod = 'WITH std as MODULE test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (NO_ERR, with_mod + 'select <test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::Foo>1'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "Foo' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_with_module_08(self):
+        await self.con.execute(f"""
+            create module dummy;
+            create module std::test;
+            create scalar type std::test::Foo extending int64;
+            create module test;
+        """)
+
+        NO_ERR = 1
+        REF_ERR = 2
+
+        queries = []
+
+        with_mod = ''
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module std '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with module std::test '
+        queries += [
+            (NO_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+        ]
+        with_mod = 'with t as module test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <t::Foo>1'),
+        ]
+        with_mod = 'with s as module std '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <s::Foo>1'),
+        ]
+        with_mod = 'with st as module std::test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (NO_ERR, with_mod + 'select <std::test::Foo>1'),
+            (NO_ERR, with_mod + 'select <st::Foo>1'),
+        ]
+        with_mod = 'WITH std as MODULE dummy '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::Foo>1'),
+        ]
+        with_mod = 'WITH std as MODULE test '
+        queries += [
+            (REF_ERR, with_mod + 'select <Foo>1'),
+            (REF_ERR, with_mod + 'select <test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::test::Foo>1'),
+            (REF_ERR, with_mod + 'select <std::Foo>1'),
+        ]
+
+        for error, query in queries:
+            if error == NO_ERR:
+                await self.con.execute(query)
+
+            elif error == REF_ERR:
+                async with self.assertRaisesRegexTx(
+                    edgedb.errors.InvalidReferenceError,
+                    "Foo' does not exist",
+                ):
+                    await self.con.execute(query)
+
+    async def test_edgeql_expr_str_interpolation_01(self):
+        await self.assert_query_result(
+            r'''
+                select "1 + 1 = \(1 + 1)"
+            ''',
+            ['1 + 1 = 2'],
+        )
+
+        await self.assert_query_result(
+            r'''
+                select ("1 + 1 = \(1 + 1)")
+            ''',
+            ['1 + 1 = 2'],
+        )
+
+        # Have some more fun. Nest it a bit.
+        await self.assert_query_result(
+            r'''select "asdf \(str_reverse("1234") ++
+"[\(sum({1,2,3}))]")! count(User)=\
+\(
+count(User))" ++ "!";''',
+            ['asdf 4321[6]! count(User)=0!'],
+        )

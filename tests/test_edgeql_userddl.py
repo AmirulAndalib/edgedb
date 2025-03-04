@@ -155,9 +155,9 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
     async def test_edgeql_userddl_10(self):
         with self.assertRaisesRegex(
                 edgedb.SchemaDefinitionError,
-                r'cannot create.*module math is read-only'):
+                r'cannot create.*module std is read-only'):
             await self.con.execute('''
-                CREATE FUNCTION math::func_10(
+                CREATE FUNCTION std::math::func_10(
                     a: str
                 ) -> str
                     USING EdgeQL $$
@@ -176,9 +176,9 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
     async def test_edgeql_userddl_12(self):
         with self.assertRaisesRegex(
                 edgedb.SchemaDefinitionError,
-                r'cannot create.*module math is read-only'):
+                r'cannot create.*module std is read-only'):
             await self.con.execute('''
-                CREATE TYPE math::Foo_11;
+                CREATE TYPE std::math::Foo_11;
             ''')
 
     async def test_edgeql_userddl_13(self):
@@ -210,9 +210,9 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
     async def test_edgeql_userddl_18(self):
         with self.assertRaisesRegex(
                 edgedb.SchemaDefinitionError,
-                r'cannot delete.*module math is read-only'):
+                r'cannot delete.*module std is read-only'):
             await self.con.execute('''
-                DROP MODULE math;
+                DROP MODULE std::math;
             ''')
 
     async def test_edgeql_userddl_19(self):
@@ -293,7 +293,7 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
     async def test_edgeql_userddl_23(self):
         with self.assertRaisesRegex(
             edgedb.UnsupportedFeatureError,
-            'user-defined pseudotypes are not supported'
+            'user-defined pseudo types are not supported'
         ):
             await self.con.execute('CREATE PSEUDO TYPE foo;')
 
@@ -390,7 +390,7 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
         await self.con.execute('''
             configure session set __internal_testmode := true;
             create module ext::_test;
-            create type ext::_test::X;
+            create type ext::_test::X extending std::BaseObject;
             configure session reset __internal_testmode;
         ''')
 
@@ -417,3 +417,66 @@ class TestEdgeQLUserDDL(tb.DDLTestCase):
             await self.con.execute('''
                 drop type ext::_test::X;
             ''')
+
+    async def test_edgeql_userddl_all_extensions_01(self):
+        # Install all extensions and then delete them all
+        exts = await self.con.query('''
+            select distinct sys::ExtensionPackage.name
+        ''')
+
+        # This tests that toggling scoping futures works with
+        # extensions, and that the extensions work if it is enabled
+        # first.
+        await self.con.execute(f"""
+            START MIGRATION TO {{
+                using future warn_old_scoping;
+                module default {{ }}
+            }};
+            POPULATE MIGRATION;
+            COMMIT MIGRATION;
+        """)
+
+        ext_commands = ''.join(f'using extension {ext};\n' for ext in exts)
+        await self.con.execute(f"""
+            START MIGRATION TO {{
+                using future warn_old_scoping;
+                {ext_commands}
+                module default {{ }}
+            }};
+            POPULATE MIGRATION;
+            COMMIT MIGRATION;
+        """)
+
+        await self.con.query("""
+            describe current database config as ddl
+        """)
+        await self.con.query("""
+            describe instance config as ddl
+        """)
+
+        await self.con.execute(f"""
+            START MIGRATION TO {{
+                {ext_commands}
+                module default {{ }}
+            }};
+            POPULATE MIGRATION;
+            COMMIT MIGRATION;
+        """)
+
+        await self.con.execute(f"""
+            START MIGRATION TO {{
+                using future warn_old_scoping;
+                {ext_commands}
+                module default {{ }}
+            }};
+            POPULATE MIGRATION;
+            COMMIT MIGRATION;
+        """)
+
+        await self.con.execute(f"""
+            START MIGRATION TO {{
+                module default {{ }}
+            }};
+            POPULATE MIGRATION;
+            COMMIT MIGRATION;
+        """)

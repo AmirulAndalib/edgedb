@@ -129,6 +129,47 @@ class TestEdgeQLExtPgTrgm(tb.QueryTestCase):
             index_type="ext::pg_trgm::gist",
         )
 
+        qry = """
+            SELECT
+                Gist2 {
+                    p_str,
+                    sim_dist := ext::pg_trgm::similarity_dist(
+                        .p_str, "q0987wertyu0988"
+                    ),
+                    p_str_2,
+                    sim_dist_2 := ext::pg_trgm::similarity_dist(
+                        .p_str_2, "q0987opasdf0988"
+                    ),
+                }
+            ORDER BY
+                .sim_dist EMPTY LAST THEN .sim_dist_2 EMPTY LAST
+            LIMIT
+                2
+        """
+
+        await self.assert_query_result(
+            qry,
+            [
+                {
+                    "p_str": "qwertyu0988",
+                    "sim_dist": 0.411765,
+                    "p_str_2": "iopasdf0988",
+                    "sim_dist_2": 0.5,
+                },
+                {
+                    "p_str": "qwertyu0987",
+                    "sim_dist": 0.5,
+                    "p_str_2": "iopasdf0987",
+                    "sim_dist_2": 0.57894737,
+                },
+            ]
+        )
+
+        await self.assert_index_use(
+            qry,
+            index_type="ext::pg_trgm::gist",
+        )
+
     async def test_edgeql_ext_pg_trgm_word_similarity(self):
         await self.assert_query_result(
             """
@@ -207,6 +248,43 @@ class TestEdgeQLExtPgTrgm(tb.QueryTestCase):
                 {
                     "p_str": "Kabikala",
                     "word_sim_dist": 0.538462,
+                },
+            ]
+        )
+
+        await self.assert_index_use(
+            qry,
+            index_type="ext::pg_trgm::gist",
+        )
+
+        qry = """
+            SELECT
+                Gist2 {
+                    p_str,
+                    word_sim_dist := ext::pg_trgm::word_similarity_dist(
+                        "Kabankala", .p_str
+                    ),
+                    p_str_2,
+                    word_sim_dist_2 := ext::pg_trgm::word_similarity_dist(
+                        "Pub", .p_str_2
+                    )
+                }
+            ORDER BY
+                .word_sim_dist EMPTY LAST THEN .word_sim_dist_2 EMPTY LAST
+            LIMIT
+                2
+        """
+
+        await self.assert_query_result(
+            qry,
+            [
+                {
+                    "p_str": "Kabankala",
+                    "word_sim_dist": 0.0,
+                },
+                {
+                    "p_str": "Kabankalan City Public Plaza",
+                    "word_sim_dist": 0.1,
                 },
             ]
         )
@@ -303,4 +381,122 @@ class TestEdgeQLExtPgTrgm(tb.QueryTestCase):
         await self.assert_index_use(
             qry,
             index_type="ext::pg_trgm::gist",
+        )
+
+    async def test_edgeql_ext_pg_trgm_config(self):
+        # We are going to fiddle with the similarity_threshold config
+        # and make sure it works right.
+
+        sim_query = """
+            WITH similar := (
+                SELECT
+                    Gist {
+                        p_str,
+                        sim := ext::pg_trgm::similarity(.p_str, "qwertyu0988")
+                    }
+                FILTER
+                    ext::pg_trgm::similar(.p_str, "qwertyu0988")
+            ),
+            SELECT exists similar and all(similar.sim >= <float32>$sim)
+        """
+
+        cfg_query = """
+            select cfg::Config.extensions[is ext::pg_trgm::Config]
+            .similarity_threshold;
+        """
+
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.3),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [False],
+            variables=dict(sim=0.5),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [False],
+            variables=dict(sim=0.9),
+        )
+
+        await self.assert_query_result(
+            cfg_query,
+            [0.3],
+        )
+
+        await self.con.execute('''
+            configure session
+            set ext::pg_trgm::Config::similarity_threshold := 0.5
+        ''')
+
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.3),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.5),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [False],
+            variables=dict(sim=0.9),
+        )
+        await self.assert_query_result(
+            cfg_query,
+            [0.5],
+        )
+
+        await self.con.execute('''
+            configure session
+            set ext::pg_trgm::Config::similarity_threshold := 0.9
+        ''')
+
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.3),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.5),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.9),
+        )
+        await self.assert_query_result(
+            cfg_query,
+            [0.9],
+        )
+
+        await self.con.execute('''
+            configure session
+            reset ext::pg_trgm::Config::similarity_threshold
+        ''')
+
+        await self.assert_query_result(
+            sim_query,
+            [True],
+            variables=dict(sim=0.3),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [False],
+            variables=dict(sim=0.5),
+        )
+        await self.assert_query_result(
+            sim_query,
+            [False],
+            variables=dict(sim=0.9),
+        )
+        await self.assert_query_result(
+            cfg_query,
+            [0.3],
         )

@@ -18,7 +18,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Callable, TypeVar, TYPE_CHECKING
 
 import enum
 
@@ -44,6 +44,7 @@ class Capability(enum.IntFlag):
 
     ALL               = 0xFFFF_FFFF_FFFF_FFFF  # noqa
     WRITE             = (MODIFICATIONS | DDL | PERSISTENT_CONFIG)  # noqa
+    NONE              = 0  # noqa
 
     def make_error(
         self,
@@ -82,6 +83,12 @@ class OutputFormat(strenum.StrEnum):
 class InputFormat(strenum.StrEnum):
     BINARY = 'BINARY'
     JSON = 'JSON'
+
+
+class InputLanguage(strenum.StrEnum):
+    EDGEQL = 'EDGEQL'
+    SQL = 'SQL'
+    SQL_PARAMS = 'SQL_PARAMS'
 
 
 def cardinality_from_ir_value(card: ir.Cardinality) -> Cardinality:

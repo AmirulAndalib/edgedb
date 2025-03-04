@@ -173,8 +173,8 @@ class TestIndexes(tb.DDLTestCase):
 
         async with self.assertRaisesRegexTx(
             edgedb.SchemaDefinitionError,
-            "cannot use aggregate functions or operators in an "
-            "index expression",
+            "cannot use SET OF operator 'std::EXISTS' "
+            "in an index expression",
         ):
             await self.con.execute(
                 """
@@ -186,8 +186,8 @@ class TestIndexes(tb.DDLTestCase):
 
         async with self.assertRaisesRegexTx(
             edgedb.SchemaDefinitionError,
-            "cannot use aggregate functions or operators in an "
-            "index expression",
+            "cannot use SET OF function 'std::count' "
+            "in an index expression",
         ):
             await self.con.execute(
                 """
@@ -298,8 +298,8 @@ class TestIndexes(tb.DDLTestCase):
                             'name': 'fts::index',
                             'kwargs': [],
                             'expr': (
-                                'fts::with_options(.name, '
-                                'language := fts::Language.eng)'
+                                'std::fts::with_options(.name, '
+                                'language := std::fts::Language.eng)'
                             ),
                             'abstract': False,
                         }
@@ -343,8 +343,8 @@ class TestIndexes(tb.DDLTestCase):
                             'name': 'default::MyIndex',
                             'kwargs': [],
                             'expr': (
-                                'fts::with_options(.name, '
-                                'language := fts::Language.eng)'
+                                'std::fts::with_options(.name, '
+                                'language := std::fts::Language.eng)'
                             ),
                             'abstract': False,
                         }
@@ -379,7 +379,7 @@ class TestIndexes(tb.DDLTestCase):
                     'abstract': True,
                     'ancestors': [
                         {
-                            'name': 'fts::index',
+                            'name': 'std::fts::index',
                             'params': [],
                             'abstract': True,
                         }
@@ -402,3 +402,31 @@ class TestIndexes(tb.DDLTestCase):
                 };
                 """
             )
+
+    async def test_index_11(self):
+        # indexes should not be rebased, but should be dropped and recreated
+
+        await self.con.execute(
+            '''
+            create type Hello {
+                create required property world: str;
+                create index pg::btree on (.world);
+            };
+            '''
+        )
+        await self.migrate(
+            r"""
+            type Hello {
+                property world: str;
+                index pg::hash on (.world);
+            };
+            """
+        )
+        await self.migrate(
+            r"""
+            type Hello {
+                property world: str;
+                index pg::btree on (.world);
+            };
+            """
+        )

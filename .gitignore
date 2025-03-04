@@ -3,7 +3,10 @@
 *.pyo
 *.o
 *.so
-.vscode
+*.dylib
+.vscode/
+.zed/
+.helix/
 *~
 .#*
 .*.swp
@@ -17,6 +20,7 @@
 /tmp
 __pycache__/
 .d8_history
+/.venv
 /.eggs
 /*.egg
 /*.egg-info
@@ -37,3 +41,4 @@ docs/_build
 /.vagga
 /.dmypy.json
 /compile_commands.json
+/pyrightconfig.json

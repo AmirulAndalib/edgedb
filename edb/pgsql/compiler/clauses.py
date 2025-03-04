@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Optional, Union, Sequence, List
 
 import random
 
@@ -34,6 +34,8 @@ from edb.pgsql import types as pg_types
 from . import astutils
 from . import context
 from . import dispatch
+from . import dml
+from . import enums as pgce
 from . import output
 from . import pathctx
 from . import relctx
@@ -48,10 +50,13 @@ def get_volatility_ref(
     """Produce an appropriate volatility_ref from a path_id."""
 
     ref: Optional[pgast.BaseExpr] = relctx.maybe_get_path_var(
-        stmt, path_id, aspect='identity', ctx=ctx)
+        stmt, path_id, aspect=pgce.PathAspect.ITERATOR, ctx=ctx)
+    if not ref:
+        ref = relctx.maybe_get_path_var(
+            stmt, path_id, aspect=pgce.PathAspect.IDENTITY, ctx=ctx)
     if not ref:
         rvar = relctx.maybe_get_path_rvar(
-            stmt, path_id, aspect='value', ctx=ctx)
+            stmt, path_id, aspect=pgce.PathAspect.VALUE, ctx=ctx)
         if (
             rvar
             and isinstance(rvar.query, pgast.ReturningQuery)
@@ -75,26 +80,23 @@ def get_volatility_ref(
             ref = pgast.ColumnRef(name=[rvar.alias.aliasname, name])
         else:
             ref = relctx.maybe_get_path_var(
-                stmt, path_id, aspect='value', ctx=ctx)
+                stmt, path_id, aspect=pgce.PathAspect.VALUE, ctx=ctx)
 
     return ref
 
 
 def setup_iterator_volatility(
         iterator: Optional[Union[irast.Set, pgast.IteratorCTE]], *,
-        is_cte: bool=False,
         ctx: context.CompilerContextLevel) -> None:
     if iterator is None:
         return
-
-    old = () if is_cte else ctx.volatility_ref
 
     path_id = iterator.path_id
 
     # We use a callback scheme here to avoid inserting volatility ref
     # columns unless there is actually a volatile operation that
     # requires it.
-    ctx.volatility_ref = old + (
+    ctx.volatility_ref += (
         lambda stmt, xctx: get_volatility_ref(path_id, stmt, ctx=xctx),)
 
 
@@ -122,57 +124,67 @@ def compile_materialized_exprs(
         for mat_set in mat_sets:
             if len(mat_set.uses) <= 1:
                 continue
-            assert mat_set.finalized
+            assert mat_set.finalized, "materialized set was not finalized!"
             if relctx.find_rvar(
                     query, flavor='packed',
                     path_id=mat_set.materialized.path_id, ctx=matctx):
                 continue
 
-            mat_ids = set(mat_set.uses)
+            _compile_materialized_expr(query, mat_set, ctx=matctx)
 
-            # We pack optional things into arrays also, since it works.
-            # TODO: use NULL?
-            card = mat_set.cardinality
-            assert card != qltypes.Cardinality.UNKNOWN
-            is_singleton = card.is_single() and not card.can_be_zero()
 
-            old_scope = matctx.path_scope
-            matctx.path_scope = old_scope.new_child()
-            for mat_id in mat_ids:
-                for k in old_scope:
-                    if k.startswith(mat_id):
-                        matctx.path_scope[k] = None
-            mat_qry = relgen.set_as_subquery(
-                mat_set.materialized, as_value=True, ctx=matctx
-            )
+def _compile_materialized_expr(
+    query: pgast.SelectStmt,
+    mat_set: irast.MaterializedSet,
+    *,
+    ctx: context.CompilerContextLevel,
+) -> None:
+    mat_ids = set(mat_set.uses)
 
-            if not is_singleton:
-                mat_qry = relctx.set_to_array(
-                    path_id=mat_set.materialized.path_id,
-                    query=mat_qry,
-                    ctx=matctx)
+    # We pack optional things into arrays also, since it works.
+    # TODO: use NULL?
+    card = mat_set.cardinality
+    assert card != qltypes.Cardinality.UNKNOWN
+    is_singleton = card.is_single() and not card.can_be_zero()
 
-            if not mat_qry.target_list[0].name:
-                mat_qry.target_list[0].name = ctx.env.aliases.get('v')
+    old_scope = ctx.path_scope
+    ctx.path_scope = old_scope.new_child()
+    for mat_id in mat_ids:
+        for k in old_scope:
+            if k.startswith(mat_id):
+                ctx.path_scope[k] = None
+    mat_qry = relgen.set_as_subquery(
+        mat_set.materialized, as_value=True, ctx=ctx
+    )
 
-            ref = pgast.ColumnRef(
-                name=[mat_qry.target_list[0].name],
-                is_packed_multi=not is_singleton,
-            )
-            for mat_id in mat_ids:
-                pathctx.put_path_packed_output(mat_qry, mat_id, ref)
+    if not is_singleton:
+        mat_qry = relctx.set_to_array(
+            path_id=mat_set.materialized.path_id,
+            query=mat_qry,
+            ctx=ctx)
 
-            mat_rvar = relctx.rvar_for_rel(mat_qry, lateral=True, ctx=matctx)
-            for mat_id in mat_ids:
-                relctx.include_rvar(
-                    query, mat_rvar, path_id=mat_id,
-                    flavor='packed', update_mask=False, pull_namespace=False,
-                    ctx=matctx,
-                )
+    if not mat_qry.target_list[0].name:
+        mat_qry.target_list[0].name = ctx.env.aliases.get('v')
+
+    ref = pgast.ColumnRef(
+        name=[mat_qry.target_list[0].name],
+        is_packed_multi=not is_singleton,
+    )
+    for mat_id in mat_ids:
+        pathctx.put_path_packed_output(mat_qry, mat_id, ref)
+
+    mat_rvar = relctx.rvar_for_rel(mat_qry, lateral=True, ctx=ctx)
+    for mat_id in mat_ids:
+        relctx.include_rvar(
+            query, mat_rvar, path_id=mat_id,
+            flavor='packed', update_mask=False, pull_namespace=False,
+            ctx=ctx,
+        )
 
 
 def compile_iterator_expr(
         query: pgast.SelectStmt, iterator_expr: irast.Set, *,
+        is_dml: bool,
         ctx: context.CompilerContextLevel) \
         -> pgast.PathRangeVar:
 
@@ -182,17 +194,22 @@ def compile_iterator_expr(
         subctx.expr_exposed = False
         subctx.rel = query
 
-        already_existed = bool(relctx.maybe_get_path_rvar(
-            query, iterator_expr.path_id, aspect='value', ctx=ctx))
         dispatch.visit(iterator_expr, ctx=subctx)
         iterator_rvar = relctx.get_path_rvar(
-            query, iterator_expr.path_id, aspect='value', ctx=ctx)
+            query,
+            iterator_expr.path_id,
+            aspect=pgce.PathAspect.VALUE,
+            ctx=ctx,
+        )
         iterator_query = iterator_rvar.query
 
         # If the iterator value is nullable, add a null test. This
         # makes sure that we don't spuriously produce output when
         # iterating over optional pointers.
         is_optional = ctx.scope_tree.is_optional(iterator_expr.path_id)
+        if isinstance(iterator_query, pgast.SelectStmt):
+            iterator_var = pathctx.get_path_value_var(
+                iterator_query, path_id=iterator_expr.path_id, env=ctx.env)
         if not is_optional:
             if isinstance(iterator_query, pgast.SelectStmt):
                 iterator_var = pathctx.get_path_value_var(
@@ -207,18 +224,29 @@ def compile_iterator_expr(
             else:
                 raise NotImplementedError()
 
-        # Regardless of result type, we use transient identity,
-        # for path identity of the iterator expression.  This is
-        # necessary to maintain correct correlation for the state
-        # of iteration in DML statements.
-        # The already_existed check is to avoid adding in bogus volatility refs
-        # when we reprocess an iterator that was hoisted.
-        if not already_existed:
-            relctx.ensure_bond_for_expr(
-                iterator_expr.expr.result, iterator_query, ctx=subctx)
-            if is_optional:
-                relctx.ensure_bond_for_expr(
-                    iterator_expr, iterator_query, ctx=subctx)
+        # For DML-containing FOR, regardless of result type, iterators need
+        # their own transient identity for path identity of the
+        # iterator expression in order maintain correct correlation
+        # for the state of iteration in DML statements, even when
+        # there are duplicates in the iterator.  This gets tracked as
+        # a special ITERATOR aspect in order to distinguish it from
+        # actual object identity.
+        #
+        # We also do this for optional iterators, since object
+        # identity isn't safe to use as a volatility ref if the object
+        # might be NULL.
+        if is_dml or is_optional:
+            relctx.create_iterator_identity_for_path(
+                iterator_expr.path_id, iterator_query,
+                apply_volatility=is_dml,
+                ctx=subctx)
+
+            pathctx.put_path_rvar(
+                query,
+                iterator_expr.path_id,
+                iterator_rvar,
+                aspect=pgce.PathAspect.ITERATOR,
+            )
 
     return iterator_rvar
 
@@ -242,18 +270,101 @@ def compile_output(
     return val
 
 
-def compile_dml_bindings(
-        stmt: irast.Stmt, *,
-        ctx: context.CompilerContextLevel) -> None:
-    for binding in (stmt.bindings or ()):
+def compile_volatile_bindings(
+    stmt: irast.Stmt,
+    *,
+    ctx: context.CompilerContextLevel
+) -> None:
+    for binding, volatility in (stmt.bindings or ()):
         # If something we are WITH binding contains DML, we want to
         # compile it *now*, in the context of its initial appearance
-        # and not where the variable is used. This will populate
-        # dml_stmts with the CTEs, which will be picked up when the
-        # variable is referenced.
-        if irutils.contains_dml(binding):
+        # and not where the variable is used.
+        #
+        # Similarly, if something we are WITH binding is volatile and the stmt
+        # contains dml, we similarly want to compile it *now*.
+
+        # If the binding is a with binding for a DML stmt, manually construct
+        # the CTEs.
+        #
+        # Note: This condition is checked first, because if the binding
+        # *references* DML then contains_dml is true. If the binding is compiled
+        # normally, since the referenced DML was already compiled, the rvar will
+        # be retrieved, and no CTEs will be set up.
+        if volatility.is_volatile() and irutils.contains_dml(stmt):
+            _compile_volatile_binding_for_dml(stmt, binding, ctx=ctx)
+
+        # For typical DML, just compile it. This will populate dml_stmts with
+        # the CTEs, which will be picked up when the variable is referenced.
+        elif irutils.contains_dml(binding):
             with ctx.substmt() as bctx:
                 dispatch.compile(binding, ctx=bctx)
+
+
+def _compile_volatile_binding_for_dml(
+    stmt: irast.Stmt,
+    binding: irast.Set,
+    *,
+    ctx: context.CompilerContextLevel
+) -> None:
+    materialized_set = None
+    if (
+        stmt.materialized_sets
+        and binding.typeref.id in stmt.materialized_sets
+    ):
+        materialized_set = stmt.materialized_sets[binding.typeref.id]
+    assert materialized_set is not None
+
+    last_iterator = ctx.enclosing_cte_iterator
+
+    with (
+        context.output_format(ctx, context.OutputFormat.NATIVE),
+        ctx.newrel() as matctx
+    ):
+        matctx.materializing |= {stmt}
+        matctx.expr_exposed = True
+
+        dml.merge_iterator(last_iterator, matctx.rel, ctx=matctx)
+        setup_iterator_volatility(last_iterator, ctx=matctx)
+
+        _compile_materialized_expr(
+            matctx.rel, materialized_set, ctx=matctx
+        )
+
+        # Add iterator identity
+        bind_pathid = (
+            irast.PathId.new_dummy(ctx.env.aliases.get('bind_path'))
+        )
+        with matctx.subrel() as bind_pathid_ctx:
+            relctx.create_iterator_identity_for_path(
+                bind_pathid, bind_pathid_ctx.rel, ctx=bind_pathid_ctx
+            )
+        bind_id_rvar = relctx.rvar_for_rel(
+            bind_pathid_ctx.rel, lateral=True, ctx=matctx
+        )
+        relctx.include_rvar(
+            matctx.rel, bind_id_rvar, path_id=bind_pathid, ctx=matctx
+        )
+
+    bind_cte = pgast.CommonTableExpr(
+        name=ctx.env.aliases.get('bind'),
+        query=matctx.rel,
+        materialized=False,
+    )
+
+    bind_iterator = pgast.IteratorCTE(
+        path_id=bind_pathid,
+        cte=bind_cte,
+        parent=last_iterator,
+        iterator_bond=True,
+    )
+    ctx.toplevel_stmt.append_cte(bind_cte)
+
+    # Merge the new iterator
+    ctx.path_scope = ctx.path_scope.new_child()
+    dml.merge_iterator(bind_iterator, ctx.rel, ctx=ctx)
+    setup_iterator_volatility(bind_iterator, ctx=ctx)
+
+    ctx.enclosing_cte_iterator = bind_iterator
 
 
 def compile_filter_clause(
@@ -378,7 +489,7 @@ def scan_check_ctes(
             name='flag', val=pgast.BooleanConstant(val=True)
         )],
         relation=pgast.RelRangeVar(relation=pgast.Relation(
-            schemaname='edgedb', name='_dml_dummy')),
+            name='_dml_dummy')),
         where_clause=pgast.Expr(
             name="=",
             lexpr=pgast.ColumnRef(name=["id"]),
@@ -391,16 +502,25 @@ def scan_check_ctes(
     ))
 
 
+def insert_ctes(
+    stmt: pgast.Query, ctx: context.CompilerContextLevel
+) -> None:
+    if stmt.ctes is None:
+        stmt.ctes = []
+    stmt.ctes[:0] = [
+        *ctx.param_ctes.values(),
+        *ctx.ptr_inheritance_ctes.values(),
+        *ctx.ordered_type_ctes,
+    ]
+
+
 def fini_toplevel(
         stmt: pgast.Query, ctx: context.CompilerContextLevel) -> None:
 
     scan_check_ctes(stmt, ctx.env.check_ctes, ctx=ctx)
 
-    # Type rewrites go first.
-    if stmt.ctes is None:
-        stmt.ctes = []
-    stmt.ctes[:0] = list(ctx.param_ctes.values())
-    stmt.ctes[:0] = list(ctx.type_ctes.values())
+    # Type rewrites and inheritance CTEs go first.
+    insert_ctes(stmt, ctx)
 
     if ctx.env.named_param_prefix is None:
         # Adding unused parameters into a CTE

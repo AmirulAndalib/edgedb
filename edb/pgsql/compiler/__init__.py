@@ -19,7 +19,7 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import Optional, Tuple, Mapping, Dict, List, TYPE_CHECKING
 from dataclasses import dataclass
 
 from edb import errors
@@ -28,6 +28,7 @@ from edb.ir import ast as irast
 
 from edb.pgsql import ast as pgast
 from edb.pgsql import params as pgparams
+from edb.pgsql import types as pgtypes
 
 from . import config as _config_compiler  # NOQA
 from . import expr as _expr_compiler  # NOQA
@@ -37,8 +38,13 @@ from . import clauses
 from . import context
 from . import dispatch
 from . import dml
+from . import pathctx
+from . import aliases
 
 from .context import OutputFormat as OutputFormat # NOQA
+
+if TYPE_CHECKING:
+    import enums as pgce
 
 
 @dataclass(kw_only=True, slots=True, repr=False, eq=False, frozen=True)
@@ -48,6 +54,8 @@ class CompileResult:
     env: context.Environment
 
     argmap: Dict[str, pgast.Param]
+
+    detached_params: Optional[List[Tuple[str, ...]]] = None
 
 
 def compile_ir_to_sql_tree(
@@ -59,18 +67,29 @@ def compile_ir_to_sql_tree(
     singleton_mode: bool = False,
     named_param_prefix: Optional[tuple[str, ...]] = None,
     expected_cardinality_one: bool = False,
-    expand_inhviews: bool = False,
+    is_explain: bool = False,
     external_rvars: Optional[
-        Mapping[Tuple[irast.PathId, str], pgast.PathRangeVar]
+        Mapping[Tuple[irast.PathId, pgce.PathAspect], pgast.PathRangeVar]
     ] = None,
     external_rels: Optional[
         Mapping[
             irast.PathId,
-            Tuple[pgast.BaseRelation | pgast.CommonTableExpr, Tuple[str, ...]],
+            Tuple[
+                pgast.BaseRelation | pgast.CommonTableExpr,
+                Tuple[pgce.PathAspect, ...]
+            ],
         ]
     ] = None,
     backend_runtime_params: Optional[pgparams.BackendRuntimeParams]=None,
+    detach_params: bool = False,
+    alias_generator: Optional[aliases.AliasGenerator] = None,
+    versioned_stdlib: bool = True,
+    # HACK?
+    versioned_singleton: bool = False,
 ) -> CompileResult:
+    if singleton_mode and not versioned_singleton:
+        versioned_stdlib = False
+
     try:
         # Transform to sql tree
         query_params = []
@@ -105,6 +124,7 @@ def compile_ir_to_sql_tree(
             backend_runtime_params = pgparams.get_default_runtime_params()
 
         env = context.Environment(
+            alias_generator=alias_generator,
             output_format=output_format,
             expected_cardinality_one=expected_cardinality_one,
             named_param_prefix=named_param_prefix,
@@ -112,11 +132,12 @@ def compile_ir_to_sql_tree(
             type_rewrites=type_rewrites,
             ignore_object_shapes=ignore_shapes,
             explicit_top_cast=explicit_top_cast,
-            expand_inhviews=expand_inhviews,
+            is_explain=is_explain,
             singleton_mode=singleton_mode,
             scope_tree_nodes=scope_tree_nodes,
             external_rvars=external_rvars,
             backend_runtime_params=backend_runtime_params,
+            versioned_stdlib=versioned_stdlib,
         )
 
         ctx = context.CompilerContextLevel(
@@ -140,9 +161,33 @@ def compile_ir_to_sql_tree(
         qtree = dispatch.compile(ir_expr, ctx=ctx)
         dml.compile_triggers(triggers, qtree, ctx=ctx)
 
-        if isinstance(ir_expr, irast.Set) and not singleton_mode:
-            assert isinstance(qtree, pgast.Query)
-            clauses.fini_toplevel(qtree, ctx)
+        if not singleton_mode:
+            if isinstance(ir_expr, irast.Set):
+                assert isinstance(qtree, pgast.Query)
+                clauses.fini_toplevel(qtree, ctx)
+
+            elif isinstance(qtree, pgast.Query):
+                # Other types of expressions may compile to queries which may
+                # use inheritance CTEs. Ensure they are added here.
+                clauses.insert_ctes(qtree, ctx)
+
+        if detach_params:
+            detached_params_idx = {
+                ctx.argmap[param.name].index: (
+                    pgtypes.pg_type_from_ir_typeref(
+                        param.ir_type.base_type or param.ir_type,
+                        # Needs serialized=True so types without their own
+                        # binary encodings (like postgis::box2d) get mapped
+                        # to the real underlying type.
+                        serialized=True,
+                    )
+                )
+                for param in ctx.env.query_params
+                if not param.sub_params
+            }
+        else:
+            detached_params_idx = {}
+        detached_params = [p for _, p in sorted(detached_params_idx.items())]
 
     except errors.EdgeDBError:
         # Don't wrap propertly typed EdgeDB errors into
@@ -156,14 +201,16 @@ def compile_ir_to_sql_tree(
             args = []
         raise errors.InternalServerError(*args) from e
 
-    return CompileResult(ast=qtree, env=env, argmap=ctx.argmap)
+    return CompileResult(
+        ast=qtree, env=env, argmap=ctx.argmap, detached_params=detached_params
+    )
 
 
 def new_external_rvar(
     *,
     rel_name: Tuple[str, ...],
     path_id: irast.PathId,
-    outputs: Mapping[Tuple[irast.PathId, Tuple[str, ...]], str],
+    outputs: Mapping[Tuple[irast.PathId, Tuple[pgce.PathAspect, ...]], str],
 ) -> pgast.RelRangeVar:
     """Construct a ``RangeVar`` instance given a relation name and a path id.
 
@@ -197,6 +244,25 @@ def new_external_rvar(
             rel.path_outputs[output_pid, aspect] = var
 
     return rvar
+
+
+def new_external_rvar_as_subquery(
+    *,
+    rel_name: tuple[str, ...],
+    path_id: irast.PathId,
+    aspects: tuple[pgce.PathAspect, ...],
+) -> pgast.SelectStmt:
+    rvar = new_external_rvar(
+        rel_name=rel_name,
+        path_id=path_id,
+        outputs={},
+    )
+    qry = pgast.SelectStmt(
+        from_clause=[rvar],
+    )
+    for aspect in aspects:
+        pathctx.put_path_rvar(qry, path_id, rvar, aspect=aspect)
+    return qry
 
 
 def new_external_rel(

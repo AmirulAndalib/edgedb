@@ -42,10 +42,7 @@ class Scalar(CType):
     cname = None
 
     def __init__(
-        self,
-        doc: typing.Optional[str]=None,
-        *,
-        default: typing.Any=None
+        self, doc: typing.Optional[str] = None, *, default: typing.Any = None
     ) -> None:
         self.doc = doc
         self.default = default
@@ -60,9 +57,7 @@ class Scalar(CType):
         raise NotImplementedError
 
     def render_field(
-        self,
-        fieldname: str,
-        buf: render_utils.RenderBuffer
+        self, fieldname: str, buf: render_utils.RenderBuffer
     ) -> None:
         cname = self.cname
         if cname is None:
@@ -212,9 +207,7 @@ class ArrayOf(CType):
             self.element.dump(el, buffer)
 
     def render_field(
-        self,
-        fieldname: str,
-        buf: render_utils.RenderBuffer
+        self, fieldname: str, buf: render_utils.RenderBuffer
     ) -> None:
         self.length_in.render_field(f'num_{fieldname}', buf)
         self.element.render_field(f'{fieldname}[num_{fieldname}]', buf)
@@ -254,9 +247,7 @@ class FixedArrayOf(CType):
             self.element.dump(el, buffer)
 
     def render_field(
-        self,
-        fieldname: str,
-        buf: render_utils.RenderBuffer
+        self, fieldname: str, buf: render_utils.RenderBuffer
     ) -> None:
         self.element.render_field(f'{fieldname}[{self.length}]', buf)
 
@@ -293,9 +284,7 @@ class EnumOf(CType):
         self.value_in.dump(val.value, buffer)
 
     def render_field(
-        self,
-        fieldname: str,
-        buf: render_utils.RenderBuffer
+        self, fieldname: str, buf: render_utils.RenderBuffer
     ) -> None:
         typename = f'{self.value_in.cname}<{self.enum.__name__}>'
         buf.write(f'{typename.ljust(_PAD - 1)} {fieldname};')
@@ -381,9 +370,7 @@ class Struct:
 
     @classmethod
     def render_field(
-        cls,
-        fieldname: str,
-        buf: render_utils.RenderBuffer
+        cls, fieldname: str, buf: render_utils.RenderBuffer
     ) -> None:
         buf.write(f'{cls.__name__.ljust(_PAD - 1)} {fieldname};')
 
@@ -501,6 +488,12 @@ class ClientMessage(Message, abstract=True):
 ###############################################################################
 
 
+class InputLanguage(enum.Enum):
+
+    EDGEQL = 0x45  # b'E'
+    SQL = 0x53  # b'S'
+
+
 class OutputFormat(enum.Enum):
 
     BINARY = 0x62
@@ -524,6 +517,11 @@ class CompilationFlag(enum.IntFlag):
     INJECT_OUTPUT_TYPE_IDS   = 1 << 0    # noqa
     INJECT_OUTPUT_TYPE_NAMES = 1 << 1    # noqa
     INJECT_OUTPUT_OBJECT_IDS = 1 << 2    # noqa
+
+
+class DumpFlag(enum.IntFlag):
+
+    DUMP_SECRETS = 1 << 0    # noqa
 
 
 class ErrorSeverity(enum.Enum):
@@ -654,8 +652,8 @@ class DumpHeader(ServerMessage):
     mtype = MessageType('@')
     message_length = MessageLength
     attributes = KeyValues
-    major_ver = UInt16('Major version of EdgeDB.')
-    minor_ver = UInt16('Minor version of EdgeDB.')
+    major_ver = UInt16('Major version of Gel.')
+    minor_ver = UInt16('Minor version of Gel.')
     schema_ddl = String('Schema.')
     types = ArrayOf(UInt32, DumpTypeInfo, 'Type identifiers.')
     descriptors = ArrayOf(UInt32, DumpObjectDesc, 'Object descriptors.')
@@ -753,6 +751,7 @@ class Dump(ClientMessage):
     mtype = MessageType('>')
     message_length = MessageLength
     annotations = Annotations
+    flags = EnumOf(UInt64, DumpFlag, 'A bit mask of dump options.')
 
 
 class Sync(ClientMessage):
@@ -802,6 +801,7 @@ class Parse(ClientMessage):
     compilation_flags = EnumOf(UInt64, CompilationFlag,
                                'A bit mask of query options.')
     implicit_limit = UInt64('Implicit LIMIT clause on returned sets.')
+    input_language = EnumOf(UInt8, InputLanguage, 'Command source language.')
     output_format = EnumOf(UInt8, OutputFormat, 'Data output format.')
     expected_cardinality = EnumOf(UInt8, Cardinality,
                                   'Expected result cardinality.')
@@ -820,6 +820,7 @@ class Execute(ClientMessage):
     compilation_flags = EnumOf(UInt64, CompilationFlag,
                                'A bit mask of query options.')
     implicit_limit = UInt64('Implicit LIMIT clause on returned sets.')
+    input_language = EnumOf(UInt8, InputLanguage, 'Command source language.')
     output_format = EnumOf(UInt8, OutputFormat, 'Data output format.')
     expected_cardinality = EnumOf(UInt8, Cardinality,
                                   'Expected result cardinality.')

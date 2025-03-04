@@ -20,7 +20,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Type
 
 import typing
 import functools
@@ -28,7 +28,7 @@ import os
 import re
 import unittest
 
-from edb.common import context
+from edb.common import span
 from edb.common import debug
 from edb.common import devmode
 from edb.common import markup
@@ -41,7 +41,6 @@ from edb.edgeql import parser as qlparser
 from edb.edgeql.parser import grammar as qlgrammar
 from edb.edgeql import qltypes
 
-from edb.server import defines
 from edb.server import compiler as edbcompiler
 
 from edb.schema import ddl as s_ddl
@@ -51,6 +50,7 @@ from edb.schema import reflection as s_refl
 from edb.schema import schema as s_schema
 from edb.schema import std as s_std
 from edb.schema import utils as s_utils
+from edb.schema import modules as s_mod
 
 
 def must_fail(exc_type, exc_msg_re=None, **kwargs):
@@ -175,24 +175,7 @@ class BaseDocTest(unittest.TestCase, metaclass=DocTestMeta):
         )
 
 
-class PreloadParserGrammarMixin:
-    pass
-
-
-def should_preload_parser(
-    cases: Iterable[unittest.TestCase],
-) -> bool:
-    for cas in cases:
-        if isinstance(cas, PreloadParserGrammarMixin):
-            return True
-    return False
-
-
-def preload_parser() -> None:
-    qlparser.preload(allow_rebuild=True)
-
-
-class BaseSyntaxTest(BaseDocTest, PreloadParserGrammarMixin):
+class BaseSyntaxTest(BaseDocTest):
     ast_to_source: Optional[Any] = None
     markup_dump_lexer: Optional[str] = None
 
@@ -211,7 +194,7 @@ class BaseSyntaxTest(BaseDocTest, PreloadParserGrammarMixin):
             markup.dump(inast)
 
         # make sure that the AST has context
-        context.ContextValidator().visit(inast)
+        span.SpanValidator().visit(inast)
 
         processed_src = self.ast_to_source(inast)
 
@@ -300,7 +283,7 @@ def new_compiler():
     )
 
 
-class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
+class BaseSchemaTest(BaseDocTest):
     DEFAULT_MODULE = 'default'
     SCHEMA: Optional[str] = None
 
@@ -315,7 +298,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
             cls.schema = _load_std_schema()
 
     @classmethod
-    def run_ddl(cls, schema, ddl, default_module=defines.DEFAULT_MODULE_ALIAS):
+    def run_ddl(cls, schema, ddl, default_module=s_mod.DEFAULT_MODULE_ALIAS):
         statements = edgeql.parse_block(ddl)
 
         current_schema = schema
@@ -330,7 +313,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
                 if target_schema is None:
                     target_schema = _load_std_schema()
 
-                migration_target = s_ddl.apply_sdl(
+                migration_target, _ = s_ddl.apply_sdl(
                     stmt.target,
                     base_schema=target_schema,
                     current_schema=current_schema,
@@ -347,7 +330,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
                     raise errors.QueryError(
                         'unexpected POPULATE MIGRATION:'
                         ' not currently in a migration block',
-                        context=stmt.context,
+                        span=stmt.span,
                     )
 
                 migration_diff = s_ddl.delta_schemas(
@@ -396,7 +379,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
                     raise errors.QueryError(
                         'unexpected COMMIT MIGRATION:'
                         ' not currently in a migration block',
-                        context=stmt.context,
+                        span=stmt.span,
                     )
 
                 last_migration = current_schema.get_last_migration()
@@ -427,7 +410,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
                 migration_target = None
                 migration_script = []
 
-            elif isinstance(stmt, qlast.DDL):
+            elif isinstance(stmt, qlast.DDLCommand):
                 if migration_target is not None:
                     migration_script.append(stmt)
                     ddl_plan = None
@@ -455,7 +438,8 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
 
     @classmethod
     def load_schema(
-            cls, source: str, modname: Optional[str]=None) -> s_schema.Schema:
+        cls, source: str, modname: Optional[str] = None
+    ) -> s_schema.Schema:
         if not modname:
             modname = cls.DEFAULT_MODULE
         sdl_schema = qlparser.parse_sdl(f'module {modname} {{ {source} }}')
@@ -464,7 +448,7 @@ class BaseSchemaTest(BaseDocTest, PreloadParserGrammarMixin):
             sdl_schema,
             base_schema=schema,
             current_schema=schema,
-        )
+        )[0]
 
     @classmethod
     def get_schema_script(cls):

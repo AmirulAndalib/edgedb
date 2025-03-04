@@ -20,7 +20,7 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Optional, Type, Dict, NamedTuple
 
 import json
 import re
@@ -30,6 +30,8 @@ from edb.common import value_dispatch
 from edb.common import uuidgen
 
 from edb.graphql import types as gql_types
+
+from edb.pgsql.parser import exceptions as parser_errors
 
 from edb.schema import name as sn
 from edb.schema import objtypes as s_objtypes
@@ -80,15 +82,18 @@ constraint_errors = frozenset({
     pgerrors.ERROR_EXCLUSION_VIOLATION,
 })
 
+branch_errors = {
+    pgerrors.ERROR_INVALID_CATALOG_NAME: errors.UnknownDatabaseError,
+    pgerrors.ERROR_DUPLICATE_DATABASE: errors.DuplicateDatabaseDefinitionError,
+}
+
 directly_mappable = {
     pgerrors.ERROR_DIVISION_BY_ZERO: errors.DivisionByZeroError,
     pgerrors.ERROR_INTERVAL_FIELD_OVERFLOW: errors.NumericOutOfRangeError,
     pgerrors.ERROR_READ_ONLY_SQL_TRANSACTION: errors.TransactionError,
     pgerrors.ERROR_SERIALIZATION_FAILURE: errors.TransactionSerializationError,
     pgerrors.ERROR_DEADLOCK_DETECTED: errors.TransactionDeadlockError,
-    pgerrors.ERROR_INVALID_CATALOG_NAME: errors.UnknownDatabaseError,
     pgerrors.ERROR_OBJECT_IN_USE: errors.ExecutionError,
-    pgerrors.ERROR_DUPLICATE_DATABASE: errors.DuplicateDatabaseDefinitionError,
     pgerrors.ERROR_IDLE_IN_TRANSACTION_TIMEOUT:
         errors.IdleTransactionTimeoutError,
     pgerrors.ERROR_QUERY_CANCELLED: errors.QueryTimeoutError,
@@ -114,7 +119,7 @@ constraint_res = {
     'id': re.compile(r'^.*"(?:\w+)_data_pkey".*$'),
     'link_target_del': re.compile(r'^.*link target policy$'),
     'scalar': re.compile(
-        r'^value for domain (\w+) violates check constraint "(.+)"'
+        r'^value for domain ([\w\.]+) violates check constraint "(.+)"'
     ),
 }
 
@@ -294,8 +299,20 @@ def static_interpret_by_code(
     return errors.InternalServerError(err_details.message)
 
 
-@static_interpret_by_code.register_for_all(
-    directly_mappable.keys())
+@static_interpret_by_code.register_for_all(branch_errors.keys())
+def _static_interpret_branch_errors(
+    code: str,
+    err_details: ErrorDetails,
+    from_graphql: bool = False,
+):
+    errcls = branch_errors[code]
+
+    msg = err_details.message.replace('database', 'branch', 1)
+
+    return errcls(msg)
+
+
+@static_interpret_by_code.register_for_all(directly_mappable.keys())
 def _static_interpret_directly_mappable(
     code: str,
     err_details: ErrorDetails,
@@ -432,21 +449,25 @@ def _static_interpret_schema_errors(
     return SchemaRequired
 
 
-@static_interpret_by_code.register(
-    pgerrors.ERROR_INVALID_PARAMETER_VALUE)
+@static_interpret_by_code.register(pgerrors.ERROR_INVALID_PARAMETER_VALUE)
 def _static_interpret_invalid_param_value(
     _code: str,
     err_details: ErrorDetails,
     from_graphql: bool = False,
 ):
+    error_message_context = ''
+    if err_details.detail_json:
+        error_message_context = (
+            err_details.detail_json.get('error_message_context', '')
+        )
+
     return errors.InvalidValueError(
-        err_details.message,
-        details=err_details.detail if err_details.detail else None
+        error_message_context + err_details.message,
+        details=err_details.detail if err_details.detail else None,
     )
 
 
-@static_interpret_by_code.register(
-    pgerrors.ERROR_WRONG_OBJECT_TYPE)
+@static_interpret_by_code.register(pgerrors.ERROR_WRONG_OBJECT_TYPE)
 def _static_interpret_wrong_object_type(
     _code: str,
     err_details: ErrorDetails,
@@ -456,18 +477,21 @@ def _static_interpret_wrong_object_type(
         return SchemaRequired
 
     hint = None
+    error_message_context = ''
     if err_details.detail_json:
         hint = err_details.detail_json.get('hint')
+        error_message_context = (
+            err_details.detail_json.get('error_message_context', '')
+        )
 
     return errors.InvalidValueError(
-        err_details.message,
+        error_message_context + err_details.message,
         details=err_details.detail if err_details.detail else None,
         hint=hint,
     )
 
 
-@static_interpret_by_code.register(
-    pgerrors.ERROR_CARDINALITY_VIOLATION)
+@static_interpret_by_code.register(pgerrors.ERROR_CARDINALITY_VIOLATION)
 def _static_interpret_cardinality_violation(
     _code: str,
     err_details: ErrorDetails,
@@ -490,8 +514,7 @@ def _static_interpret_cardinality_violation(
     return errors.InternalServerError(err_details.message)
 
 
-@static_interpret_by_code.register(
-    pgerrors.ERROR_FEATURE_NOT_SUPPORTED)
+@static_interpret_by_code.register(pgerrors.ERROR_FEATURE_NOT_SUPPORTED)
 def _static_interpret_feature_not_supported(
     _code: str,
     err_details: ErrorDetails,
@@ -603,10 +626,16 @@ def _interpret_constraint_errors(
             obj_ptr = obj_type.getptr(schema, sn.UnqualName('id'))
             constraint = obj_ptr.get_exclusive_constraints(schema)[0]
 
-        msg = constraint.format_error(schema)
+        # msg is for the "end user" that should not mention pointers and object
+        # type it is also affected by setting `errmessage` in user schema.
+        msg = constraint.format_error_message(schema)
+
+        # details is for the "developer" that must explain what's going on
+        # under the hood. It contains verbose descriptions of object involved.
         subject = constraint.get_subject(schema)
-        vname = subject.get_verbosename(schema, with_parent=True)
-        details = constraint.format_error_message(schema, vname)
+        subject_description = subject.get_verbosename(schema, with_parent=True)
+        constraint_description = constraint.get_verbosename(schema)
+        details = f'violated {constraint_description} on {subject_description}'
 
         if from_graphql:
             msg = gql_replace_type_names_in_text(msg)
@@ -721,3 +750,21 @@ def _interpret_wrong_object_type(
         )
 
     return errors.InternalServerError(err_details.message)
+
+
+def static_interpret_psql_parse_error(
+    exc: parser_errors.PSqlParseError
+) -> errors.EdgeDBError:
+    res: errors.EdgeDBError
+    if isinstance(exc, parser_errors.PSqlSyntaxError):
+        res = errors.EdgeQLSyntaxError(str(exc))
+        res.set_position(exc.cursor_pos - 1, None)
+        res.compute_line_col(exc.query_source)
+    elif isinstance(exc, parser_errors.PSqlUnsupportedError):
+        res = errors.UnsupportedFeatureError(str(exc))
+        if exc.location is not None:
+            res.set_position(exc.location, None)
+    else:
+        res = errors.InternalServerError(str(exc))
+
+    return res

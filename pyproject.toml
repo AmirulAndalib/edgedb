@@ -1,38 +1,51 @@
 [project]
-name = "edgedb-server"
-description = "EdgeDB Server"
-requires-python = '>=3.10.0'
-dynamic = ["entry-points", "version"]
+name = "gel-server"
+description = "Gel Server"
+requires-python = '>=3.12.0'
+dynamic = ["version"]
 dependencies = [
-    'edgedb==1.6.0',
+    'gel==3.0.0b7',
 
     'httptools>=0.6.0',
     'immutables>=0.18',
     'parsing~=2.0',
-    'uvloop~=0.17.0',
+    'uvloop~=0.21.0',
 
-    'click~=7.1',
-    'cryptography~=35.0',
+    'click~=8.0',
+    'cryptography~=42.0',
     'graphql-core~=3.1.5',
-    'jwcrypto~=1.3.1',
     'psutil~=5.8',
     'setproctitle~=1.2',
 
-    'httpx~=0.24.1',
-    'httpx_cache~=0.12.0',
+    'webauthn~=2.0.0',
     'argon2-cffi~=23.1.0',
-    'aiosmtplib~=2.0',
+    'aiosmtplib~=3.0',
+    'tiktoken~=0.7.0',
+    'mistral_common~=1.2.1',
 ]
+
+[project.scripts]
+edb = "edb.tools.edb:edbcommands"
+
+edgedb-server = "edb.server.main:main"
+edgedb-load-ext = "edb.load_ext.main:main"
+edgedb-ls = "edb.language_server.main:main"
+edgedb = "edb.cli:rustcli"
+
+gel-server = "edb.server.main:main"
+gel-load-ext = "edb.load_ext.main:main"
+gel-ls = "edb.language_server.main:main"
+gel-dev = "edb.cli:rustcli"
 
 [project.optional-dependencies]
 test = [
-    'black~=21.7b0',
-    'coverage~=5.5',
-    'flake8~=6.0.0',
-    'flake8-bugbear~=23.1.20',
-    'pycodestyle~=2.10.0',
-    'pyflakes~=3.0.1',
-    'asyncpg~=0.26.0',
+    'black~=24.2.0',
+    'coverage~=7.4',
+    'ruff==0.3.7',
+    'asyncpg~=0.30.0',
+
+    # Needed for testing asyncutil
+    'async_solipsism==0.5.0',
 
     # Needed for test_docs_sphinx_ext
     'requests-xml~=0.2.3',
@@ -42,16 +55,16 @@ test = [
     'MarkupSafe~=1.1',
     'PyYAML~=6.0',
 
-    'mypy==1.0.0',
+    'mypy[faster-cache] ~= 1.13.0',
     # mypy stub packages; when updating, you can use mypy --install-types
     # to install stub packages and then pip freeze to read out the specifier
-    'types-click~=7.1',
-    'types-docutils~=0.17.0,<0.17.6',  # incomplete nodes.document.__init__
+    'types-docutils~=0.17.0,<0.17.6', # incomplete nodes.document.__init__
     'types-Jinja2~=2.11',
     'types-MarkupSafe~=1.1',
-    'types-pkg-resources~=0.1.3',
+    'types-setuptools~=71.1.0',
     'types-typed-ast~=1.4.2',
     'types-requests~=2.25.6',
+    'types-PyYAML~=6.0',
 
     'prometheus_client~=0.11.0',
 
@@ -60,6 +73,11 @@ test = [
     'Pygments~=2.10.0',
     'Sphinx~=4.2.0',
     'sphinxcontrib-asyncio~=0.3.0',
+    'sphinxcontrib-applehelp<1.0.8',
+    'sphinxcontrib-devhelp<1.0.6',
+    'sphinxcontrib-htmlhelp<2.0.5',
+    'sphinxcontrib-serializinghtml<1.1.10',
+    'sphinxcontrib-qthelp<1.0.7',
     'sphinx_code_tabs~=0.5.3',
 ]
 
@@ -72,16 +90,18 @@ docs = [
     'sphinx_code_tabs~=0.5.3',
 ]
 
+language-server = ['pygls~=1.3.1']
+
 [build-system]
 requires = [
-    "Cython (>=0.29.32, <0.30.0)",
+    "Cython(>=3.0.11,<3.1.0)",
     "packaging >= 21.0",
     "setuptools >= 67",
-    "setuptools-rust ~= 0.12.1",
+    "setuptools-rust ~= 1.8",
     "wheel",
 
     "parsing ~= 2.0",
-    'edgedb == 1.6.0',
+    "gel==3.0.0b7",
 ]
 # Custom backend needed to set up build-time sys.path because
 # setup.py needs to import `edb.buildmeta`.
@@ -89,7 +109,7 @@ build-backend = "build_backend"
 backend-path = ["."]
 
 [tool.setuptools]
-packages = {find = { include = ["edb", "edb.*"] }}
+packages = { find = { include = ["edb", "edb.*"] } }
 zip-safe = false
 
 
@@ -107,7 +127,18 @@ skip-string-normalization = true
 # ========================
 
 [tool.mypy]
-python_version = "3.11"
+exclude = [
+    "^.eggs",
+    "^.github",
+    "^.vscode",
+    "^build",
+    "^dist",
+    "^docs",
+    "^postgres",
+    "^target",
+]
+files = "."
+python_version = "3.12"
 plugins = "edb/tools/mypy/plugin.py"
 follow_imports = "normal"
 ignore_missing_imports = true
@@ -115,6 +146,9 @@ warn_redundant_casts = true
 warn_unused_configs = true
 show_column_numbers = true
 show_error_codes = true
+local_partial_types = true
+# This being an error seems super confused to me.
+disable_error_code = "type-abstract"
 
 [[tool.mypy.overrides]]
 module = [
@@ -133,11 +167,12 @@ module = [
     "edb.schema.*",
     "edb.schema.reflection.*",
     "edb.server.cluster",
+    "edb.server.compiler.*",
     "edb.server.config",
     "edb.server.connpool.*",
+    "edb.server.protocol.*",
     "edb.server.pgcluster",
     "edb.server.pgconnparams",
-    "edb.server.compiler.*",
 ]
 # Equivalent of --strict on the command line,
 # but without disallow_untyped_calls:
@@ -199,3 +234,33 @@ exclude_lines = [
 ]
 show_missing = true
 ignore_errors = true
+
+# Change the below to invalidate dependency cache in CI
+# CACHE-TAG: 2
+
+[tool.ruff]
+line-length = 80
+indent-width = 4
+exclude = ["postgres", ".github"]
+
+[tool.ruff.lint]
+preview = true
+select = ["E", "F", "W", "B"]
+ignore = [
+    "F541", # f-string without any placeholders
+    "B904", # Within an except clause, raise exceptions with raise ... from err
+    # or raise ... from None to distinguish them from errors in
+    # exception handling
+    "E731", # Do not assign a lambda expression, use a def
+    "E741", # Ambiguous variable name: l or i or I
+    "E252", # Missing whitespace around parameter equals
+
+    # TODO: enable this
+    "B905", # zip() without an explicit strict= parameter
+]
+flake8-bugbear.extend-immutable-calls = ["immutables.Map"]
+
+[tool.pyright]
+# Pyright has no idea about metaclass-generated getters for schema fields.
+reportAttributeAccessIssue = false
+typeCheckingMode = "off"

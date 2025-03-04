@@ -183,7 +183,7 @@ std::bit_rshift(val: std::int16, n: std::int64) -> std::int16
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -212,7 +212,7 @@ std::bit_rshift(val: std::int32, n: std::int64) -> std::int32
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -241,7 +241,7 @@ std::bit_rshift(val: std::int64, n: std::int64) -> std::int64
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -270,7 +270,7 @@ std::bit_lshift(val: std::int16, n: std::int64) -> std::int16
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -295,7 +295,7 @@ std::bit_lshift(val: std::int32, n: std::int64) -> std::int32
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -320,7 +320,7 @@ std::bit_lshift(val: std::int64, n: std::int64) -> std::int64
     SELECT (
         CASE
             WHEN n < 0 THEN
-                edgedb.raise(
+                edgedb_VER.raise(
                     NULL::int8,
                     'invalid_parameter_value',
                     msg => (
@@ -331,5 +331,38 @@ std::bit_lshift(val: std::int64, n: std::int64) -> std::int64
             ELSE val << n::int4
         END
     )
+    $$;
+};
+
+CREATE FUNCTION
+std::bit_count(val: std::int16) -> std::int64
+{
+    CREATE ANNOTATION std::description :=
+        'Count the number of set bits in a 16-bit integer.';
+    SET volatility := 'Immutable';
+    USING SQL $$
+    SELECT bit_count(val::int4::bit(16))
+    $$;
+};
+
+CREATE FUNCTION
+std::bit_count(val: std::int32) -> std::int64
+{
+    CREATE ANNOTATION std::description :=
+        'Count the number of set bits in a 32-bit integer.';
+    SET volatility := 'Immutable';
+    USING SQL $$
+    SELECT bit_count(val::bit(32))
+    $$;
+};
+
+CREATE FUNCTION
+std::bit_count(val: std::int64) -> std::int64
+{
+    CREATE ANNOTATION std::description :=
+        'Count the number of set bits in a 64-bit integer.';
+    SET volatility := 'Immutable';
+    USING SQL $$
+    SELECT bit_count(val::bit(64))
     $$;
 };

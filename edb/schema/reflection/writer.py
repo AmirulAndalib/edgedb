@@ -19,7 +19,17 @@
 """Schema reflection helpers."""
 
 from __future__ import annotations
-from typing import *
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    Tuple,
+    Type,
+    Collection,
+    Dict,
+    List,
+    cast,
+)
 
 import functools
 import json
@@ -30,6 +40,7 @@ from edb.edgeql import qltypes
 
 from edb.schema import constraints as s_constr
 from edb.schema import delta as sd
+from edb.schema import extensions as s_ext
 from edb.schema import objects as so
 from edb.schema import objtypes as s_objtypes
 from edb.schema import referencing as s_ref
@@ -79,10 +90,23 @@ def _hoist_if_unused_deletes(
     might move the command after something that needs to go *after*,
     like a delete of one of the union components.)
 
+    Don't hoist the if_unused all the way *outside* an extension. We want the
+    effects of deleting an extension to be contained in the DeleteExtension
+    command. If there are union/collection types used outside this extension,
+    they won't be deleted. If the union/collection types are used only by this
+    extension, there is a chance that they also rely on the types *from* the
+    extension. This means that it will be impossible to delete the base types
+    if we defer deleting the union/collection types until all extension
+    content is removed.
+
     FIXME: Could we instead *generate* the deletions at the outermost point?
     """
     new_target = target
-    if not new_target and isinstance(cmd, sd.DeleteObject):
+    if (
+        not new_target
+        and isinstance(cmd, sd.DeleteObject)
+        and not isinstance(cmd, s_ext.DeleteExtension)
+    ):
         new_target = cmd
 
     for sub in cmd.get_subcommands():
@@ -152,9 +176,7 @@ def _descend(
     if cmd_filter:
         commands = tuple(filter(cmd_filter, commands))
 
-    def _write_subcommands(
-        commands: Collection[sd.Command]
-    ) -> None:
+    def _write_subcommands(commands: Collection[sd.Command]) -> None:
         for subcmd in commands:
             if not isinstance(subcmd, sd.AlterObjectProperty):
                 write_meta(
@@ -299,12 +321,13 @@ def _build_object_mutation_shape(
             # an ObjectKeyDict collection that allow associating objects
             # with arbitrary values (a transposed ObjectDict).
             target_expr = f"""assert_distinct((
-                FOR v IN {{ json_array_unpack(<json>${var_n}) }}
+                FOR v IN {{ enumerate(json_array_unpack(<json>${var_n})) }}
                 UNION (
                     SELECT {target.get_name(schema)} {{
-                        @value := <str>v[1]
+                        @index := v.0,
+                        @value := <str>v.1[1],
                     }}
-                    FILTER .id = <uuid>v[0]
+                    FILTER .id = <uuid>v.1[0]
                 )
             ))"""
             args = props.get('args', [])
@@ -443,12 +466,13 @@ def _build_object_mutation_shape(
                     WITH
                         orig_json := json_array_unpack(<json>${var_n})
                     SELECT
-                        array_agg(
+                        array_agg((
+                            for orig_json in orig_json union
                             (
                                 name := <str>orig_json['name'],
                                 expr := <str>orig_json['expr']['text'],
                             )
-                        )
+                        ))
                 )
             '''
             if v is not None:
@@ -473,14 +497,15 @@ def _build_object_mutation_shape(
                     WITH
                         orig_json := json_array_unpack(<json>${var_n})
                     SELECT
-                        array_agg(
+                        array_agg((
+                            for orig_json in orig_json union
                             (
                                 name := <str>orig_json['name'],
                                 expr := sys::_expr_from_json(
                                     orig_json['expr']
                                 )
                             )
-                        )
+                        ))
                 )
             '''
 
@@ -521,39 +546,39 @@ def _build_object_mutation_shape(
 
         variables[var_n] = json.dumps(target_value)
 
-    if isinstance(cmd, sd.CreateObject):
-        if (
-            issubclass(mcls, (s_scalars.ScalarType, s_types.Collection))
-            and not issubclass(mcls, s_types.CollectionExprAlias)
-            and not cmd.get_attribute_value('abstract')
-            and not cmd.get_attribute_value('transient')
-        ):
-            kind = f'"schema::{mcls.__name__}"'
+    object_actually_exists = schema.has_object(cmd.scls.id)
+    if (
+        isinstance(cmd, sd.CreateObject)
+        and object_actually_exists
+        and issubclass(mcls, (s_scalars.ScalarType, s_types.Collection))
+        and not issubclass(mcls, s_types.CollectionExprAlias)
+        and not cmd.get_attribute_value('abstract')
+        and not cmd.get_attribute_value('transient')
+    ):
+        kind = f'"schema::{mcls.__name__}"'
 
-            if issubclass(mcls, (s_types.Array,
-                                 s_types.Range,
-                                 s_types.MultiRange)):
-                assignments.append(
-                    f'backend_id := sys::_get_pg_type_for_edgedb_type('
-                    f'<uuid>$__{var_prefix}id, '
-                    f'{kind}, '
-                    f'<uuid>$__{var_prefix}element_type, '
-                    f'<str>$__{var_prefix}sql_type2), '
-                )
-            else:
-                assignments.append(
-                    f'backend_id := sys::_get_pg_type_for_edgedb_type('
-                    f'<uuid>$__{var_prefix}id, {kind}, <uuid>{{}}, '
-                    f'<str>$__{var_prefix}sql_type2), '
-                )
-            sql_type = None
-            if isinstance(cmd.scls, s_scalars.ScalarType):
-                sql_type, _ = cmd.scls.resolve_sql_type_scheme(schema)
+        if issubclass(mcls, (s_types.Array, s_types.Range, s_types.MultiRange)):
+            assignments.append(
+                f'backend_id := sys::_get_pg_type_for_edgedb_type('
+                f'<uuid>$__{var_prefix}id, '
+                f'{kind}, '
+                f'<uuid>$__{var_prefix}element_type, '
+                f'<str>$__{var_prefix}sql_type2), '
+            )
+        else:
+            assignments.append(
+                f'backend_id := sys::_get_pg_type_for_edgedb_type('
+                f'<uuid>$__{var_prefix}id, {kind}, <uuid>{{}}, '
+                f'<str>$__{var_prefix}sql_type2), '
+            )
+        sql_type = None
+        if isinstance(cmd.scls, s_scalars.ScalarType):
+            sql_type, _ = cmd.scls.resolve_sql_type_scheme(schema)
 
-            variables[f'__{var_prefix}id'] = json.dumps(
-                str(cmd.get_attribute_value('id')))
-            variables[f'__{var_prefix}sql_type2'] = json.dumps(
-                sql_type)
+        variables[f'__{var_prefix}id'] = json.dumps(
+            str(cmd.get_attribute_value('id'))
+        )
+        variables[f'__{var_prefix}sql_type2'] = json.dumps(sql_type)
 
     shape = ',\n'.join(assignments)
 
@@ -1083,8 +1108,6 @@ def write_meta_delete_object(
 
             parent_variables = {}
 
-            if not hasattr(target, 'id'):
-                breakpoint()
             parent_variables[f'__{target_link}'] = (
                 json.dumps(str(target.id))
             )

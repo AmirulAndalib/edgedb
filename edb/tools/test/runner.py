@@ -18,15 +18,15 @@
 
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Callable, Optional, Dict, TYPE_CHECKING
 
 import asyncio
-import binascii
 import collections
 import collections.abc
 import csv
 import dataclasses
 import enum
+import faulthandler
 import io
 import itertools
 import json
@@ -37,6 +37,7 @@ import os
 import pathlib
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,18 +55,22 @@ import click
 import edgedb
 
 from edb.common import devmode
-from edb.testbase import lang as tb_lang
 from edb.testbase import server as tb
 
 from . import cpython_state
 from . import mproc_fixes
 from . import styles
+from . import results
 
+if TYPE_CHECKING:
+    import edb.server.cluster as edb_cluster
 
 result: Optional[unittest.result.TestResult] = None
 coverage_run: Optional[Any] = None
 py_hash_secret: bytes = cpython_state.get_py_hash_secret()
 py_random_seed: bytes = random.SystemRandom().randbytes(8)
+
+faulthandler.enable(file=sys.stderr, all_threads=True)
 
 
 def teardown_suite() -> None:
@@ -79,13 +84,21 @@ def teardown_suite() -> None:
     suite._handleModuleTearDown(result)  # type: ignore[attr-defined]
 
 
-def init_worker(status_queue: multiprocessing.SimpleQueue,
-                param_queue: multiprocessing.SimpleQueue,
-                result_queue: multiprocessing.SimpleQueue) -> None:
+def init_worker(
+    status_queue: multiprocessing.SimpleQueue,
+    param_queue: multiprocessing.SimpleQueue,
+    result_queue: multiprocessing.SimpleQueue,
+    additional_init: Optional[Callable]
+) -> None:
     global result
     global coverage_run
     global py_hash_secret
     global py_random_seed
+
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+
+    if additional_init:
+        additional_init()
 
     # Make sure the generator is re-seeded, as we have inherited
     # the seed from the parent process.
@@ -151,15 +164,17 @@ class StreamingTestSuite(unittest.TestSuite):
                 getattr(result, '_moduleSetUpFailed', False)):
             return
 
+        result.annotate_test(test, {
+            'py-hash-secret': py_hash_secret,
+            'py-random-seed': py_random_seed,
+            'runner-pid': os.getpid(),
+        })
+
         start = time.monotonic()
         test.run(result)
         elapsed = time.monotonic() - start
 
         result.record_test_stats(test, {'running-time': elapsed})
-        result.annotate_test(test, {
-            'py-hash-secret': py_hash_secret,
-            'py-random-seed': py_random_seed,
-        })
 
         result._testRunEntered = False
         return result
@@ -277,13 +292,27 @@ def monitor_thread(queue, result):
         method(*args, **kwargs)
 
 
+def status_thread_func(
+    result: ParallelTextTestResult,
+    stop_event: threading.Event,
+) -> None:
+    while True:
+        result.report_still_running()
+        time.sleep(1)
+        if stop_event.is_set():
+            break
+
+
 class ParallelTestSuite(unittest.TestSuite):
-    def __init__(self, tests, server_conn, num_workers, backend_dsn):
+    def __init__(
+        self, tests, server_conn, num_workers, backend_dsn, init_worker
+    ):
         self.tests = tests
         self.server_conn = server_conn
         self.num_workers = num_workers
         self.stop_requested = False
         self.backend_dsn = backend_dsn
+        self.init_worker = init_worker
 
     def run(self, result):
         # We use SimpleQueues because they are more predictable.
@@ -299,11 +328,25 @@ class ParallelTestSuite(unittest.TestSuite):
             worker_param_queue.put((self.server_conn, self.backend_dsn))
 
         result_thread = threading.Thread(
-            name='test-monitor', target=monitor_thread,
-            args=(result_queue, result), daemon=True)
+            name='test-monitor',
+            target=monitor_thread,
+            args=(result_queue, result),
+            daemon=True,
+        )
         result_thread.start()
 
-        initargs = (status_queue, worker_param_queue, result_queue)
+        status_thread_stop_event = threading.Event()
+        status_thread = threading.Thread(
+            name='test-status',
+            target=status_thread_func,
+            args=(result, status_thread_stop_event),
+            daemon=True,
+        )
+        status_thread.start()
+
+        initargs = (
+            status_queue, worker_param_queue, result_queue, self.init_worker
+        )
 
         pool = multiprocessing.Pool(
             self.num_workers,
@@ -315,42 +358,76 @@ class ParallelTestSuite(unittest.TestSuite):
             status_queue.get()
 
         with pool:
-            ar = pool.map_async(_run_test, iter(self.tests), chunksize=1)
-
-            while True:
-                try:
-                    ar.get(timeout=0.1)
-                except multiprocessing.TimeoutError:
-                    if self.stop_requested:
-                        break
-                    else:
-                        continue
-                else:
+            for is_repeat in (False, True):
+                if self.stop_requested:
                     break
+                ar = pool.map_async(
+                    _run_test,
+                    filter(
+                        lambda t: ('test_zREPEAT' in str(t)) == is_repeat,
+                        self.tests,
+                    ),
+                    chunksize=1,
+                )
 
-            # Post the terminal message to the queue so that
-            # test-monitor can stop.
-            result_queue.put((None, None, None))
+                while True:
+                    try:
+                        ar.get(timeout=0.1)
+                    except multiprocessing.TimeoutError:
+                        # multiprocessing doesn't handle processes
+                        # crashing very well, so we check ourselves
+                        # (having disabled its own child pruning in
+                        # mproc_fixes)
+                        #
+                        # TODO: Should we look into using
+                        # concurrent.futures.ProcessPoolExecutor
+                        # instead?
+                        for p in pool._pool:
+                            if p.exitcode:
+                                tmsg = ''
+                                if isinstance(result, ParallelTextTestResult):
+                                    test = result.current_pids.get(p.pid)
+                                    tmsg = f' while running {test}'
+                                print(
+                                    f"ERROR: Test worker {p.pid} crashed with "
+                                    f"exit code {p.exitcode}{tmsg}",
+                                    file=sys.stderr,
+                                )
+                                sys.stderr.flush()
+                                os._exit(1)
 
-            # Give the test-monitor thread some time to
-            # process the queue messages.  If something
-            # goes wrong, the thread will be forcibly
-            # joined by a timeout.
-            result_thread.join(timeout=3)
+                        if self.stop_requested:
+                            break
+                        else:
+                            continue
+                    else:
+                        break
 
         # Wait for pool to shutdown, this includes test teardowns.
         pool.join()
+
+        # Post the terminal message to the queue so that
+        # test-monitor can stop.
+        result_queue.put((None, None, None))
+        status_thread_stop_event.set()
+
+        # Give the test-monitor and test-status threads some time to process the
+        # queue messages.  If something goes wrong, the thread will be forcibly
+        # joined by a timeout.
+        result_thread.join(timeout=3)
+        status_thread.join(timeout=3)
 
         return result
 
 
 class SequentialTestSuite(unittest.TestSuite):
 
-    def __init__(self, tests, server_conn, backend_dsn):
+    def __init__(self, tests, server_conn, backend_dsn, worker_init):
         self.tests = tests
         self.server_conn = server_conn
         self.stop_requested = False
         self.backend_dsn = backend_dsn
+        self.worker_init = worker_init
 
     def run(self, result_):
         global result
@@ -361,6 +438,9 @@ class SequentialTestSuite(unittest.TestSuite):
                 json.dumps(self.server_conn)
         if self.backend_dsn:
             os.environ['EDGEDB_TEST_BACKEND_DSN'] = self.backend_dsn
+
+        if self.worker_init:
+            self.worker_init()
 
         random.seed(py_random_seed)
 
@@ -387,7 +467,7 @@ class Markers(enum.Enum):
     upassed = 'U'  # unexpected success
 
 
-class OutputFormat(enum.Enum):
+class OutputFormat(str, enum.Enum):
     auto = 'auto'
     simple = 'simple'
     stacked = 'stacked'
@@ -420,6 +500,12 @@ class BaseRenderer:
     def report(self, test, marker, description=None, *, currently_running):
         raise NotImplementedError
 
+    def report_start(self, test, *, currently_running):
+        return
+
+    def report_still_running(self, still_running: dict[str, float]):
+        return
+
 
 class SimpleRenderer(BaseRenderer):
     def report(self, test, marker, description=None, *, currently_running):
@@ -450,14 +536,18 @@ class VerboseRenderer(BaseRenderer):
         click.echo(style(self._render_test(test, marker, description)),
                    file=self.stream)
 
+    def report_still_running(self, still_running: dict[str, float]) -> None:
+        items = [f"{t} for {d:.02f}s" for t, d in still_running.items()]
+        click.echo(f"still running:\n  {'\n   '.join(items)}")
+
 
 class MultiLineRenderer(BaseRenderer):
 
     FT_LABEL = 'First few failed: '
-    FT_MAX_LINES = 3
+    FT_MAX_LINES = 6
 
     R_LABEL = 'Running: '
-    R_MAX_LINES = 3
+    R_MAX_LINES = 6
 
     def __init__(self, *, tests, stream):
         super().__init__(tests=tests, stream=stream)
@@ -488,6 +578,13 @@ class MultiLineRenderer(BaseRenderer):
         self.completed_tests += 1
         self._render(currently_running)
 
+    def report_start(self, test, *, currently_running):
+        self._render(currently_running)
+
+    def report_still_running(self, still_running: dict[str, float]):
+        # Still-running tests are already reported in normal repert
+        return
+
     def _render_modname(self, name):
         return name.replace('.', '/') + '.py'
 
@@ -505,7 +602,7 @@ class MultiLineRenderer(BaseRenderer):
             print_line(' ')
 
         last_render = self.completed_tests == self.total_tests
-        cols, rows = click.get_terminal_size()
+        cols, rows = shutil.get_terminal_size()
         second_col_width = cols - self.first_col_width
 
         def _render_test_list(label, max_lines, tests, style):
@@ -557,10 +654,13 @@ class MultiLineRenderer(BaseRenderer):
             # Prevent the rendered output from "jumping" up/down when we
             # render 2 lines worth of running tests just after we rendered
             # 3 lines.
-            for _ in range(self.max_label_lines_rendered[label] - tests_lines):
+            lkey = label.split(':')[0]
+            # ^- We can't just use `label`, as we append extra information
+            # to the "Running: (..)" label, so strip that
+            for _ in range(self.max_label_lines_rendered[lkey] - tests_lines):
                 lines.append(' ' * cols)
-            self.max_label_lines_rendered[label] = max(
-                self.max_label_lines_rendered[label],
+            self.max_label_lines_rendered[lkey] = max(
+                self.max_label_lines_rendered[lkey],
                 tests_lines
             )
 
@@ -610,7 +710,7 @@ class MultiLineRenderer(BaseRenderer):
                 running_tests.append('...')
 
             _render_test_list(
-                self.R_LABEL,
+                self.R_LABEL + f'({len(currently_running)})',
                 self.R_MAX_LINES,
                 running_tests,
                 styles.marker_passed
@@ -618,13 +718,14 @@ class MultiLineRenderer(BaseRenderer):
 
         print_empty_line()
         print_line(
-            f'Progress: {self.completed_tests}/{self.total_tests} tests.')
+            f'Progress: {self.completed_tests}/{self.total_tests} tests.'
+        )
 
-        if last_render:
-            if self.max_lines > len(lines):
-                for _ in range(self.max_lines - len(lines)):
-                    lines.insert(0, ' ' * cols)
-        else:
+        if self.max_lines > len(lines):
+            for _ in range(self.max_lines - len(lines)):
+                lines.insert(0, ' ' * cols)
+
+        if not last_render:
             # If it's not the last test, check if our render buffer
             # requires more rows than currently visible.
             if len(lines) + 1 > rows:
@@ -665,6 +766,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
         self.warnings = []
         self.notImplemented = []
         self.currently_running = {}
+        self.current_pids = {}
         # An index of all seen warnings to keep track
         # of repeated warnings.
         self._warnings = {}
@@ -675,7 +777,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
             self.ren = VerboseRenderer(tests=tests, stream=stream)
         elif (output_format is OutputFormat.stacked or
                 (output_format is OutputFormat.auto and stream.isatty() and
-                 click.get_terminal_size()[0] > 60 and
+                 shutil.get_terminal_size()[0] > 60 and
                  os.name != 'nt')):
             self.ren = MultiLineRenderer(tests=tests, stream=stream)
         else:
@@ -689,6 +791,23 @@ class ParallelTextTestResult(unittest.result.TestResult):
             description,
             currently_running=list(self.currently_running),
         )
+
+    def report_still_running(self):
+        now = time.monotonic()
+        still_running = {}
+        for test, start in self.currently_running.items():
+            running_for = now - start
+            if running_for > 5.0:
+                key = str(test)
+                if (
+                    test in self.test_annotations
+                    and (pid := self.test_annotations[test].get('runner-pid'))
+                ):
+                    key = f'{key} (pid={pid})'
+
+                still_running[key] = running_for
+        if still_running:
+            self.ren.report_still_running(still_running)
 
     def record_test_stats(self, test, stats):
         self.test_stats.append((test, stats))
@@ -708,7 +827,14 @@ class ParallelTextTestResult(unittest.result.TestResult):
 
     def startTest(self, test):
         super().startTest(test)
-        self.currently_running[test] = True
+        self.currently_running[test] = time.monotonic()
+        self.ren.report_start(
+            test, currently_running=list(self.currently_running))
+        if (
+            test in self.test_annotations
+            and (pid := self.test_annotations[test].get('runner-pid'))
+        ):
+            self.current_pids[pid] = test
 
     def addSuccess(self, test):
         super().addSuccess(test)
@@ -748,11 +874,13 @@ class ParallelTextTestResult(unittest.result.TestResult):
             reason = method.__et_xfail_reason__
             not_impl = getattr(method, '__et_xfail_not_implemented__', False)
             allow_fail = getattr(method, '__et_xfail_allow_failure__', False)
+            allow_error = getattr(method, '__et_xfail_allow_error__', False)
         except AttributeError:
             # Maybe the whole test case class is decorated?
             reason = getattr(test, '__et_xfail_reason__', None)
             not_impl = getattr(test, '__et_xfail_not_implemented__', False)
             allow_fail = getattr(test, '__et_xfail_allow_failure__', False)
+            allow_error = getattr(test, '__et_xfail_allow_error__', False)
 
         marker = Markers.not_implemented if not_impl else Markers.xfailed
         if not_impl:
@@ -760,7 +888,7 @@ class ParallelTextTestResult(unittest.result.TestResult):
                 (test, self._exc_info_to_string(err, test)))
         else:
             is_fail = _is_assert_failure(err)
-            if allow_fail == is_fail:
+            if (allow_fail and is_fail) or (allow_error and not is_fail):
                 super().addExpectedFailure(test, err)
             else:
                 if is_fail:
@@ -797,7 +925,7 @@ class ParallelTextTestRunner:
     def __init__(self, *, stream=None, num_workers=1, verbosity=1,
                  output_format=OutputFormat.auto, warnings=True,
                  failfast=False, shuffle=False, backend_dsn=None,
-                 data_dir=None, try_cached_db=False):
+                 data_dir=None, try_cached_db=False, use_data_dir_dbs=False):
         self.stream = stream if stream is not None else sys.stderr
         self.num_workers = num_workers
         self.verbosity = verbosity
@@ -807,9 +935,16 @@ class ParallelTextTestRunner:
         self.output_format = output_format
         self.backend_dsn = backend_dsn
         self.data_dir = data_dir
+        self.use_data_dir_dbs = use_data_dir_dbs
         self.try_cached_db = try_cached_db
 
-    def run(self, test, selected_shard, total_shards, running_times_log_file):
+    def run(
+        self,
+        test: Any,
+        selected_shard: int,
+        total_shards: int,
+        running_times_log_file: Optional[Any],
+    ) -> results.TestResult:
         session_start = time.monotonic()
         cases = tb.get_test_cases([test])
         stats = {}
@@ -824,11 +959,11 @@ class ParallelTextTestRunner:
         )
         setup = tb.get_test_cases_setup(cases)
         server_used = tb.test_cases_use_server(cases)
-        preload_parser = tb_lang.should_preload_parser(cases)
-        bootstrap_time_taken = 0
-        tests_time_taken = 0
-        result = None
-        cluster = None
+        worker_init = None
+        bootstrap_time_taken = 0.0
+        tests_time_taken = 0.0
+        result: Optional[ParallelTextTestResult] = None
+        cluster: Optional[edb_cluster.BaseCluster] = None
         conn = None
         tempdir = None
         setup_stats = []
@@ -839,6 +974,8 @@ class ParallelTextTestRunner:
             if (
                 not os.environ.get("EDGEDB_SERVER_TLS_CERT_FILE")
                 and not os.environ.get("EDGEDB_SERVER_TLS_KEY_FILE")
+                and not os.environ.get("GEL_SERVER_TLS_CERT_FILE")
+                and not os.environ.get("GEL_SERVER_TLS_KEY_FILE")
             ):
                 if self.verbosity >= 1:
                     self._echo(
@@ -849,11 +986,14 @@ class ParallelTextTestRunner:
                 key_file = pathlib.Path(tempdir.name) / "tlskey.pem"
                 tb.generate_tls_cert(cert_file, key_file, ["localhost"])
 
-                os.environ["EDGEDB_SERVER_TLS_CERT_FILE"] = str(cert_file)
-                os.environ["EDGEDB_SERVER_TLS_KEY_FILE"] = str(key_file)
+                os.environ["GEL_SERVER_TLS_CERT_FILE"] = str(cert_file)
+                os.environ["GEL_SERVER_TLS_KEY_FILE"] = str(key_file)
 
-            if not os.environ.get("EDGEDB_SERVER_JWS_KEY_FILE"):
-                jwk_file = pathlib.Path(tempdir.name) / "jwk.pem"
+            if (
+                not os.environ.get("EDGEDB_SERVER_JWS_KEY_FILE")
+                and not os.environ.get("GEL_SERVER_JWS_KEY_FILE")
+            ):
+                jwk_file = pathlib.Path(tempdir.name) / "jwk.json"
                 if self.verbosity >= 1:
                     self._echo(
                         'Generating JSON Web Key...',
@@ -861,10 +1001,7 @@ class ParallelTextTestRunner:
                     )
                 tb.generate_jwk(jwk_file)
 
-                os.environ["EDGEDB_SERVER_JWS_KEY_FILE"] = str(jwk_file)
-
-        if preload_parser:
-            tb_lang.preload_parser()
+                os.environ["GEL_SERVER_JWS_KEY_FILE"] = str(jwk_file)
 
         try:
             if setup:
@@ -877,7 +1014,7 @@ class ParallelTextTestRunner:
 
                 if self.verbosity > 1:
                     self._echo(
-                        '\n -> Bootstrapping EdgeDB instance...',
+                        '\n -> Bootstrapping Gel instance...',
                         fg='white',
                         nl=False,
                     )
@@ -933,7 +1070,9 @@ class ParallelTextTestRunner:
                         conn,
                         self.num_workers,
                         verbose=self.verbosity > 1,
-                        try_cached_db=self.try_cached_db,
+                        try_cached_db=(
+                            self.try_cached_db or self.use_data_dir_dbs
+                        ),
                     )
                     if self.try_cached_db and any(
                         not x[1]['cached'] for x in stats
@@ -962,6 +1101,7 @@ class ParallelTextTestRunner:
 
                 setup_stats = asyncio.run(_setup())
 
+                assert cluster
                 if cluster.has_create_database():
                     os.environ.update({
                         'EDGEDB_TEST_CASES_SET_UP': "skip"
@@ -986,18 +1126,21 @@ class ParallelTextTestRunner:
             all_tests = list(itertools.chain.from_iterable(
                 tests for tests in cases.values()))
 
+            suite: unittest.TestSuite
             if self.num_workers > 1:
                 suite = ParallelTestSuite(
                     self._sort_tests(cases),
                     conn,
                     self.num_workers,
                     self.backend_dsn,
+                    worker_init,
                 )
             else:
                 suite = SequentialTestSuite(
                     self._sort_tests(cases),
                     conn,
                     self.backend_dsn,
+                    worker_init,
                 )
 
             result = ParallelTextTestResult(
@@ -1040,121 +1183,15 @@ class ParallelTextTestRunner:
                 self._echo('OK.')
 
         if result is not None:
-            self._render_result(
-                result, bootstrap_time_taken, tests_time_taken)
+            return results.collect_result_data(
+                result, bootstrap_time_taken, tests_time_taken
+            )
+        else:
+            return None
 
-        return result
-
-    def _get_term_width(self):
-        return click.get_terminal_size()[0] or 70
-
-    def _echo(self, s='', **kwargs):
+    def _echo(self, s: str = '', **kwargs):
         if self.verbosity > 0:
             click.secho(s, file=self.stream, **kwargs)
-
-    def _fill(self, char, **kwargs):
-        self._echo(char * self._get_term_width(), **kwargs)
-
-    def _format_time(self, seconds):
-        hours = int(seconds // 3600)
-        seconds %= 3600
-        minutes = int(seconds // 60)
-        seconds %= 60
-
-        return f'{hours:02d}:{minutes:02d}:{seconds:04.1f}'
-
-    def _print_errors(self, result):
-        uxsuccesses = ((s, '') for s in result.unexpectedSuccesses)
-        data = zip(
-            ('WARNING', 'ERROR', 'FAIL', 'UNEXPECTED SUCCESS'),
-            ('yellow', 'red', 'red', 'red'),
-            (result.warnings, result.errors, result.failures, uxsuccesses)
-        )
-
-        for kind, fg, errors in data:
-            for test, err in errors:
-                self._fill('=', fg=fg)
-                self._echo(f'{kind}: {result.getDescription(test)}',
-                           fg=fg, bold=True)
-                self._fill('-', fg=fg)
-
-                if annos := result.get_test_annotations(test):
-                    if phs := annos.get('py-hash-secret'):
-                        phs_hex = binascii.hexlify(phs).decode()
-                        self._echo(f'Py_HashSecret: {phs_hex}')
-                    if prs := annos.get('py-random-seed'):
-                        prs_hex = binascii.hexlify(prs).decode()
-                        self._echo(f'random.seed(): {prs_hex}')
-                    self._fill('-', fg=fg)
-
-                srv_tb = None
-                if _is_exc_info(err):
-                    if isinstance(err[1], edgedb.EdgeDBError):
-                        srv_tb = err[1].get_server_context()
-                    err = unittest.result.TestResult._exc_info_to_string(
-                        result, err, test)
-                elif isinstance(err, SerializedServerError):
-                    err, srv_tb = err.test_error, err.server_error
-                if srv_tb:
-                    self._echo('Server Traceback:',
-                               fg='red', bold=True)
-                    self._echo(srv_tb)
-                    self._echo('Test Traceback:',
-                               fg='red', bold=True)
-                self._echo(err)
-
-    def _render_result(self, result, boot_time_taken, tests_time_taken):
-        self._echo()
-
-        if self.verbosity > 0:
-            self._print_errors(result)
-
-        if result.wasSuccessful():
-            fg = 'green'
-            outcome = 'SUCCESS'
-        else:
-            fg = 'red'
-            outcome = 'FAILURE'
-
-        if self.verbosity > 1:
-            self._fill('=', fg=fg)
-        self._echo(outcome, fg=fg, bold=True)
-
-        counts = [('tests ran', result.testsRun)]
-
-        display = {
-            'expectedFailures': 'expected failures',
-            'notImplemented': 'not implemented',
-            'unexpectedSuccesses': 'unexpected successes',
-        }
-
-        for bit in ['failures', 'errors', 'expectedFailures',
-                    'notImplemented', 'unexpectedSuccesses', 'skipped']:
-            count = len(getattr(result, bit))
-            if count:
-                counts.append((display.get(bit, bit), count))
-
-        for bit, count in counts:
-            self._echo(f'  {bit}: ', nl=False)
-            self._echo(f'{count}', bold=True)
-
-        self._echo()
-        self._echo(f'Running times: ')
-        if boot_time_taken:
-            self._echo('  bootstrap: ', nl=False)
-            self._echo(self._format_time(boot_time_taken), bold=True)
-
-        self._echo('  tests: ', nl=False)
-        self._echo(self._format_time(tests_time_taken), bold=True)
-
-        if boot_time_taken:
-            self._echo('  total: ', nl=False)
-            self._echo(self._format_time(boot_time_taken + tests_time_taken),
-                       bold=True)
-
-        self._echo()
-
-        return result
 
     def _sort_tests(self, cases):
         serialized_suites = {}

@@ -16,265 +16,138 @@
 # limitations under the License.
 #
 
-import argon2
+
+import datetime
 import json
-import hashlib
-import base64
 
-from typing import Any
-from edb.errors import ConstraintViolationError
+from typing import Any, cast
 from edb.server.protocol import execute
-
-from . import errors, util, data
-
-ph = argon2.PasswordHasher()
+from . import data
 
 
 class Client:
-    def __init__(self, db: Any, provider_name: str):
+    def __init__(self, db: Any):
         self.db = db
 
-        match provider_name:
-            case "builtin::local_emailpassword":
-                self._get_provider_config(provider_name)
-                self.provider = EmailPasswordProvider()
-            case _:
-                raise errors.InvalidData(f"Invalid provider: {provider_name}")
-
-    async def register(self, *args, **kwargs):
-        return await self.provider.register(self.db, *args, **kwargs)
-
-    async def authenticate(self, *args, **kwargs):
-        return await self.provider.authenticate(self.db, *args, **kwargs)
-
-    async def logout(self, *args, **kwargs):
-        return await self.provider.logout(*args, **kwargs)
-
-    async def get_identity_and_secret(self, *args, **kwargs):
-        return await self.provider.get_identity_and_secret(
-            self.db, *args, **kwargs)
-
-    async def validate_reset_secret(self, *args, **kwargs):
-        identity = await self.provider.validate_reset_secret(
-            self.db, *args, **kwargs)
-        return identity is not None
-
-    async def update_password(self, *args, **kwargs):
-        return await self.provider.update_password(
-            self.db, *args, **kwargs)
-
-    def _get_provider_config(self, provider_name: str):
-        provider_client_config = util.get_config(
-            self.db, "ext::auth::AuthConfig::providers", frozenset
-        )
-        for cfg in provider_client_config:
-            if cfg.name == provider_name:
-                return cfg
-
-        raise errors.MissingConfiguration(
-            provider_name,
-            f"Provider is not configured"
-        )
-
-
-class EmailPasswordProvider:
-    async def register(self, db: Any, input: dict[str, Any]):
-        match (input.get("email"), input.get("password")):
-            case (str(e), str(p)):
-                email = e
-                password = p
-            case _:
-                raise errors.InvalidData(
-                    "Missing 'email' or 'password' in data"
-                )
-
-        try:
-            r = await execute.parse_execute_json(
-                db=db,
-                query="""\
-    with
-      email := <optional str>$email,
-      password_hash := <str>$password_hash,
-      identity := (insert ext::auth::LocalIdentity {
-        issuer := "local",
-        subject := "",
-      }),
-      password := (insert ext::auth::EmailPasswordFactor {
-        password_hash := password_hash,
-        email := email,
-        identity := identity,
-      }),
-
-    select identity { * };""",
-                variables={
-                    "email": email,
-                    "password_hash": ph.hash(password),
-                },
-                cached_globally=True,
-            )
-        except Exception as e:
-            exc = await execute.interpret_error(e, db)
-            if isinstance(exc, ConstraintViolationError):
-                raise errors.UserAlreadyRegistered()
-            else:
-                raise exc
-
-        result_json = json.loads(r.decode())
-        assert len(result_json) == 1
-
-        return data.LocalIdentity(**result_json[0])
-
-    async def authenticate(self, db: Any, input: dict[str, Any]):
-        if 'email' not in input or 'password' not in input:
-            raise errors.InvalidData("Missing 'email' or 'password' in data")
-
-        password = input["password"]
-        email = input["email"]
-        r = await execute.parse_execute_json(
-            db=db,
+    async def verify_email(
+        self, identity_id: str, verified_at: datetime.datetime
+    ) -> data.EmailFactor | None:
+        result_bytes = await execute.parse_execute_json(
+            db=self.db,
             query="""\
 with
-  email := <str>$email,
-select ext::auth::EmailPasswordFactor { password_hash, identity: { * } }
-filter .email = email;""",
-            variables={
-                "email": email,
-            },
-            cached_globally=True,
-        )
-
-        password_credential_dicts = json.loads(r.decode())
-        if len(password_credential_dicts) != 1:
-            raise errors.NoIdentityFound()
-        password_credential_dict = password_credential_dicts[0]
-
-        password_hash = password_credential_dict["password_hash"]
-        try:
-            ph.verify(password_hash, password)
-        except argon2.exceptions.VerifyMismatchError:
-            raise errors.NoIdentityFound()
-
-        local_identity = data.LocalIdentity(
-            **password_credential_dict["identity"]
-        )
-
-        if ph.check_needs_rehash(password_hash):
-            new_hash = ph.hash(password)
-            await execute.parse_execute_json(
-                db=db,
-                query="""\
-with
-  email := <str>$email,
-  new_hash := <str>$new_hash,
-
-update ext::auth::EmailPasswordFactor
-filter .email = email
-set { password_hash := new_hash };""",
-                variables={
-                    "email": email,
-                    "new_hash": new_hash,
-                },
-                cached_globally=True,
-            )
-
-        return local_identity
-
-    async def get_identity_and_secret(self, db: Any, input: dict[str, Any]):
-        if 'email' not in input:
-            raise errors.InvalidData("Missing 'email' in data")
-
-        email = input["email"]
-        r = await execute.parse_execute_json(
-            db=db,
-            query="""
-with
-  email := <str>$email,
-select ext::auth::EmailPasswordFactor {
-  password_hash,
-  identity: { * }
-} filter .email = email""",
-            variables={
-                "email": email,
-            },
-            cached_globally=True,
-        )
-
-        result_json = json.loads(r.decode())
-        if len(result_json) != 1:
-            raise errors.NoIdentityFound()
-        password_cred = result_json[0]
-
-        local_identity = data.LocalIdentity(
-            **password_cred["identity"]
-        )
-        secret = base64.b64encode(
-            hashlib.sha256(password_cred['password_hash'].encode()).digest()
-        ).decode()
-
-        return (local_identity, secret)
-
-    async def validate_reset_secret(
-        self, db: Any, identity_id: str, secret: str
-    ):
-
-        r = await execute.parse_execute_json(
-            db=db,
-            query="""\
-with
-  identity_id := <uuid><str>$identity_id,
-select ext::auth::EmailPasswordFactor { password_hash, identity: { * } }
-filter .identity.id = identity_id;""",
+    LOCAL_IDENTITY := <ext::auth::LocalIdentity><uuid>$identity_id,
+    verified_at := <datetime>$verified_at,
+    UPDATED := (
+        update ext::auth::EmailFactor
+        filter .identity = LOCAL_IDENTITY
+            and not exists .verified_at ?? false
+        set { verified_at := verified_at }
+    ),
+select UPDATED {**};
+""",
             variables={
                 "identity_id": identity_id,
+                "verified_at": verified_at.isoformat(),
             },
             cached_globally=True,
+            query_tag='gel/auth',
+        )
+        result_json = json.loads(result_bytes.decode())
+        if len(result_json) == 0:
+            return None
+
+        factor = result_json[0]
+        return data.EmailFactor(**factor)
+
+    async def get_email_factor_by_identity_id(
+        self, identity_id: str
+    ) -> data.EmailFactor | None:
+        r = await execute.parse_execute_json(
+            self.db,
+            """
+select ext::auth::EmailFactor { ** } filter .identity.id = <uuid>$identity_id;
+            """,
+            variables={"identity_id": identity_id},
+            cached_globally=True,
+            query_tag='gel/auth',
         )
 
         result_json = json.loads(r.decode())
-        if len(result_json) != 1:
-            raise errors.NoIdentityFound()
-        password_cred = result_json[0]
+        if len(result_json) == 0:
+            return None
 
-        local_identity = data.LocalIdentity(
-            **password_cred["identity"]
-        )
+        assert len(result_json) == 1
 
-        current_secret = base64.b64encode(
-            hashlib.sha256(password_cred['password_hash'].encode()).digest()
-        ).decode()
+        factor = result_json[0]
 
-        return local_identity if secret == current_secret else None
+        return data.EmailFactor(**factor)
 
-    async def update_password(
-        self, db: Any, identity_id: str, secret: str, input: dict[str, Any]
-    ):
-        if 'password' not in input:
-            raise errors.InvalidData("Missing 'password' in data")
-
-        password = input["password"]
-
-        local_identity = await self.validate_reset_secret(
-            db, identity_id, secret)
-
-        if local_identity is None:
-            raise errors.InvalidData("Invalid 'reset_token'")
-
-        # TODO: check if race between validating secret and updating password
-        #       is a problem
-        await execute.parse_execute_json(
-            db=db,
-            query="""\
-with
-  identity_id := <uuid><str>$identity_id,
-  new_hash := <str>$new_hash,
-update ext::auth::EmailPasswordFactor
-filter .identity.id = identity_id
-set { password_hash := new_hash };""",
-            variables={
-                'identity_id': identity_id,
-                'new_hash': ph.hash(password)
-            },
+    async def get_verified_by_identity_id(self, identity_id: str) -> str | None:
+        r = await execute.parse_execute_json(
+            self.db,
+            """
+select ext::auth::EmailFactor {
+    verified_at,
+} filter .identity.id = <uuid>$identity_id;
+            """,
+            variables={"identity_id": identity_id},
             cached_globally=True,
+            query_tag='gel/auth',
         )
 
-        return local_identity
+        result_json = json.loads(r.decode())
+        if len(result_json) == 0:
+            return None
+
+        assert len(result_json) == 1
+
+        return cast(str, result_json[0]["verified_at"])
+
+    async def get_identity_id_by_email(
+        self, email: str, *, factor_type: str = 'EmailFactor'
+    ) -> str | None:
+        r = await execute.parse_execute_json(
+            self.db,
+            f"""
+with
+    email := <str>$email,
+    identity := (
+        select ext::auth::LocalIdentity
+        filter .<identity[is ext::auth::{factor_type}].email = email
+    ),
+select identity.id;""",
+            variables={"email": email},
+            cached_globally=True,
+            query_tag='gel/auth',
+        )
+
+        result_json = json.loads(r.decode())
+        if len(result_json) == 0:
+            return None
+
+        assert len(result_json) == 1
+
+        return cast(str, result_json[0])
+
+    async def get_email_factor_by_email(
+        self, email: str
+    ) -> data.EmailFactor | None:
+        r = await execute.parse_execute_json(
+            self.db,
+            """
+select ext::auth::EmailFactor { ** } filter .email = <str>$email;
+            """,
+            variables={"email": email},
+            cached_globally=True,
+            query_tag='gel/auth',
+        )
+
+        result_json = json.loads(r.decode())
+        if len(result_json) == 0:
+            return None
+
+        assert len(result_json) == 1
+
+        factor = result_json[0]
+        return data.EmailFactor(**factor)

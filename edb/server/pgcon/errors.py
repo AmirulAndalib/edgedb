@@ -49,6 +49,7 @@ ERROR_CHECK_VIOLATION = '23514'
 ERROR_EXCLUSION_VIOLATION = '23P01'
 
 # Class 25 - Invalid Transaction State
+ERRCODE_IN_FAILED_SQL_TRANSACTION = '25P02'
 ERROR_IDLE_IN_TRANSACTION_TIMEOUT = '25P03'
 ERROR_READ_ONLY_SQL_TRANSACTION = '25006'
 
@@ -67,7 +68,10 @@ ERROR_DEADLOCK_DETECTED = '40P01'
 # Class 42 - Syntax Error or Access Rule Violation
 ERROR_WRONG_OBJECT_TYPE = '42809'
 ERROR_INSUFFICIENT_PRIVILEGE = '42501'
+ERROR_UNDEFINED_COLUMN = '42703'
+ERROR_UNDEFINED_FUNCTION = '42883'
 ERROR_UNDEFINED_TABLE = '42P01'
+ERROR_UNDEFINED_PARAMETER = '42P02'
 ERROR_DUPLICATE_DATABASE = '42P04'
 ERROR_SYNTAX_ERROR = '42601'
 ERROR_DUPLICATE_CURSOR = '42P03'
@@ -169,29 +173,29 @@ def new(
 
 class FeatureNotSupported(BackendError):
     def __init__(self, message="feature not supported", **kwargs):
-        super().__init__(fields=_build_fields(
-            ERROR_FEATURE_NOT_SUPPORTED, message, **kwargs
-        ))
+        super().__init__(
+            fields=_build_fields(ERROR_FEATURE_NOT_SUPPORTED, message, **kwargs)
+        )
 
 
 class ProtocolViolation(BackendError):
     def __init__(self, message="protocol violation", **kwargs):
-        super().__init__(fields=_build_fields(
-            ERROR_PROTOCOL_VIOLATION, message, **kwargs
-        ))
+        super().__init__(
+            fields=_build_fields(ERROR_PROTOCOL_VIOLATION, message, **kwargs)
+        )
 
 
 class CannotConnectNowError(BackendError):
     def __init__(self, message="cannot connect now", **kwargs):
-        super().__init__(fields=_build_fields(
-            ERROR_CANNOT_CONNECT_NOW, message, **kwargs
-        ))
+        super().__init__(
+            fields=_build_fields(ERROR_CANNOT_CONNECT_NOW, message, **kwargs)
+        )
 
 
 class InvalidAuthSpec(BackendError):
-    def __init__(
-        self, message="invalid authorization specification", **kwargs
-    ):
-        super().__init__(fields=_build_fields(
-            ERROR_INVALID_AUTHORIZATION_SPECIFICATION, message, **kwargs
-        ))
+    def __init__(self, message="invalid authorization specification", **kwargs):
+        super().__init__(
+            fields=_build_fields(
+                ERROR_INVALID_AUTHORIZATION_SPECIFICATION, message, **kwargs
+            )
+        )

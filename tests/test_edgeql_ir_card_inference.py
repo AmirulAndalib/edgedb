@@ -68,7 +68,7 @@ class TestEdgeQLCardinalityInference(tb.BaseEdgeQLCompilerTest):
             shape = ir.expr.expr.result.shape
             for el, _ in shape:
                 if str(el.path_id.rptr_name()).endswith(field):
-                    card = el.rptr.ptrref.out_cardinality
+                    card = el.expr.ptrref.out_cardinality
                     self.assertEqual(card, expected_cardinality,
                                      'unexpected cardinality:\n' + source)
                     break
@@ -364,6 +364,33 @@ class TestEdgeQLCardinalityInference(tb.BaseEdgeQLCompilerTest):
         }
 % OK %
         parent: AT_MOST_ONE
+        """
+
+    def test_edgeql_ir_card_inference_36b(self):
+        """
+        SELECT Eert {
+            asdf := .<children[is Eert]
+        }
+% OK %
+        asdf: AT_MOST_ONE
+        """
+
+    def test_edgeql_ir_card_inference_36c(self):
+        """
+        SELECT Eert {
+            asdf := .<children[is Asdf]
+        }
+% OK %
+        asdf: MANY
+        """
+
+    def test_edgeql_ir_card_inference_36d(self):
+        """
+        SELECT Eert {
+            asdf := .<children[is Object]
+        }
+% OK %
+        asdf: MANY
         """
 
     def test_edgeql_ir_card_inference_37(self):
@@ -1268,4 +1295,50 @@ class TestEdgeQLCardinalityInference(tb.BaseEdgeQLCompilerTest):
     def test_edgeql_ir_card_inference_150(self):
         """
         select User { [is schema::Object].name }
+        """
+
+    def test_edgeql_ir_card_inference_151(self):
+        # lnk has a *delegated* constraint
+        """
+        select Tgt { back := .<lnk[is Src] }
+% OK %
+        back: MANY
+        """
+
+    def test_edgeql_ir_card_inference_152(self):
+        """
+        select Tgt { back := .<lnk[is SrcSub1] }
+% OK %
+        back: AT_MOST_ONE
+        """
+
+    def test_edgeql_ir_card_inference_153(self):
+        # Constraint is delegated, shouldn't apply here
+        """
+        select Named filter .name = ''
+% OK %
+        MANY
+        """
+
+    def test_edgeql_ir_card_inference_154(self):
+        # Constraint is delegated, shouldn't apply here
+        """
+        select Named2 filter .name = ''
+% OK %
+        MANY
+        """
+
+    def test_edgeql_ir_card_inference_155(self):
+        # But should apply to this subtype
+        """
+        select Named2Sub filter .name = ''
+% OK %
+        AT_MOST_ONE
+        """
+
+    def test_edgeql_ir_card_inference_156(self):
+        """
+        select global Alice
+% OK %
+        AT_MOST_ONE
         """

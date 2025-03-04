@@ -49,6 +49,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
     If x can be losslessly cast into Y, then casting it back is also lossless:
         x = <X><Y>x
     '''
+
     # FIXME: a special schema should be used here since we need to
     # cover all known scalars and even some arrays and tuples.
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas',
@@ -81,8 +82,10 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
     async def test_edgeql_casts_bytes_04(self):
         async with self.assertRaisesRegexTx(
-                edgedb.InvalidValueError, r'expected JSON string or null'):
-            await self.con.query_single("""SELECT <bytes>to_json('1');"""),
+            edgedb.InvalidValueError,
+            r'expected JSON string or null',
+        ):
+            await self.con.query_single("SELECT <bytes>to_json('1');")
 
         self.assertEqual(
             await self.con.query_single(r'''
@@ -540,7 +543,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # values.
         await self.assert_query_result(
             r'''
-                WITH x := {'true', 'false'}
+                FOR x in {'true', 'false'}
                 SELECT <str><bool>x = x;
             ''',
             [True, True],
@@ -548,7 +551,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {'True', 'False', 'TRUE', 'FALSE', '  TrUe   '}
+                FOR x in {'True', 'False', 'TRUE', 'FALSE', '  TrUe   '}
                 SELECT <str><bool>x = x;
             ''',
             [False, False, False, False, False],
@@ -556,7 +559,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {'True', 'False', 'TRUE', 'FALSE', 'TrUe'}
+                FOR x in {'True', 'False', 'TRUE', 'FALSE', 'TrUe'}
                 SELECT <str><bool>x = str_lower(x);
             ''',
             [True, True, True, True, True],
@@ -578,7 +581,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # str to json is always lossless
         await self.assert_query_result(
             r'''
-                WITH x := {'any', 'arbitrary', '♠gibberish♠'}
+                FOR x in {'any', 'arbitrary', '♠gibberish♠'}
                 SELECT <str><json>x = x;
             ''',
             [True, True, True],
@@ -588,7 +591,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # canonical uuid representation as a string is using lowercase
         await self.assert_query_result(
             r'''
-                WITH x := 'd4288330-eea3-11e8-bc5f-7faf132b1d84'
+                FOR x in 'd4288330-eea3-11e8-bc5f-7faf132b1d84'
                 SELECT <str><uuid>x = x;
             ''',
             [True],
@@ -597,7 +600,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # non-canonical
             r'''
-                WITH x := {
+                FOR x in {
                     'D4288330-EEA3-11E8-BC5F-7FAF132B1D84',
                     'D4288330-Eea3-11E8-Bc5F-7Faf132B1D84',
                     'D4288330-eea3-11e8-bc5f-7faf132b1d84',
@@ -609,7 +612,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {
+                FOR x in {
                     'D4288330-EEA3-11E8-BC5F-7FAF132B1D84',
                     'D4288330-Eea3-11E8-Bc5F-7Faf132B1D84',
                     'D4288330-eea3-11e8-bc5f-7faf132b1d84',
@@ -625,7 +628,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # in UTC time zone.
         await self.assert_query_result(
             r'''
-                WITH x := '2018-05-07T20:01:22.306916+00:00'
+                FOR x in '2018-05-07T20:01:22.306916+00:00'
                 SELECT <str><datetime>x = x;
             ''',
             [True],
@@ -634,7 +637,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same datetime
             r'''
-                WITH x := {
+                FOR x in {
                     '2018-05-07T15:01:22.306916-05:00',
                     '2018-05-07T15:01:22.306916-05',
                     '2018-05-07T20:01:22.306916Z',
@@ -688,7 +691,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # in UTC time zone.
         await self.assert_query_result(
             r'''
-                WITH x := '2018-05-07T20:01:22.306916'
+                FOR x in '2018-05-07T20:01:22.306916'
                 SELECT <str><cal::local_datetime>x = x;
             ''',
             [True],
@@ -697,7 +700,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same datetime
             r'''
-                WITH x := {
+                FOR x in {
                     # the '-' and ':' separators may be omitted
                     '20180507T200122.306916',
                     # acceptable RFC 3339
@@ -753,7 +756,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # 8601.
         await self.assert_query_result(
             r'''
-                WITH x := '2018-05-07'
+                FOR x in '2018-05-07'
                 SELECT <str><cal::local_date>x = x;
             ''',
             [True],
@@ -762,7 +765,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same date
             r'''
-                WITH x := {
+                FOR x in {
                     # the '-' separators may be omitted
                     '20180507',
                 }
@@ -800,7 +803,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # 8601.
         await self.assert_query_result(
             r'''
-                WITH x := '20:01:22.306916'
+                FOR x in '20:01:22.306916'
                 SELECT <str><cal::local_time>x = x;
             ''',
             [True],
@@ -808,7 +811,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {
+                FOR x in {
                     '20:01',
                     '20:01:00',
                     # the ':' separators may be omitted
@@ -822,7 +825,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                'invalid input syntax for type cal::local_time'):
+                'invalid input syntax for type std::cal::local_time'):
             await self.con.query_single(
                 "SELECT <cal::local_time>'2018-05-07 20:01:22'")
 
@@ -836,7 +839,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # Canonical duration
         await self.assert_query_result(
             r'''
-                WITH x := 'PT20H1M22.306916S'
+                FOR x in 'PT20H1M22.306916S'
                 SELECT <str><duration>x = x;
             ''',
             [True],
@@ -845,7 +848,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # non-canonical
             r'''
-                WITH x := {
+                FOR x in {
                     '20:01:22.306916',
                     '20h 1m 22.306916s',
                     '20 hours 1 minute 22.306916 seconds',
@@ -860,7 +863,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same duration
             r'''
-                WITH x := {
+                FOR x in {
                     '20:01:22.306916',
                     '20h 1m 22.306916s',
                     '20 hours 1 minute 22.306916 seconds',
@@ -877,7 +880,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # there's no whitespace, which is trimmed
         await self.assert_query_result(
             r'''
-                WITH x := {'-20', '0', '7', '12345'}
+                FOR x in {'-20', '0', '7', '12345'}
                 SELECT <str><int16>x = x;
             ''',
             [True, True, True, True],
@@ -885,7 +888,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {'-20', '0', '7', '12345'}
+                FOR x in {'-20', '0', '7', '12345'}
                 SELECT <str><int32>x = x;
             ''',
             [True, True, True, True],
@@ -893,7 +896,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {'-20', '0', '7', '12345'}
+                FOR x in {'-20', '0', '7', '12345'}
                 SELECT <str><int64>x = x;
             ''',
             [True, True, True, True],
@@ -902,7 +905,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # with whitespace
             r'''
-                WITH x := {
+                FOR x in {
                     '       42',
                     '42     ',
                     '       42      ',
@@ -915,7 +918,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same value
             r'''
-                WITH x := {
+                FOR x in {
                     '       42',
                     '42     ',
                     '       42      ',
@@ -932,7 +935,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # lossy.
         await self.assert_query_result(
             r'''
-                WITH x := {'-20', '0', '7.2'}
+                FOR x in {'-20', '0', '7.2'}
                 SELECT <str><float32>x = x;
             ''',
             [True, True, True],
@@ -940,7 +943,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {'-20', '0', '7.2'}
+                FOR x in {'-20', '0', '7.2'}
                 SELECT <str><float64>x = x;
             ''',
             [True, True, True],
@@ -949,7 +952,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # non-canonical
             r'''
-                WITH x := {
+                FOR x in {
                     '0.0000000001234',
                     '1234E-13',
                     '0.1234e-9',
@@ -961,7 +964,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := {
+                FOR x in {
                     '0.0000000001234',
                     '1234E-13',
                     '0.1234e-9',
@@ -974,7 +977,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same value
             r'''
-                WITH x := {
+                FOR x in {
                     '0.0000000001234',
                     '1234E-13',
                     '0.1234e-9',
@@ -989,7 +992,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # use of scientific notation.
         await self.assert_query_result(
             r'''
-                WITH x := {
+                FOR x in {
                     '-20', '0', '7.2', '0.0000000001234', '1234.00000001234'
                 }
                 SELECT <str><decimal>x = x;
@@ -1000,7 +1003,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # non-canonical
             r'''
-                WITH x := {
+                FOR x in {
                     '1234E-13',
                     '0.1234e-9',
                 }
@@ -1012,7 +1015,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same date
             r'''
-                WITH x := {
+                FOR x in {
                     '1234E-13',
                     '0.1234e-9',
                 }
@@ -1154,7 +1157,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
                 # technically we're already casting a literal int64
                 # to int16 first
                 f'''
-                    WITH x := <int16>{{-32768, -32767, -100,
+                    FOR x in <int16>{{-32768, -32767, -100,
                                       0, 13, 32766, 32767}}
                     SELECT <int16><{numtype}>x = x;
                 ''',
@@ -1165,7 +1168,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
                 # technically we're already casting a literal int64
                 # to int32 first
                 f'''
-                    WITH x := <int32>{{-2147483648, -2147483647, -65536, -100,
+                    FOR x in <int32>{{-2147483648, -2147483647, -65536, -100,
                                       0, 13, 32768, 2147483646, 2147483647}}
                     SELECT <int32><{numtype}>x = x;
                 ''',
@@ -1174,7 +1177,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
             await self.assert_query_result(
                 f'''
-                    WITH x := <int64>{{
+                    FOR x in <int64>{{
                         -9223372036854775808,
                         -9223372036854775807,
                         -4294967296,
@@ -1201,7 +1204,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
             # technically we're already casting a literal int64 or
             # float64 to float32 first
             r'''
-                WITH x := <float32>{-3.31234e+38, -1.234e+12, -1.234e-12,
+                FOR x in <float32>{-3.31234e+38, -1.234e+12, -1.234e-12,
                                     -100, 0, 13, 1.234e-12, 1.234e+12, 3.4e+38}
                 SELECT <float32><decimal>x = x;
             ''',
@@ -1210,7 +1213,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := <float64>{-1.61234e+308, -1.234e+42, -1.234e-42,
+                FOR x in <float64>{-1.61234e+308, -1.234e+42, -1.234e-42,
                                     -100, 0, 13, 1.234e-42, 1.234e+42,
                                     1.7e+308}
                 SELECT <float64><decimal>x = x;
@@ -1228,7 +1231,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # ints <= 2^24 can be represented exactly in a float32
             r'''
-            WITH x := <int32>{16777216, 16777215, 16777214,
+            FOR x in <int32>{16777216, 16777215, 16777214,
                               1677721, 167772, 16777}
             SELECT <int32><float32>x = x;
             ''',
@@ -1238,7 +1241,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # max int32 -100, -1000
             r'''
-            WITH x := <int32>{2147483548, 2147482648}
+            FOR x in <int32>{2147483548, 2147482648}
             SELECT <int32><float32>x = x;
             ''',
             [False, False],
@@ -1246,7 +1249,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-            WITH x := <int32>{2147483548, 2147482648}
+            FOR x in <int32>{2147483548, 2147482648}
             SELECT <int32><float32>x;
             ''',
             [2147483520, 2147482624],
@@ -1256,7 +1259,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # ints <= 2^24 can be represented exactly in a float32
             r'''
-                WITH x := <int32>{16777216, 16777215, 16777214,
+                FOR x in <int32>{16777216, 16777215, 16777214,
                                   1677721, 167772, 16777}
                 SELECT <int32><float64>x = x;
             ''',
@@ -1266,7 +1269,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # max int32 -1, -2, -3, -10, -100, -1000
             r'''
-            WITH x := <int32>{2147483647, 2147483646, 2147483645,
+            FOR x in <int32>{2147483647, 2147483646, 2147483645,
                               2147483638, 2147483548, 2147482648}
             SELECT <int32><float64>x = x;
             ''',
@@ -1280,7 +1283,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             r'''
                 # 2^31 -1, -2, -3, -10
-                WITH x := <int32>{2147483647, 2147483646, 2147483645,
+                FOR x in <int32>{2147483647, 2147483646, 2147483645,
                                   2147483638}
                 # 2147483647 is the max int32
                 SELECT x <= <int32>2147483647;
@@ -1451,6 +1454,137 @@ class TestEdgeQLCasts(tb.QueryTestCase):
             [[['1'], ['2'], ['3']]],
         )
 
+    # check that casting to collections produces the correct error messages
+    async def test_edgeql_casts_collection_errors_01(self):
+        # scalar to array
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'std::int64' to 'array<std::int64>'"):
+            await self.con.execute("""
+                SELECT <array<int64>>1;
+            """)
+
+    async def test_edgeql_casts_collection_errors_02(self):
+        # tuple to array
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'tuple<std::int64>' to 'array<std::int64>'"):
+            await self.con.execute("""
+                SELECT <array<int64>>(1,);
+            """)
+
+    async def test_edgeql_casts_collection_errors_03(self):
+        # object to array
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'std::FreeObject' to 'array<std::int64>'"):
+            await self.con.execute("""
+                SELECT <array<int64>>{a := 1};
+            """)
+
+    async def test_edgeql_casts_collection_errors_04(self):
+        # array to array, mismatched element types
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'array<tuple<std::int64>>' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"cannot cast 'tuple<std::int64>' to 'std::int64'"):
+            await self.con.execute("""
+                SELECT <array<int64>>[(1,)];
+            """)
+
+    async def test_edgeql_casts_collection_errors_05(self):
+        # scalar to tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'std::int64' to 'tuple<std::int64>'"):
+            await self.con.execute("""
+                SELECT <tuple<int64>>1;
+            """)
+
+    async def test_edgeql_casts_collection_errors_06(self):
+        # array to tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'array<std::int64>' to 'tuple<std::int64>'"):
+            await self.con.execute("""
+                SELECT <tuple<int64>>[1];
+            """)
+
+    async def test_edgeql_casts_collection_errors_07(self):
+        # object to array
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"cannot cast 'std::FreeObject' to 'tuple<std::int64>'"):
+            await self.con.execute("""
+                SELECT <tuple<int64>>{a := 1};
+            """)
+
+    async def test_edgeql_casts_collection_errors_08(self):
+        # tuple to tuple, mismatched element types
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'tuple<array<std::int64>>' "
+                r"to 'tuple<std::int64>', "
+                r"at tuple element '0', "
+                r"cannot cast 'array<std::int64>' to 'std::int64'"):
+            await self.con.execute("""
+                SELECT <tuple<int64>>([1],);
+            """)
+
+    async def test_edgeql_casts_collection_errors_09(self):
+        # named tuple to named tuple, use new element name
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'tuple<b: array<std::int64>>' "
+                r"to 'tuple<a: std::int64>', "
+                r"at tuple element 'a', "
+                r"cannot cast 'array<std::int64>' to 'std::int64'"):
+            await self.con.execute("""
+                SELECT <tuple<a: int64>>(b := [1]);
+            """)
+
+    async def test_edgeql_casts_collection_errors_10(self):
+        # nested tuple to nested tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'tuple<tuple<array<std::int64>>>' "
+                r"to 'tuple<a: tuple<b: std::int64>>', "
+                r"at tuple element 'a', "
+                r"at tuple element 'b', "
+                r"cannot cast 'array<std::int64>' to 'std::int64'"):
+            await self.con.execute("""
+                SELECT <tuple<a: tuple<b: int64>>>(([1],),);
+            """)
+
+    async def test_edgeql_casts_collection_errors_11(self):
+        # nested array to nested array
+        # note: arrays can't be directly nested
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'array<tuple<array<tuple<std::int64>>>>' "
+                r"to 'array<tuple<array<std::int64>>>', "
+                r"in array elements, "
+                r"at tuple element '0', "
+                r"in array elements, "
+                r"cannot cast 'tuple<std::int64>' to 'std::int64'"):
+            await self.con.execute("""
+                SELECT <array<tuple<array<int64>>>>[([(1,)],)];
+            """)
+
+    async def test_edgeql_casts_collection_errors_12(self):
+        # tuple with multiple elements, error in later element
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"while casting 'tuple<std::int64, std::int64, std::int64>' "
+                r"to 'tuple<std::int64, std::int64, array<std::int64>>', "
+                r"at tuple element '2', "
+                r"cannot cast 'std::int64' to 'array<std::int64>"):
+            await self.con.execute("""
+                SELECT <tuple<int64, int64, array<int64>>>(1, 2, 3);
+            """)
+
     # casting into an abstract scalar should be illegal
     async def test_edgeql_casts_illegal_01(self):
         async with self.assertRaisesRegexTx(
@@ -1515,6 +1649,131 @@ class TestEdgeQLCasts(tb.QueryTestCase):
             await self.con.execute("""
                 SELECT <schema::Object>std::Object;
             """)
+
+    async def test_edgeql_casts_illegal_10(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError, r"cannot cast into generic.*anyenum"):
+            await self.con.execute("""
+                SELECT <array<anyenum>>{};
+            """)
+
+    async def test_edgeql_casts_illegal_11(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError, r"cannot cast into generic.*anyenum"):
+            await self.con.execute("""
+                SELECT <tuple<int64, anyenum>>{};
+            """)
+
+    async def test_edgeql_casts_illegal_12(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError, r"cannot cast into generic.*anypoint"):
+            await self.con.execute("""
+                SELECT <range<anypoint>>{};
+            """)
+
+    async def test_edgeql_casts_illegal_13(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError, r"cannot cast into generic.*anypoint"):
+            await self.con.execute("""
+                SELECT <multirange<anypoint>>{};
+            """)
+
+    # abstract scalar params should be illegal
+    async def test_edgeql_casts_illegal_param_01(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*'anytype'"):
+            await self.con.execute("""
+                SELECT <anytype>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_02(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyscalar'"):
+            await self.con.execute("""
+                SELECT <anyscalar>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_03(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyreal'"):
+            await self.con.execute("""
+                SELECT <anyreal>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_04(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyint'"):
+            await self.con.execute("""
+                SELECT <anyint>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_05(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyfloat'"):
+            await self.con.execute("""
+                SELECT <anyfloat>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_06(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*sequence'"):
+            await self.con.execute("""
+                SELECT <sequence>$0;
+            """, 123)
+
+    async def test_edgeql_casts_illegal_param_07(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anytype"):
+            await self.con.execute("""
+                SELECT <array<anytype>>$0;
+            """, [123])
+
+    async def test_edgeql_casts_illegal_param_08(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anytype"):
+            await self.con.execute("""
+                SELECT <tuple<int64, anytype>>$0;
+            """, (123, 123))
+
+    async def test_edgeql_casts_illegal_param_10(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyenum"):
+            await self.con.execute("""
+                SELECT <array<anyenum>>$0;
+            """, [])
+
+    async def test_edgeql_casts_illegal_param_11(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anyenum"):
+            await self.con.execute("""
+                SELECT <optional tuple<int64, anyenum>>$0;
+            """, None)
+
+    async def test_edgeql_casts_illegal_param_12(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anypoint"):
+            await self.con.execute("""
+                SELECT <optional range<anypoint>>$0;
+            """, None)
+
+    async def test_edgeql_casts_illegal_param_13(self):
+        async with self.assertRaisesRegexTx(
+                edgedb.QueryError,
+                r"parameter cannot be a generic type.*anypoint"):
+            await self.con.execute("""
+                SELECT <optional multirange<anypoint>>$0;
+            """, None)
 
     # NOTE: json is a special type as it has its own type system. A
     # json value can be JSON array, object, boolean, number, string or
@@ -1960,7 +2219,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # in UTC time zone.
         await self.assert_query_result(
             r'''
-                WITH x := <json>'2018-05-07T20:01:22.306916+00:00'
+                FOR x in <json>'2018-05-07T20:01:22.306916+00:00'
                 SELECT <json><datetime>x = x;
             ''',
             [True],
@@ -1969,7 +2228,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same datetime
             r'''
-                WITH x := <json>{
+                FOR x in <json>{
                     '2018-05-07T15:01:22.306916-05:00',
                     '2018-05-07T15:01:22.306916-05',
                     '2018-05-07T20:01:22.306916Z',
@@ -2030,7 +2289,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # in UTC time zone.
         await self.assert_query_result(
             r'''
-                WITH x := <json>'2018-05-07T20:01:22.306916'
+                FOR x in <json>'2018-05-07T20:01:22.306916'
                 SELECT <json><cal::local_datetime>x = x;
             ''',
             [True],
@@ -2039,7 +2298,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.assert_query_result(
             # validating that these are all in fact the same datetime
             r'''
-                WITH x := <json>{
+                FOR x in <json>{
                     # the '-' and ':' separators may be omitted
                     '20180507T200122.306916',
                     # acceptable RFC 3339
@@ -2100,7 +2359,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # 8601.
         await self.assert_query_result(
             r'''
-                WITH x := <json>'2018-05-07'
+                FOR x in <json>'2018-05-07'
                 SELECT <json><cal::local_date>x = x;
             ''',
             [True],
@@ -2110,7 +2369,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
             # validating that these are all in fact the same date
             r'''
                 # the '-' separators may be omitted
-                WITH x := <json>'20180507'
+                FOR x in <json>'20180507'
                 SELECT
                     <cal::local_date>x = <cal::local_date><json>'2018-05-07';
             ''',
@@ -2151,7 +2410,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         # 8601.
         await self.assert_query_result(
             r'''
-                WITH x := <json>'20:01:22.306916'
+                FOR x in <json>'20:01:22.306916'
                 SELECT <json><cal::local_time>x = x;
             ''',
             [True],
@@ -2159,7 +2418,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         await self.assert_query_result(
             r'''
-                WITH x := <json>{
+                FOR x in <json>{
                     '20:01',
                     '20:01:00',
                     # the ':' separators may be omitted
@@ -2173,7 +2432,7 @@ class TestEdgeQLCasts(tb.QueryTestCase):
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                'invalid input syntax for type cal::local_time'):
+                'invalid input syntax for type std::cal::local_time'):
             await self.con.query_single(
                 "SELECT <cal::local_time><json>'2018-05-07 20:01:22'")
 
@@ -2189,47 +2448,119 @@ class TestEdgeQLCasts(tb.QueryTestCase):
             [[1, 1, 2, 3, 5]]
         )
 
+        # string to array
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'expected JSON number or null; got JSON string'):
+                r'expected JSON array; got JSON string'):
+            await self.con.query_single(
+                r"SELECT <array<int64>><json>'asdf'")
+
+        # array of string to array of int
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"expected JSON number or null; got JSON string"):
             await self.con.query_single(
                 r"SELECT <array<int64>><json>['asdf']")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'expected JSON number or null; got JSON string'):
+                r"while casting 'std::json' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"expected JSON number or null; got JSON string"):
             await self.con.query_single(
                 r"SELECT <array<int64>>to_json('[1, 2, \"asdf\"]')")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"expected JSON number or null; got JSON string"):
+            await self.con.execute("""
+                SELECT <array<int64>>to_json('["a"]');
+            """)
+
+        # array with null to array
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'array<std::json>' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"invalid null value in cast"):
             await self.con.query_single(
                 r"SELECT <array<int64>>[to_json('1'), to_json('null')]")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"array<std::int64>', "
+                r"in array elements, "
+                r"invalid null value in cast"):
             await self.con.query_single(
                 r"SELECT <array<int64>>to_json('[1, 2, null]')")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'array<std::json>' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"invalid null value in cast"):
             await self.con.query_single(
                 r"SELECT <array<int64>><array<json>>to_json('[1, 2, null]')")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'tuple<array<std::str>>', "
+                r"at tuple element '0', "
+                r"invalid null value in cast"):
             await self.con.query_single(
                 r"select <tuple<array<str>>>to_json('[null]')")
 
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'cannot extract elements from a scalar'):
+                r"while casting 'std::json' "
+                r"to 'tuple<array<std::str>>', "
+                r"at tuple element '0', "
+                r"in array elements, "
+                r"invalid null value in cast"):
             await self.con.query_single(
-                r"SELECT <array<int64>><json>'asdf'")
+                r"select <tuple<array<str>>>to_json('[[null]]')")
+
+        # object to array
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"expected JSON array; got JSON object"):
+            await self.con.execute("""
+                SELECT <array<int64>>to_json('{"a": 1}');
+            """)
+
+        # array of object to array of scalar
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'array<std::int64>', "
+                r"in array elements, "
+                r"expected JSON number or null; got JSON object"):
+            await self.con.execute("""
+                SELECT <array<int64>>to_json('[{"a": 1}]');
+            """)
+
+        # nested array
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'array<tuple<array<std::str>>>', "
+                r"in array elements, "
+                r"at tuple element '0', "
+                r"in array elements, "
+                r"expected JSON string or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <array<tuple<array<str>>>>to_json('[[[1]]]');
+            """)
 
     async def test_edgeql_casts_json_12(self):
         self.assertEqual(
@@ -2311,9 +2642,13 @@ class TestEdgeQLCasts(tb.QueryTestCase):
               edgedb.NamedTuple(a=12, b="bar")])
         )
 
+        # object with wrong element type to tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'expected JSON number or null; got JSON string'):
+                r"while casting 'std::json' "
+                r"to 'tuple<a: std::int64, b: std::int64>', "
+                r"at tuple element 'b', "
+                r"expected JSON number or null; got JSON string"):
             await self.con.query(
                 r"""
                     SELECT <tuple<a: int64, b: int64>>
@@ -2321,24 +2656,46 @@ class TestEdgeQLCasts(tb.QueryTestCase):
                 """
             )
 
-        # This isn't really the best error message for this.
+        # object with null value to tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'tuple<a: std::int64>', "
+                r"at tuple element 'a', "
+                r"invalid null value in cast"):
+            await self.con.query(
+                r"""SELECT <tuple<a: int64>>to_json('{"a": null}')"""
+            )
+
+        # object with missing element to tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<a: std::int64, b: std::int64>', "
+                r"at tuple element 'b', "
+                r"missing value in JSON object"):
             await self.con.query(
                 r"""SELECT <tuple<a: int64, b: int64>>to_json('{"a": 1}')"""
             )
 
+        # short array to unnamed tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'tuple<std::int64, std::int64>', "
+                r"at tuple element '1', "
+                r"missing value in JSON object"):
             await self.con.query(
                 r"""SELECT <tuple<int64, int64>>to_json('[3000]')"""
             )
 
+        # array to named tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'tuple<a: std::int64, b: std::int64>', "
+                r"at tuple element 'a', "
+                r"missing value in JSON object"):
             await self.con.query(
                 r"""
                     SELECT <tuple<a: int64, b: int64>>
@@ -2346,19 +2703,89 @@ class TestEdgeQLCasts(tb.QueryTestCase):
                 """
             )
 
+        # string to tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r'expected JSON array or object or null; got JSON string'):
             await self.con.query(
                 r"""SELECT <tuple<a: int64, b: int64>> to_json('"test"')"""
             )
 
+        # short array to unnamed tuple
         async with self.assertRaisesRegexTx(
                 edgedb.InvalidValueError,
-                r'invalid null value in cast'):
+                r"while casting 'std::json' "
+                r"to 'tuple<std::json, std::json>', "
+                r"at tuple element '1', "
+                r"missing value in JSON object"):
             await self.con.query(
                 r"""SELECT <tuple<json, json>> to_json('[3000]')"""
             )
+
+        # object to unnamed tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' to "
+                r"'tuple<std::int64>', "
+                r"at tuple element '0', "
+                r"missing value in JSON object"):
+            await self.con.execute("""
+                SELECT <tuple<int64>>to_json('{"a": 1}');
+            """)
+
+        # nested tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<a: tuple<b: std::str>>', "
+                r"at tuple element 'a', "
+                r"at tuple element 'b', "
+                r"expected JSON string or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <tuple<a: tuple<b: str>>>to_json('{"a": {"b": 1}}');
+            """)
+
+        # array with null to tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<std::int64, std::int64>', "
+                r"at tuple element '1', "
+                r"invalid null value in cast"):
+            await self.con.execute("""
+                SELECT <tuple<int64, int64>>to_json('[1, null]');
+            """)
+
+        # object with null to tuple
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<a: std::int64>', "
+                r"at tuple element 'a', "
+                r"invalid null value in cast"):
+            await self.con.execute("""
+                SELECT <tuple<a: int64>>to_json('{"a": null}');
+            """)
+
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<a: array<std::int64>>', "
+                r"at tuple element 'a', "
+                r"invalid null value in cast"):
+            await self.con.execute("""
+                SELECT <tuple<a: array<int64>>>to_json('{"a": null}');
+            """)
+
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'tuple<a: tuple<b: std::str>>', "
+                r"at tuple element 'a', "
+                r"invalid null value in cast"):
+            await self.con.execute("""
+                SELECT <tuple<a: tuple<b: str>>>to_json('{"a": null}');
+            """)
 
     async def test_edgeql_casts_json_13(self):
         await self.assert_query_result(
@@ -2449,6 +2876,148 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         await self.con.query('''
             select <json>Z union <json>Z;
         ''')
+
+    async def test_edgeql_casts_json_16(self):
+        # number to range
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"expected JSON object or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('1');
+            """)
+
+        # array to range
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"expected JSON object or null; got JSON array"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('[1]');
+            """)
+
+        # object to range, bad empty
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'range<std::int64>', "
+                r"in range parameter 'empty', "
+                r"expected JSON boolean or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "empty": 1
+                }');
+            """)
+
+        # object to range, empty with distinct lower and upper
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"conflicting arguments in range constructor: 'empty' is "
+                r"`true` while the specified bounds suggest otherwise"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "empty": true,
+                    "lower": 1,
+                    "upper": 2
+                }');
+            """)
+
+        # object to range, empty with same lower and upper
+        # and inc_lower and inc_upper
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"conflicting arguments in range constructor: 'empty' is "
+                r"`true` while the specified bounds suggest otherwise"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "empty": true,
+                    "lower": 1,
+                    "upper": 2,
+                    "inc_lower": true,
+                    "inc_upper": true
+                }');
+            """)
+
+        # object to range, missing inc_lower
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"JSON object representing a range must include an "
+                r"'inc_lower'"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "inc_upper": false
+                }');
+            """)
+
+        # object to range, missing inc_upper
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"JSON object representing a range must include an "
+                r"'inc_upper'"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "inc_lower": false
+                }');
+            """)
+
+        # object to range, bad inc_lower
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'range<std::int64>', "
+                r"in range parameter 'inc_lower', "
+                r"expected JSON boolean or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "inc_lower": 1,
+                    "inc_upper": false
+                }');
+            """)
+
+        # object to range, bad inc_upper
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"while casting 'std::json' "
+                r"to 'range<std::int64>', "
+                r"in range parameter 'inc_upper', "
+                r"expected JSON boolean or null; got JSON number"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "inc_lower": false,
+                    "inc_upper": 1
+                }');
+            """)
+
+        # object to range, extra parameters
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"JSON object representing a range contains unexpected keys: "
+                r"bar, foo"):
+            await self.con.execute("""
+                SELECT <range<int64>>to_json('{
+                    "lower": 1,
+                    "upper": 2,
+                    "inc_lower": true,
+                    "inc_upper": true,
+                    "foo": "foo",
+                    "bar": "bar"
+                }');
+            """)
+
+    async def test_edgeql_casts_json_17(self):
+        # number to multirange
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"expected JSON array; got JSON number"):
+            await self.con.execute("""
+                SELECT <multirange<int64>>to_json('1');
+            """)
+
+        # object to multirange
+        async with self.assertRaisesRegexTx(
+                edgedb.InvalidValueError,
+                r"expected JSON array; got JSON object"):
+            await self.con.execute("""
+                SELECT <multirange<int64>>to_json('{"a": 1}');
+            """)
 
     async def test_edgeql_casts_assignment_01(self):
         async with self._run_and_rollback():
@@ -2980,12 +3549,13 @@ class TestEdgeQLCasts(tb.QueryTestCase):
         }
         # Populate a type that has an optional field for each cast source type
         sep = '\n                '
+        props = sep.join(
+            f'CREATE PROPERTY {n} -> {_t(t)};'
+            for t, n in type_keys.items()
+        )
         setup = f'''
             CREATE TYPE Null {{
-                {sep.join(
-                    f'CREATE PROPERTY {n} -> {_t(t)};'
-                    for t, n in type_keys.items()
-                 )}
+                {props}
             }};
             INSERT Null;
         '''

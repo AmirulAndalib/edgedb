@@ -17,26 +17,21 @@
 #
 
 from __future__ import annotations
-from typing import *
+from typing import Any, Callable, Optional, Tuple, Type, Union, Mapping, List
+import pathlib
 
 from edb import errors
 from edb.common import parsing
 
 import edb._edgeql_parser as rust_parser
 
-from . import grammar as qlgrammar
 from .grammar import tokens
 
 from .. import ast as qlast
 from .. import tokenizer as qltokenizer
 
 
-ParserError = Tuple[
-    str,
-    Tuple[int, Optional[int]],
-    Optional[str],
-    Optional[str]
-]
+SPEC_LOADED = False
 
 
 def append_module_aliases(tree, aliases):
@@ -124,27 +119,38 @@ def parse(
     source: Union[str, qltokenizer.Source],
     filename: Optional[str] = None,
 ):
+    if not SPEC_LOADED:
+        preload_spec()
+
     if isinstance(source, str):
         source = qltokenizer.Source.from_string(source)
 
-    start_token_name = start_token.__name__[2:]
-    result, productions = rust_parser.parse(start_token_name, source.tokens())
+    start_name = start_token.__name__[2:]
+    result, productions = rust_parser.parse(start_name, source.tokens())
 
-    if len(result.errors()) > 0:
+    if len(result.errors) > 0:
         # TODO: emit multiple errors
 
         # Heuristic to pick the error:
+        # - the only Unexpected, if it is a keyword
         # - first encountered,
         # - Unexpected before Missing,
         # - original order.
-        errs: List[ParserError] = result.errors()
-        errs.sort(key=lambda e: (e[1][0], -ord(e[0][1])))
-        error = errs[0]
+        errs = result.errors
+        unexpected = [e for e in errs if e[0].startswith('Unexpected')]
+        if (
+            len(unexpected) == 1
+            and unexpected[0][0].startswith('Unexpected keyword')
+        ):
+            error = unexpected[0]
+        else:
+            errs.sort(key=lambda e: (e[1][0], -ord(e[0][1])))
+            error = errs[0]
 
         message, span, hint, details = error
         position = qltokenizer.inflate_position(source.text(), span)
 
-        pcontext = parsing.ParserContext(
+        parsing_span = parsing.Span(
             'query',
             source.text(),
             start=position[2],
@@ -156,11 +162,12 @@ def parse(
             position=position,
             hint=hint,
             details=details,
-            context=pcontext
+            span=parsing_span
         )
 
+    assert isinstance(result.out, rust_parser.CSTNode)
     return _cst_to_ast(
-        result.out(),
+        result.out,
         productions,
         source,
         filename,
@@ -169,7 +176,7 @@ def parse(
 
 def _cst_to_ast(
     cst: rust_parser.CSTNode,
-    productions: list[Callable],
+    productions: List[Tuple[Type, Callable]],
     source: qltokenizer.Source,
     filename: Optional[str],
 ) -> Any:
@@ -193,26 +200,26 @@ def _cst_to_ast(
         if isinstance(node, rust_parser.CSTNode):
             # this would be the body of the original recursion function
 
-            if terminal := node.terminal():
+            if terminal := node.terminal:
                 # Terminal is simple: just convert to parsing.Token
-                context = parsing.ParserContext(
+                span = parsing.Span(
                     name=filename,
                     buffer=source.text(),
-                    start=terminal.start(),
-                    end=terminal.end(),
+                    start=terminal.start,
+                    end=terminal.end,
                 )
                 result.append(
                     parsing.Token(
-                        terminal.text(), terminal.value(), context
+                        terminal.text, terminal.value, span
                     )
                 )
 
-            elif production := node.production():
+            elif production := node.production:
                 # Production needs to first process all args, then
                 # call the appropriate method.
                 # (this is all in reverse, because stacks)
                 stack.append(production)
-                args = list(production.args())
+                args = list(production.args)
                 args.reverse()
                 stack.extend(args)
             else:
@@ -220,18 +227,16 @@ def _cst_to_ast(
 
         elif isinstance(node, rust_parser.Production):
             # production args are done, get them out of result stack
-            len_args = len(node.args())
+            len_args = len(node.args)
             split_at = len(result) - len_args
             args = result[split_at:]
             result = result[0:split_at]
 
             # find correct method to call
-            production_id = node.id()
-            production = productions[production_id]
-
-            sym = production.lhs.nontermType()
-            assert len(args) == len(production.rhs)
-            production.method(sym, *args)
+            production_id = node.id
+            non_term_type, method = productions[production_id]
+            sym = non_term_type()
+            method(sym, *args)
 
             # push into result stack
             result.append(sym)
@@ -239,14 +244,15 @@ def _cst_to_ast(
     return result.pop()
 
 
-def preload(allow_rebuild: bool = False) -> None:
-    grammar = qlgrammar.start
-    try:
-        spec = parsing.load_parser_spec(grammar, allow_rebuild=False)
-    except parsing.ParserSpecIncompatibleError as e:
-        if allow_rebuild:
-            spec = parsing.load_parser_spec(grammar, allow_rebuild=True)
-        else:
-            raise errors.InternalServerError(e.args[0]) from None
+def preload_spec() -> None:
+    global SPEC_LOADED
+    path = get_spec_filepath()
+    rust_parser.preload_spec(path)
+    SPEC_LOADED = True
 
-    rust_parser.cache_spec(spec)
+
+def get_spec_filepath():
+    "Returns an absolute path to the serialized grammar spec file"
+
+    edgeql_dir = pathlib.Path(__file__).parent.parent
+    return str(edgeql_dir / 'grammar.bc')

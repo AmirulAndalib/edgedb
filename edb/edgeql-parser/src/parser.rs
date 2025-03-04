@@ -24,7 +24,11 @@ impl<'s> Context<'s> {
     }
 }
 
-pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode<'a>>, Vec<Error>) {
+/// This is a const just so we remember to update it everywhere
+/// when changing.
+const UNEXPECTED: &str = "Unexpected";
+
+pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<CSTNode<'a>>, Vec<Error>) {
     let stack_top = ctx.arena.alloc(StackNode {
         parent: None,
         state: 0,
@@ -39,7 +43,15 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
         has_custom_error: false,
     };
 
-    // append EIO
+    // Append EIO token.
+    // We have a weird setup that requires two EOI tokens:
+    // - one is consumed by the grammar generator and does not contribute to
+    //   span of the nodes.
+    // - second is consumed by explicit EOF tokens in EdgeQLGrammar NonTerm.
+    //   Since these are children of productions, they do contribute to the
+    //   spans of the top-level nodes.
+    // First EOI is produced by tokenizer (with correct offset) and second one
+    // is injected here.
     let end = input.last().map(|t| t.span.end).unwrap_or_default();
     let eoi = ctx.alloc_terminal(Terminal {
         kind: Kind::EOI,
@@ -48,13 +60,14 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
         value: None,
         is_placeholder: false,
     });
-    let input = input.iter().chain(Some(eoi));
+    let input = input.iter().chain([eoi]);
 
     let mut parsers = vec![initial_track];
     let mut prev_span: Option<Span> = None;
     let mut new_parsers = Vec::with_capacity(parsers.len() + 5);
 
     for token in input {
+        // println!("token {:?}", token);
         while let Some(mut parser) = parsers.pop() {
             let res = parser.act(ctx, token);
 
@@ -75,20 +88,22 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
                 };
 
                 // option 1: inject a token
-                let possible_actions = &ctx.spec.actions[parser.stack_top.state];
-                for token_kind in possible_actions.keys() {
-                    let mut inject = parser.clone();
+                if parser.error_cost <= ERROR_COST_INJECT_MAX {
+                    let possible_actions = &ctx.spec.actions[parser.stack_top.state];
+                    for token_kind in possible_actions.keys() {
+                        let mut inject = parser.clone();
 
-                    let injection = new_token_for_injection(*token_kind, ctx);
+                        let injection = new_token_for_injection(*token_kind, ctx);
 
-                    let cost = injection_cost(token_kind);
-                    let error = Error::new(format!("Missing {injection}")).with_span(gap_span);
-                    inject.push_error(error, cost);
+                        let cost = injection_cost(token_kind);
+                        let error = Error::new(format!("Missing {injection}")).with_span(gap_span);
+                        inject.push_error(error, cost);
 
-                    if inject.error_cost <= ERROR_COST_INJECT_MAX {
-                        // println!("   --> [inject {injection}]");
+                        if inject.error_cost <= ERROR_COST_INJECT_MAX
+                            && inject.act(ctx, injection).is_ok()
+                        {
+                            // println!("   --> [inject {injection}]");
 
-                        if inject.act(ctx, injection).is_ok() {
                             // insert into parsers, to retry the original token
                             parsers.push(inject);
                         }
@@ -104,29 +119,30 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
                             .push_error(error.default_span_to(token.span), ERROR_COST_CUSTOM_ERROR);
                         parser.has_custom_error = true;
 
+                        // println!("   --> [custom error]");
                         new_parsers.push(parser);
                         continue;
                     }
                 } else if parser.has_custom_error {
                     // when there is a custom error, just skip the tokens until
                     // the parser recovers
+                    // println!("   --> [skip because of custom error]");
                     new_parsers.push(parser);
                     continue;
                 }
 
                 // option 3: skip the token
                 let mut skip = parser;
-                let error = Error::new(format!("Unexpected {token}")).with_span(token.span);
+                let error = Error::new(format!("{UNEXPECTED} {token}")).with_span(token.span);
                 skip.push_error(error, ERROR_COST_SKIP);
-                if token.kind == Kind::EOF {
+                if token.kind == Kind::EOI || token.kind == Kind::Semicolon {
                     // extra penalty
                     skip.error_cost += ERROR_COST_INJECT_MAX;
                     skip.can_recover = false;
                 }
 
-                // println!("   --> [skip]");
-
                 // insert into new_parsers, so the token is skipped
+                // println!("   --> [skip] {}", skip.error_cost);
                 new_parsers.push(skip);
             }
         }
@@ -150,11 +166,16 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
                     new_parsers.push(recovered);
                 }
             }
-        }
 
-        // prune: pick only X best parsers
-        if new_parsers.len() > PARSER_COUNT_MAX {
-            new_parsers.drain(PARSER_COUNT_MAX..);
+            // prune: pick only 1 best parsers that has cost > ERROR_COST_INJECT_MAX
+            if new_parsers[0].error_cost > ERROR_COST_INJECT_MAX {
+                new_parsers.drain(1..);
+            }
+
+            // prune: pick only X best parsers
+            if new_parsers.len() > PARSER_COUNT_MAX {
+                new_parsers.drain(PARSER_COUNT_MAX..);
+            }
         }
 
         assert!(parsers.is_empty());
@@ -164,16 +185,28 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
 
     // there will always be a parser left,
     // since we always allow a token to be skipped
-    let mut parser = parsers.into_iter().min_by_key(|p| p.error_cost).unwrap();
-    parser.finish();
+    let parser = parsers
+        .into_iter()
+        .min_by(|a, b| {
+            Ord::cmp(&a.error_cost, &b.error_cost).then_with(|| {
+                Ord::cmp(
+                    &starts_with_unexpected_error(a),
+                    &starts_with_unexpected_error(b),
+                )
+                .reverse()
+            })
+        })
+        .unwrap();
 
-    let node = if parser.can_recover {
-        Some(&parser.stack_top.value)
-    } else {
-        None
-    };
+    let node = parser.finish(ctx);
     let errors = custom_errors::post_process(parser.errors);
     (node, errors)
+}
+
+fn starts_with_unexpected_error(a: &Parser) -> bool {
+    a.errors
+        .first()
+        .map_or(true, |x| x.message.starts_with(UNEXPECTED))
 }
 
 impl<'s> Context<'s> {
@@ -222,7 +255,6 @@ pub struct Spec {
 
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(untagged))]
 pub enum Action {
     Shift(usize),
     Reduce(Reduce),
@@ -246,8 +278,9 @@ pub struct Reduce {
 /// Any types that do allocation with global allocator (such as String or Vec),
 /// must manually drop. This is why Terminal has a special vec arena that does
 /// Drop.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum CSTNode<'a> {
+    #[default]
     Empty,
     Terminal(&'a Terminal),
     Production(Production<'a>),
@@ -384,28 +417,37 @@ impl<'s> Parser<'s> {
         self.stack_top = ctx.arena.alloc(node);
     }
 
-    pub fn finish(&mut self) {
-        debug_assert!(matches!(
-            &self.stack_top.value,
-            CSTNode::Terminal(Terminal {
-                kind: Kind::EOI,
-                ..
-            })
-        ));
-        self.stack_top = self.stack_top.parent.unwrap();
+    pub fn finish(&self, _ctx: &'s Context) -> Option<CSTNode<'s>> {
+        if !self.can_recover || self.has_custom_error {
+            return None;
+        }
 
-        // self.print_stack();
+        // pop the EOI from the top of the stack
+        assert!(
+            matches!(
+                &self.stack_top.value,
+                CSTNode::Terminal(Terminal {
+                    kind: Kind::EOI,
+                    ..
+                })
+            ),
+            "expected EOI CST node, got {:?}",
+            self.stack_top.value
+        );
+
+        let final_node = self.stack_top.parent.unwrap();
+
+        // self.print_stack(_ctx);
         // println!("   --> accept");
 
-        #[cfg(debug_assertions)]
-        {
-            let first = self.stack_top.parent.unwrap();
-            assert!(
-                matches!(&first.value, CSTNode::Empty),
-                "expected 'Empty' found {:?}",
-                first.value
-            );
-        }
+        let first = final_node.parent.unwrap();
+        assert!(
+            matches!(&first.value, CSTNode::Empty),
+            "expected empty CST node, found {:?}",
+            first.value
+        );
+
+        Some(final_node.value)
     }
 
     #[cfg(never)]
@@ -443,7 +485,23 @@ impl<'s> Parser<'s> {
     }
 
     fn push_error(&mut self, error: Error, cost: u16) {
-        self.errors.push(error);
+        let mut suppress = false;
+        if error.message.starts_with(UNEXPECTED) {
+            if let Some(last) = self.errors.last() {
+                if last.message.starts_with(UNEXPECTED) {
+                    // don't repeat "Unexpected" errors
+
+                    // This is especially useful when we encounter an
+                    // unrecoverable error which will make all tokens until EOF
+                    // as "Unexpected".
+                    suppress = true;
+                }
+            }
+        }
+        if !suppress {
+            self.errors.push(error);
+        }
+
         self.error_cost += cost;
         self.node_count = 0;
     }
@@ -524,13 +582,17 @@ fn injection_cost(kind: &Kind) -> u16 {
     use Kind::*;
 
     match kind {
-        Ident => 9,
+        Ident => 10,
         Substitution => 8,
 
-        // A few keywords that should not be injected since they result in
-        // confusing error messages.
-        Keyword(keywords::Keyword("delete" | "update" | "link")) => 100,
-        Keyword(_) => 10,
+        // Manual keyword tweaks to encourage some error messages and discourage others.
+        Keyword(keywords::Keyword(
+            "delete" | "update" | "migration" | "role" | "global" | "administer" | "future"
+            | "database",
+        )) => 100,
+        Keyword(keywords::Keyword("insert" | "module" | "extension" | "branch")) => 20,
+        Keyword(keywords::Keyword("select" | "property" | "type")) => 10,
+        Keyword(_) => 15,
 
         Dot => 5,
         OpenBrace | OpenBracket => 5,
@@ -539,7 +601,7 @@ fn injection_cost(kind: &Kind) -> u16 {
         CloseBrace | CloseBracket | CloseParen => 1,
 
         Namespace => 10,
-        Semicolon | Comma | Colon => 2,
+        Comma | Colon | Semicolon => 2,
         Eq => 5,
 
         At => 6,
@@ -554,7 +616,9 @@ fn injection_cost(kind: &Kind) -> u16 {
 impl std::fmt::Display for Terminal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if (self.is_placeholder && self.kind == Kind::Ident) || self.text.is_empty() {
-            return write!(f, "{}", self.kind.user_friendly_text().unwrap_or_default());
+            if let Some(user_friendly) = self.kind.user_friendly_text() {
+                return write!(f, "{}", user_friendly);
+            }
         }
 
         match self.kind {
@@ -562,12 +626,6 @@ impl std::fmt::Display for Terminal {
             Kind::Keyword(Keyword(kw)) => write!(f, "keyword '{}'", kw.to_ascii_uppercase()),
             _ => write!(f, "'{}'", self.text),
         }
-    }
-}
-
-impl<'a> Default for CSTNode<'a> {
-    fn default() -> Self {
-        CSTNode::Empty
     }
 }
 
@@ -595,19 +653,18 @@ impl Terminal {
 }
 
 #[cfg(feature = "serde")]
-impl Spec {
-    pub fn from_json(j_spec: &str) -> Result<Spec, String> {
-        #[derive(Debug, serde::Serialize, serde::Deserialize)]
-        struct SpecJson {
-            pub actions: Vec<Vec<(String, Action)>>,
-            pub goto: Vec<Vec<(String, usize)>>,
-            pub start: String,
-            pub inlines: Vec<(usize, u8)>,
-            pub production_names: Vec<(String, String)>,
-        }
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SpecSerializable {
+    pub actions: Vec<Vec<(String, Action)>>,
+    pub goto: Vec<Vec<(String, usize)>>,
+    pub start: String,
+    pub inlines: Vec<(usize, u8)>,
+    pub production_names: Vec<(String, String)>,
+}
 
-        let v = serde_json::from_str::<SpecJson>(j_spec).map_err(|e| e.to_string())?;
-
+#[cfg(feature = "serde")]
+impl From<SpecSerializable> for Spec {
+    fn from(v: SpecSerializable) -> Spec {
         let actions = v
             .actions
             .into_iter()
@@ -616,13 +673,14 @@ impl Spec {
             .collect();
         let goto = v.goto.into_iter().map(IndexMap::from_iter).collect();
         let inlines = IndexMap::from_iter(v.inlines);
-        Ok(Spec {
+
+        Spec {
             actions,
             goto,
             start: v.start,
             inlines,
             production_names: v.production_names,
-        })
+        }
     }
 }
 
@@ -667,8 +725,7 @@ fn get_token_kind(token_name: &str) -> Kind {
         ">" => Greater,
 
         "IDENT" => Ident,
-        "EOF" => EOF,
-        "<$>" => EOI,
+        "EOI" | "<$>" => EOI,
         "<e>" => Epsilon,
 
         "BCONST" => BinStr,
@@ -689,8 +746,13 @@ fn get_token_kind(token_name: &str) -> Kind {
         ":=" => Assign,
         "-=" => SubAssign,
 
-        "ARGUMENT" => Argument,
+        "PARAMETER" => Parameter,
+        "PARAMETERANDTYPE" => ParameterAndType,
         "SUBSTITUTION" => Substitution,
+
+        "STRINTERPSTART" => StrInterpStart,
+        "STRINTERPCONT" => StrInterpCont,
+        "STRINTERPEND" => StrInterpEnd,
 
         _ => {
             let mut token_name = token_name.to_lowercase();

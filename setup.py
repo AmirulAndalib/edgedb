@@ -18,11 +18,11 @@
 
 
 import binascii
-import importlib
 import os
 import os.path
 import pathlib
 import platform
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -35,7 +35,6 @@ from setuptools.command import build_ext as setuptools_build_ext
 import distutils
 
 import Cython.Build
-import parsing
 import setuptools_rust
 
 
@@ -49,7 +48,7 @@ EDGEDBGUI_COMMIT = 'main'
 
 PGVECTOR_REPO = 'https://github.com/pgvector/pgvector.git'
 # This can be a branch, tag, or commit
-PGVECTOR_COMMIT = 'v0.4.2'
+PGVECTOR_COMMIT = 'v0.7.4'
 
 SAFE_EXT_CFLAGS: list[str] = []
 if flag := os.environ.get('EDGEDB_OPT_CFLAG'):
@@ -58,6 +57,8 @@ else:
     SAFE_EXT_CFLAGS += ['-O2']
 
 EXT_CFLAGS: list[str] = list(SAFE_EXT_CFLAGS)
+# See also: https://github.com/cython/cython/issues/5240
+EXT_CFLAGS += ['-Wno-error=incompatible-pointer-types']
 EXT_LDFLAGS: list[str] = []
 
 ROOT_PATH = pathlib.Path(__file__).parent.resolve()
@@ -70,12 +71,17 @@ EXT_INC_DIRS = [
 EXT_LIB_DIRS = [
     (ROOT_PATH / 'edb' / 'pgsql' / 'parser' / 'libpg_query').as_posix()
 ]
+EDBSS_DIR = ROOT_PATH / 'edb_stat_statements'
 
 
 if platform.uname().system != 'Windows':
     EXT_CFLAGS.extend([
         '-std=c99', '-fsigned-char', '-Wall', '-Wsign-compare', '-Wconversion'
     ])
+
+
+def _is_langserver_build() -> bool:
+    return os.environ.get("EDGEDB_BUILD_PACKAGE", "") == "language-server"
 
 
 def _compile_build_meta(build_lib, version, pg_config, runstate_dir,
@@ -195,10 +201,11 @@ def _get_env_with_openssl_flags():
     return env
 
 
-def _compile_postgres(build_base, *,
+def _compile_postgres(build_base, build_temp, *,
                       force_build=False, fresh_build=True,
                       run_configure=True, build_contrib=True,
-                      produce_compile_commands_json=False):
+                      produce_compile_commands_json=False,
+                      run_tests=False):
 
     proc = subprocess.run(
         ['git', 'submodule', 'status', 'postgres'],
@@ -246,29 +253,45 @@ def _compile_postgres(build_base, *,
 
         if run_configure or fresh_build or is_outdated:
             env = _get_env_with_openssl_flags()
-            subprocess.run([
+            cmd = [
                 str(postgres_src / 'configure'),
                 '--prefix=' + str(postgres_build / 'install'),
                 '--with-openssl',
                 '--with-uuid=' + uuidlib,
-            ], check=True, cwd=str(build_dir), env=env)
+            ]
+            if os.environ.get('EDGEDB_DEBUG'):
+                cmd += [
+                    '--enable-tap-tests',
+                    '--enable-debug',
+                ]
+                cflags = os.environ.get("CFLAGS", "")
+                cflags = f"{cflags} -O0"
+                env['CFLAGS'] = cflags
+            subprocess.run(cmd, check=True, cwd=str(build_dir), env=env)
 
         if produce_compile_commands_json:
             make = ['bear', '--', 'make']
         else:
             make = ['make']
 
+        make_args = ['MAKELEVEL=0', '-j', str(max(os.cpu_count() - 1, 1))]
+
         subprocess.run(
-            make + ['MAKELEVEL=0', '-j', str(max(os.cpu_count() - 1, 1))],
+            make + make_args,
             cwd=str(build_dir), check=True)
 
         if build_contrib or fresh_build or is_outdated:
             subprocess.run(
-                make + [
-                    '-C', 'contrib', 'MAKELEVEL=0', '-j',
-                    str(max(os.cpu_count() - 1, 1))
-                ],
+                make + ['-C', 'contrib'] + make_args,
                 cwd=str(build_dir), check=True)
+
+        if run_tests:
+            subprocess.run(
+                make + ["check-world"],
+                cwd=str(build_dir),
+                check=True,
+                env=os.environ | {"MAKELEVEL": "0"},
+            )
 
         subprocess.run(
             ['make', 'MAKELEVEL=0', 'install'],
@@ -278,6 +301,12 @@ def _compile_postgres(build_base, *,
             subprocess.run(
                 ['make', '-C', 'contrib', 'MAKELEVEL=0', 'install'],
                 cwd=str(build_dir), check=True)
+
+        pg_config = (
+            build_base / 'postgres' / 'install' / 'bin' / 'pg_config'
+        ).resolve()
+        _compile_pgvector(pg_config, build_temp)
+        _compile_edb_stat_statements(pg_config, build_temp)
 
         with open(postgres_build_stamp, 'w') as f:
             f.write(source_stamp)
@@ -289,7 +318,7 @@ def _compile_postgres(build_base, *,
             )
 
 
-def _compile_pgvector(build_base, build_temp):
+def _compile_pgvector(pg_config, build_temp):
     git_rev = _get_git_rev(PGVECTOR_REPO, PGVECTOR_COMMIT)
 
     pgv_root = (build_temp / 'pgvector').resolve()
@@ -317,10 +346,6 @@ def _compile_pgvector(build_base, build_temp):
         cwd=pgv_root,
     )
 
-    pg_config = (
-        build_base / 'postgres' / 'install' / 'bin' / 'pg_config'
-    ).resolve()
-
     cflags = os.environ.get("CFLAGS", "")
     cflags = f"{cflags} {' '.join(SAFE_EXT_CFLAGS)} -std=gnu99"
 
@@ -344,6 +369,74 @@ def _compile_pgvector(build_base, build_temp):
     )
 
 
+def _compile_edb_stat_statements(pg_config, build_temp):
+    subprocess.run(
+        [
+            'make',
+            f'PG_CONFIG={pg_config}',
+        ],
+        cwd=EDBSS_DIR,
+        check=True,
+    )
+
+    subprocess.run(
+        [
+            'make',
+            'install',
+            f'PG_CONFIG={pg_config}',
+        ],
+        cwd=EDBSS_DIR,
+        check=True,
+    )
+
+
+def _get_env_with_protobuf_c_flags():
+    env = dict(os.environ)
+    cflags = env.get('EDGEDB_BUILD_PROTOBUFC_CFLAGS')
+    ldflags = env.get('EDGEDB_BUILD_PROTOBUFC_LDFLAGS')
+
+    if not (cflags or ldflags) and platform.system() == 'Darwin':
+        try:
+            prefix = pathlib.Path(subprocess.check_output(
+                ['brew', '--prefix', 'protobuf-c'], text=True
+            ).strip())
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            prefix = None
+        else:
+            pc_path = str(prefix / 'lib' / 'pkgconfig')
+            if 'PKG_CONFIG_PATH' in env:
+                env['PKG_CONFIG_PATH'] += f':{pc_path}'
+            else:
+                env['PKG_CONFIG_PATH'] = pc_path
+        try:
+            cflags = subprocess.check_output(
+                ['pkg-config', '--cflags', 'protobuf-c'], text=True, env=env
+            ).strip()
+            ldflags = subprocess.check_output(
+                ['pkg-config', '--libs', 'protobuf-c'], text=True, env=env
+            ).strip()
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            # pkg-config is not installed or cannot find flags with pkg-config
+            if not prefix:
+                prefix = pathlib.Path("/opt/local")
+            cflags = f'-I{prefix / "include"!s}'
+            ldflags = f'-L{prefix / "lib"!s}'
+
+    if cflags:
+        if 'CPPFLAGS' in env:
+            env['CPPFLAGS'] += f' {cflags}'
+        elif 'CFLAGS' in env:
+            env['CFLAGS'] += f' {cflags}'
+        else:
+            env['CPPFLAGS'] = cflags
+    if ldflags:
+        if 'LDFLAGS' in env:
+            env['LDFLAGS'] += f' {ldflags}'
+        else:
+            env['LDFLAGS'] = ldflags
+    return env
+
+
 def _compile_libpg_query():
     dir = (ROOT_PATH / 'edb' / 'pgsql' / 'parser' / 'libpg_query').resolve()
 
@@ -355,15 +448,21 @@ def _compile_libpg_query():
     cflags = os.environ.get("CFLAGS", "")
     cflags = f"{cflags} {' '.join(SAFE_EXT_CFLAGS)} -std=gnu99"
 
+    env = _get_env_with_protobuf_c_flags()
+    if "CFLAGS" in env:
+        env["CFLAGS"] += f' {cflags}'
+    else:
+        env["CFLAGS"] = cflags
+
     subprocess.run(
         [
             'make',
             'build',
             '-j',
             str(max(os.cpu_count() - 1, 1)),
-            f'CFLAGS={cflags}',
         ],
         cwd=str(dir),
+        env=env,
         check=True,
     )
 
@@ -387,14 +486,39 @@ def _get_git_rev(repo, ref):
 
 
 def _get_pg_source_stamp():
+    from edb.buildmeta import hash_dirs
+
     output = subprocess.check_output(
-        ['git', 'submodule', 'status', 'postgres'],
+        ['git', 'submodule', 'status', '--cached', 'postgres'],
         universal_newlines=True,
         cwd=ROOT_PATH,
     )
     revision, _, _ = output[1:].partition(' ')
-    source_stamp = revision + '+' + PGVECTOR_COMMIT
-    return source_stamp
+    edbss_dir = EDBSS_DIR.as_posix()
+    edbss_hash = hash_dirs(
+        [(edbss_dir, '.c'), (edbss_dir, '.sql')],
+        extra_files=[
+            EDBSS_DIR / 'Makefile',
+            EDBSS_DIR / 'edb_stat_statements.control',
+        ],
+    )
+    edbss = binascii.hexlify(edbss_hash).decode()
+    stamp_list = [revision, PGVECTOR_COMMIT, edbss]
+    if os.environ.get('EDGEDB_DEBUG'):
+        stamp_list += ['debug']
+    source_stamp = '+'.join(stamp_list)
+    return source_stamp.strip()
+
+
+def _get_libpg_query_source_stamp():
+    output = subprocess.check_output(
+        ['git', 'submodule', 'status', '--cached',
+         'edb/pgsql/parser/libpg_query'],
+        universal_newlines=True,
+        cwd=ROOT_PATH,
+    )
+    revision, _, _ = output[1:].partition(' ')
+    return revision.strip()
 
 
 def _compile_cli(build_base, build_temp):
@@ -402,54 +526,65 @@ def _compile_cli(build_base, build_temp):
     env = dict(os.environ)
     env['CARGO_TARGET_DIR'] = str(build_temp / 'rust' / 'cli')
     env['PSQL_DEFAULT_PATH'] = build_base / 'postgres' / 'install' / 'bin'
-    git_ref = env.get("EDGEDBCLI_GIT_REV") or EDGEDBCLI_COMMIT
-    git_rev = _get_git_rev(EDGEDBCLI_REPO, git_ref)
-
-    subprocess.run(
-        [
-            'cargo', 'install',
-            '--verbose', '--verbose',
+    path = env.get("EDGEDBCLI_PATH")
+    args = [
+        'cargo', 'install',
+        '--verbose', '--verbose',
+        '--bin', 'gel',
+        '--root', rust_root,
+        '--features=dev_mode',
+        '--locked',
+        '--debug',
+    ]
+    if path:
+        args.extend([
+            '--path', path,
+        ])
+    else:
+        git_ref = env.get("EDGEDBCLI_GIT_REV") or EDGEDBCLI_COMMIT
+        git_rev = _get_git_rev(EDGEDBCLI_REPO, git_ref)
+        args.extend([
             '--git', EDGEDBCLI_REPO,
             '--rev', git_rev,
-            '--bin', 'edgedb',
-            '--root', rust_root,
-            '--features=dev_mode',
-            '--locked',
-            '--debug',
-        ],
+        ])
+
+    subprocess.run(
+        args,
         env=env,
         check=True,
     )
 
-    cli_dest = ROOT_PATH / 'edb' / 'cli' / 'edgedb'
-    # Delete the target first, to avoid "Text file busy" errors during
-    # the copy if the CLI is currently running.
-    try:
-        cli_dest.unlink()
-    except FileNotFoundError:
-        pass
+    for dest in ('gel', 'edgedb'):
+        cli_dest = ROOT_PATH / 'edb' / 'cli' / dest
+        # Delete the target first, to avoid "Text file busy" errors during
+        # the copy if the CLI is currently running.
+        try:
+            cli_dest.unlink()
+        except FileNotFoundError:
+            pass
 
-    shutil.copy(
-        rust_root / 'bin' / 'edgedb',
-        cli_dest,
-    )
+        shutil.copy(
+            rust_root / 'bin' / 'gel',
+            cli_dest,
+        )
+
+
+_PYTHON_ONLY = os.environ.get("BUILD_EXT_MODE", "both") == "skip"
 
 
 class build(setuptools_build.build):
 
     user_options = setuptools_build.build.user_options
 
-    sub_commands = (
-        [
-            ("build_libpg_query", lambda self: True),
-            *setuptools_build.build.sub_commands,
-            ("build_metadata", lambda self: True),
-            ("build_parsers", lambda self: True),
-            ("build_postgres", lambda self: True),
-            ("build_cli", lambda self: True),
-            ("build_ui", lambda self: True),
-        ]
-    )
+    sub_commands = setuptools_build.build.sub_commands if _PYTHON_ONLY else [
+        ("build_libpg_query", lambda self: True),
+        *setuptools_build.build.sub_commands,
+        ("build_metadata", lambda self: True),
+        ("build_parsers", lambda self: True),
+        ("build_postgres", lambda self: True),
+        ("build_cli", lambda self: True),
+        ("build_ui", lambda self: True),
+    ]
 
 
 class build_metadata(setuptools.Command):
@@ -515,7 +650,7 @@ class ci_helper(setuptools.Command):
     description = "echo specified hash or build info for CI"
     user_options = [
         ('type=', None,
-         'one of: cli, rust, ext, parsers, postgres, bootstrap, '
+         'one of: cli, rust, ext, parsers, postgres, libpg_query, bootstrap, '
          'build_temp, build_lib'),
     ]
 
@@ -529,39 +664,65 @@ class ci_helper(setuptools.Command):
         if self.type == 'parsers':
             parser_hash = hash_dirs(
                 [(pkg_dir / 'edgeql/parser/grammar', '.py')],
-                extra_files=[pkg_dir / 'edgeql-parser/src/keywords.rs'],
+                extra_files=[
+                    pkg_dir / 'edgeql-parser/src/keywords.rs',
+                    pkg_dir / 'edgeql-parser/edgeql-parser-python/src/parser.rs'
+                ],
             )
             print(binascii.hexlify(parser_hash).decode())
 
         elif self.type == 'postgres':
-            print(_get_pg_source_stamp().strip())
+            print(_get_pg_source_stamp())
+
+        elif self.type == 'libpg_query':
+            print(_get_libpg_query_source_stamp())
 
         elif self.type == 'bootstrap':
             bootstrap_hash = hash_dirs(
                 get_cache_src_dirs(),
-                extra_files=[pkg_dir / 'server/bootstrap.py'],
+                extra_files=[
+                    pkg_dir / 'server/bootstrap.py',
+                    pkg_dir / 'buildmeta.py',
+                ],
             )
             print(binascii.hexlify(bootstrap_hash).decode())
 
         elif self.type == 'rust':
-            rust_hash = hash_dirs([
-                (pkg_dir / 'edgeql-parser', '.rs'),
-                (pkg_dir / 'graphql-rewrite', '.rs'),
-            ], extra_files=[
-                pkg_dir / 'edgeql-parser/Cargo.toml',
-                pkg_dir / 'edgeql-parser/edgeql-parser-python/Cargo.toml',
-                pkg_dir / 'graphql-rewrite/Cargo.toml',
-            ])
+            dirs = []
+            # HACK: For annoying reasons, metapkg invokes setup.py
+            # with an ancient version of Python, and that doesn't have
+            # tomllib.  It doesn't invoke *this* code path, though, so
+            # import it here.
+            import tomllib
+
+            # Read the list of Rust projects from Cargo.toml
+            with open(pkg_dir.parent / 'Cargo.toml', 'rb') as f:
+                root = tomllib.load(f)
+                for member in root['workspace']['members']:
+                    dirs.append(pkg_dir.parent / member)
+            rust_hash = hash_dirs(
+                [(dir, '.rs') for dir in dirs],
+                extra_files=[dir / 'Cargo.toml' for dir in dirs] +
+                  [pkg_dir.parent / 'Cargo.lock'])
             print(binascii.hexlify(rust_hash).decode())
 
         elif self.type == 'ext':
-            ext_hash = hash_dirs([
-                (pkg_dir, '.pyx'),
-                (pkg_dir, '.pyi'),
-                (pkg_dir, '.pxd'),
-                (pkg_dir, '.pxi'),
-            ])
-            print(binascii.hexlify(ext_hash).decode())
+            import gel
+
+            ext_hash = hash_dirs(
+                [
+                    (pkg_dir, '.pyx'),
+                    (pkg_dir, '.pyi'),
+                    (pkg_dir, '.pxd'),
+                    (pkg_dir, '.pxi'),
+                ],
+                # protocol.pyx for tests links to edgedb-python binary
+                extra_data=gel.__version__.encode(),
+            )
+            print(
+                binascii.hexlify(ext_hash).decode() + '-'
+                + _get_libpg_query_source_stamp()
+            )
 
         elif self.type == 'cli':
             print(_get_git_rev(EDGEDBCLI_REPO, EDGEDBCLI_COMMIT))
@@ -578,7 +739,7 @@ class ci_helper(setuptools.Command):
         else:
             raise RuntimeError(
                 f'Illegal --type={self.type}; can only be: '
-                'cli, rust, ext, postgres, bootstrap, parsers,'
+                'cli, rust, ext, postgres, libpg_query, bootstrap, parsers,'
                 'build_temp or build_lib'
             )
 
@@ -598,6 +759,7 @@ class build_postgres(setuptools.Command):
         ('build-contrib', None, 'build contrib'),
         ('fresh-build', None, 'rebuild from scratch'),
         ('compile-commands', None, 'produce compile-commands.json using bear'),
+        ('run-tests', None, 'run Postgres test suite after building'),
     ]
 
     editable_mode: bool
@@ -608,6 +770,7 @@ class build_postgres(setuptools.Command):
         self.build_contrib = False
         self.fresh_build = False
         self.compile_commands = False
+        self.run_tests = False
 
     def finalize_options(self):
         pass
@@ -618,15 +781,13 @@ class build_postgres(setuptools.Command):
         build = self.get_finalized_command('build')
         _compile_postgres(
             pathlib.Path(build.build_base).resolve(),
+            pathlib.Path(build.build_temp).resolve(),
             force_build=True,
             fresh_build=self.fresh_build,
             run_configure=self.configure,
             build_contrib=self.build_contrib,
             produce_compile_commands_json=self.compile_commands,
-        )
-        _compile_pgvector(
-            pathlib.Path(build.build_base).resolve(),
-            pathlib.Path(build.build_temp).resolve(),
+            run_tests=self.run_tests,
         )
 
 
@@ -653,8 +814,8 @@ class build_ext(setuptools_build_ext.build_ext):
     user_options = setuptools_build_ext.build_ext.user_options + [
         ('cython-annotate', None,
             'Produce a colorized HTML version of the Cython source.'),
-        ('cython-directives=', None,
-            'Cython compiler directives'),
+        ('cython-extra-directives=', None,
+            'Extra Cython compiler directives'),
     ]
 
     def initialize_options(self):
@@ -669,17 +830,17 @@ class build_ext(setuptools_build_ext.build_ext):
         if os.environ.get('EDGEDB_DEBUG'):
             self.cython_always = True
             self.cython_annotate = True
-            self.cython_directives = "linetrace=True"
+            self.cython_extra_directives = "linetrace=True"
             self.define = 'PG_DEBUG,CYTHON_TRACE,CYTHON_TRACE_NOGIL'
             self.debug = True
         else:
             self.cython_always = False
             self.cython_annotate = None
-            self.cython_directives = None
+            self.cython_extra_directives = None
             self.debug = False
         self.build_mode = os.environ.get('BUILD_EXT_MODE', 'both')
 
-    def finalize_options(self):
+    def finalize_options(self) -> None:
         # finalize_options() may be called multiple times on the
         # same command object, so make sure not to override previously
         # set options.
@@ -693,12 +854,12 @@ class build_ext(setuptools_build_ext.build_ext):
             super(build_ext, self).finalize_options()
             return
 
-        directives = {
+        directives: dict[str, str | bool] = {
             'language_level': '3'
         }
 
-        if self.cython_directives:
-            for directive in self.cython_directives.split(','):
+        if self.cython_extra_directives:
+            for directive in self.cython_extra_directives.split(','):
                 k, _, v = directive.partition('=')
                 if v.lower() == 'false':
                     v = False
@@ -760,6 +921,9 @@ class build_ui(setuptools.Command):
         self.set_undefined_options("build_py", ("build_lib", "build_lib"))
 
     def run(self, *args, **kwargs):
+        if _is_langserver_build():
+            return
+
         from edb import buildmeta
         from edb.common import devmode
 
@@ -828,7 +992,7 @@ class build_ui(setuptools.Command):
 
 class build_parsers(setuptools.Command):
 
-    description = "build the parsers"
+    description = "build and serialize the parser grammar spec"
 
     build_lib: str
     target_root: pathlib.Path
@@ -839,10 +1003,6 @@ class build_parsers(setuptools.Command):
         ('inplace', None,
          'ignore build-lib and put compiled parsers into the source directory '
          'alongside your pure Python modules')]
-
-    sources = [
-        "edb.edgeql.parser.grammar.start",
-    ]
 
     def initialize_options(self):
         self.editable_mode = False
@@ -859,29 +1019,20 @@ class build_parsers(setuptools.Command):
         else:
             self.target_root = pathlib.Path(self.build_lib)
 
-    def get_output_mapping(self) -> dict[str, str]:
-        return {
-            str(self.target_root / src.parent / f"{src.stem}.pickle"): str(src)
-            for src in self._get_source_files()
-        }
-
-    def get_outputs(self) -> list[str]:
-        return list(self.get_output_mapping())
-
-    def get_source_files(self) -> list[str]:
-        return [str(src) for src in self._get_source_files()]
-
     def run(self, *args, **kwargs):
-        for src, dst in zip(self.sources, self.get_outputs()):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            spec_mod = importlib.import_module(src)
-            parsing.Spec(spec_mod, pickleFile=dst, verbose=True)
+        # load grammar definitions and build the parser
+        from edb.common import parsing
+        from edb.edgeql.parser import grammar as qlgrammar
+        spec = parsing.load_parser_spec(qlgrammar.start)
+        spec_json = parsing.spec_to_json(spec)
 
-    def _get_source_files(self) -> list[pathlib.Path]:
-        return [
-            pathlib.Path(src.replace(".", "/") + ".py")
-            for src in self.sources
-        ]
+        # prepare destination
+        dst = str(self.target_root / 'edb' / 'edgeql' / 'grammar.bc')
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+        # serialize
+        import edb._edgeql_parser as rust_parser
+        rust_parser.save_spec(spec_json, str(dst))
 
 
 class build_rust(setuptools_rust.build.build_rust):
@@ -930,18 +1081,12 @@ def _version():
     return buildmeta.get_version_from_scm(ROOT_PATH)
 
 
-_entry_points = {
-    'edgedb-server = edb.server.main:main',
-    'edgedb = edb.cli:rustcli',
-    'edb = edb.tools.edb:edbcommands',
-}
+_protobuf_c_flags = _get_env_with_protobuf_c_flags()
+_protobuf_c_cflags = shlex.split(_protobuf_c_flags.get("CPPFLAGS", ""))
 
 
 setuptools.setup(
     version=_version(),
-    entry_points={
-        "console_scripts": _entry_points,
-    },
     cmdclass={
         'build': build,
         'build_metadata': build_metadata,
@@ -1028,6 +1173,14 @@ setuptools.setup(
         ),
 
         setuptools_extension.Extension(
+            "edb.server.protocol.auth_helpers",
+            ["edb/server/protocol/auth_helpers.pyx"],
+            extra_compile_args=EXT_CFLAGS,
+            extra_link_args=EXT_LDFLAGS,
+            include_dirs=EXT_INC_DIRS,
+        ),
+
+        setuptools_extension.Extension(
             "edb.server.protocol.notebook_ext",
             ["edb/server/protocol/notebook_ext.pyx"],
             extra_compile_args=EXT_CFLAGS,
@@ -1066,7 +1219,6 @@ setuptools.setup(
             extra_link_args=EXT_LDFLAGS,
             include_dirs=EXT_INC_DIRS,
         ),
-
         setuptools_extension.Extension(
             "edb.server.pgcon.pgcon",
             ["edb/server/pgcon/pgcon.pyx"],
@@ -1086,23 +1238,39 @@ setuptools.setup(
         setuptools_extension.Extension(
             "edb.pgsql.parser.parser",
             ["edb/pgsql/parser/parser.pyx"],
-            extra_compile_args=EXT_CFLAGS,
+            extra_compile_args=EXT_CFLAGS + _protobuf_c_cflags,
             extra_link_args=EXT_LDFLAGS,
             include_dirs=EXT_INC_DIRS,
             library_dirs=EXT_LIB_DIRS,
             libraries=['pg_query']
+        ),
+
+        setuptools_extension.Extension(
+            "edb.server.compiler.rpc",
+            ["edb/server/compiler/rpc.pyx"],
+            extra_compile_args=EXT_CFLAGS,
+            extra_link_args=EXT_LDFLAGS,
+            include_dirs=EXT_INC_DIRS,
         ),
     ],
     rust_extensions=[
         setuptools_rust.RustExtension(
             "edb._edgeql_parser",
             path="edb/edgeql-parser/edgeql-parser-python/Cargo.toml",
-            binding=setuptools_rust.Binding.RustCPython,
+            features=["python_extension"],
+            binding=setuptools_rust.Binding.PyO3,
         ),
         setuptools_rust.RustExtension(
             "edb._graphql_rewrite",
             path="edb/graphql-rewrite/Cargo.toml",
-            binding=setuptools_rust.Binding.RustCPython,
+            features=["python_extension"],
+            binding=setuptools_rust.Binding.PyO3,
+        ),
+        setuptools_rust.RustExtension(
+            "edb.server._rust_native",
+            path="edb/server/_rust_native/Cargo.toml",
+            features=["python_extension"],
+            binding=setuptools_rust.Binding.PyO3,
         ),
     ],
 )

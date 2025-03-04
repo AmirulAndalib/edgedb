@@ -22,7 +22,20 @@
 
 from __future__ import annotations
 
-from typing import *
+from typing import (
+    Optional,
+    Tuple,
+    Union,
+    AbstractSet,
+    Iterable,
+    Mapping,
+    Sequence,
+    Dict,
+    List,
+    Set,
+    NamedTuple,
+    cast,
+)
 
 from edb import errors
 
@@ -33,6 +46,7 @@ from edb.schema import functions as s_func
 from edb.schema import name as sn
 from edb.schema import types as s_types
 from edb.schema import pseudo as s_pseudo
+from edb.schema import expr as s_expr
 
 from edb.edgeql import ast as qlast
 from edb.edgeql import qltypes as ft
@@ -67,7 +81,8 @@ class BoundCall(NamedTuple):
     args: List[BoundArg]
     null_args: Set[str]
     return_type: s_types.Type
-    has_empty_variadic: bool
+    variadic_arg_id: Optional[int]
+    variadic_arg_count: Optional[int]
 
 
 _VARIADIC = ft.ParameterKind.VariadicParam
@@ -80,10 +95,12 @@ _SINGLETON = ft.TypeModifier.SingletonType
 
 
 def find_callable_typemods(
-        candidates: Sequence[s_func.CallableLike], *,
-        num_args: int,
-        kwargs_names: AbstractSet[str],
-        ctx: context.ContextLevel) -> Dict[Union[int, str], ft.TypeModifier]:
+    candidates: Sequence[s_func.CallableLike],
+    *,
+    num_args: int,
+    kwargs_names: AbstractSet[str],
+    ctx: context.ContextLevel,
+) -> Dict[Union[int, str], ft.TypeModifier]:
     """Find the type modifiers for a callable.
 
     We do this early, before we've compiled/checked the arguments,
@@ -91,7 +108,7 @@ def find_callable_typemods(
     """
 
     typ = s_pseudo.PseudoType.get(ctx.env.schema, 'anytype')
-    dummy = irast.EmptySet()  # type: ignore
+    dummy = irast.DUMMY_SET
     args = [(typ, dummy)] * num_args
     kwargs = {k: (typ, dummy) for k in kwargs_names}
     options = find_callable(
@@ -129,11 +146,13 @@ def find_callable_typemods(
 
 
 def find_callable(
-        candidates: Iterable[s_func.CallableLike], *,
-        args: Sequence[Tuple[s_types.Type, irast.Set]],
-        kwargs: Mapping[str, Tuple[s_types.Type, irast.Set]],
-        basic_matching_only: bool=False,
-        ctx: context.ContextLevel) -> List[BoundCall]:
+    candidates: Iterable[s_func.CallableLike],
+    *,
+    args: Sequence[Tuple[s_types.Type, irast.Set]],
+    kwargs: Mapping[str, Tuple[s_types.Type, irast.Set]],
+    basic_matching_only: bool = False,
+    ctx: context.ContextLevel,
+) -> List[BoundCall]:
 
     implicit_cast_distance = None
     matched = []
@@ -193,12 +212,13 @@ def find_callable(
 
 
 def try_bind_call_args(
-        args: Sequence[Tuple[s_types.Type, irast.Set]],
-        kwargs: Mapping[str, Tuple[s_types.Type, irast.Set]],
-        func: s_func.CallableLike,
-        basic_matching_only: bool,
-        *,
-        ctx: context.ContextLevel) -> Optional[BoundCall]:
+    args: Sequence[Tuple[s_types.Type, irast.Set]],
+    kwargs: Mapping[str, Tuple[s_types.Type, irast.Set]],
+    func: s_func.CallableLike,
+    basic_matching_only: bool,
+    *,
+    ctx: context.ContextLevel,
+) -> Optional[BoundCall]:
 
     return_type = func.get_return_type(ctx.env.schema)
     is_abstract = func.get_abstract(ctx.env.schema)
@@ -290,9 +310,19 @@ def try_bind_call_args(
         ctx.env.options.func_params.has_polymorphic(schema)
     )
 
-    has_empty_variadic = False
+    variadic_arg_id: Optional[int] = None
+    variadic_arg_count: Optional[int] = None
     no_args_call = not args and not kwargs
-    has_inlined_defaults = func.has_inlined_defaults(schema)
+    has_inlined_defaults = (
+        func.has_inlined_defaults(schema)
+        and not (
+            isinstance(func, s_func.Function)
+            and (
+                func.get_volatility(schema) == ft.Volatility.Modifying
+                or func.get_is_inlined(schema)
+            )
+        )
+    )
 
     func_params = func.get_params(schema)
 
@@ -311,8 +341,8 @@ def try_bind_call_args(
                     ctx=ctx)
                 bargs = [BoundArg(None, bytes_t, argval, bytes_t, 0, -1)]
             return BoundCall(
-                func, bargs, set(),
-                return_type, False)
+                func, bargs, set(), return_type, None, None
+            )
         else:
             # No match: `func` is a function without parameters
             # being called with some arguments.
@@ -411,6 +441,9 @@ def try_bind_call_args(
                         BoundArg(param, param_type, arg_val, arg_type, cd,
                                  ai + di))
 
+                variadic_arg_id = ai - 1
+                variadic_arg_count = nargs - ai + 1
+
                 break
 
             cd = _get_cast_distance(arg_val, arg_type, param_type)
@@ -439,7 +472,8 @@ def try_bind_call_args(
             bound_args_prep.append(MissingArg(param, param_type))
 
         elif param_kind is _VARIADIC:
-            has_empty_variadic = True
+            variadic_arg_id = i
+            variadic_arg_count = 0
 
         elif param_kind is _NAMED_ONLY:
             # impossible condition
@@ -468,10 +502,12 @@ def try_bind_call_args(
                 defaults_mask |= 1 << i
 
                 if not has_inlined_defaults:
-                    param_default = param.get_default(schema)
+                    param_default: Optional[s_expr.Expression] = (
+                        param.get_default(schema)
+                    )
                     assert param_default is not None
                     default = compile_arg(
-                        param_default.qlast, param_typemod, ctx=ctx)
+                        param_default.parse(), param_typemod, ctx=ctx)
 
                 empty_default = (
                     has_inlined_defaults or
@@ -571,7 +607,13 @@ def try_bind_call_args(
                 )
 
     return BoundCall(
-        func, bound_param_args, null_args, return_type, has_empty_variadic)
+        func,
+        bound_param_args,
+        null_args,
+        return_type,
+        variadic_arg_id,
+        variadic_arg_count,
+    )
 
 
 def compile_arg(
@@ -599,10 +641,10 @@ def compile_arg(
 
         if fenced:
             arg_ql = qlast.SelectQuery(
-                result=arg_ql, context=arg_ql.context,
+                result=arg_ql, span=arg_ql.span,
                 implicit=True, rptr_passthrough=True)
 
-        argctx.inhibit_implicit_limit = True
+        argctx.implicit_limit = 0
 
         arg_ir = dispatch.compile(arg_ql, ctx=argctx)
 

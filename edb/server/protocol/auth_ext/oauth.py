@@ -19,48 +19,81 @@
 
 import json
 
-from typing import Any, Type
+from typing import cast, Any, Callable
 from edb.server.protocol import execute
+from edb.server.http import HttpClient
 
-from . import github, google, azure, apple
-from . import errors, util, data, base, http_client
+from . import github, google, azure, apple, discord, slack
+from . import config, errors, util, data, base
 
 
 class Client:
     provider: base.BaseProvider
 
     def __init__(
-        self, db: Any, provider_name: str, base_url: str | None = None
+        self,
+        *,
+        db: Any,
+        provider_name: str,
+        http_client: HttpClient,
+        url_munger: Callable[[str], str] | None = None,
     ):
         self.db = db
 
-        http_factory = lambda *args, **kwargs: http_client.HttpClient(
-            *args, edgedb_test_url=base_url, **kwargs
+        http_factory = lambda *args, **kwargs: http_client.with_context(
+            *args, url_munger=url_munger, **kwargs
         )
 
         provider_config = self._get_provider_config(provider_name)
-        provider_args = (provider_config.client_id, provider_config.secret)
+        provider_args: tuple[str, str] | tuple[str, str, str, str] = (
+            provider_config.client_id,
+            provider_config.secret,
+        )
         provider_kwargs = {
             "http_factory": http_factory,
             "additional_scope": provider_config.additional_scope,
         }
 
-        provider_class: Type[base.BaseProvider]
-        match provider_name:
-            case "builtin::oauth_github":
-                provider_class = github.GitHubProvider
-            case "builtin::oauth_google":
-                provider_class = google.GoogleProvider
-            case "builtin::oauth_azure":
-                provider_class = azure.AzureProvider
-            case "builtin::oauth_apple":
-                provider_class = apple.AppleProvider
+        match (provider_name, provider_config.issuer_url):
+            case ("builtin::oauth_github", _):
+                self.provider = github.GitHubProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case ("builtin::oauth_google", _):
+                self.provider = google.GoogleProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case ("builtin::oauth_azure", _):
+                self.provider = azure.AzureProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case ("builtin::oauth_apple", _):
+                self.provider = apple.AppleProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case ("builtin::oauth_discord", _):
+                self.provider = discord.DiscordProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case ("builtin::oauth_slack", _):
+                self.provider = slack.SlackProvider(
+                    *provider_args,
+                    **provider_kwargs,
+                )
+            case (provider_name, str(issuer_url)):
+                self.provider = base.OpenIDConnectProvider(
+                    provider_name,
+                    issuer_url,
+                    *provider_args,
+                    **provider_kwargs,
+                )
             case _:
                 raise errors.InvalidData(f"Invalid provider: {provider_name}")
-
-        self.provider = provider_class(
-            *provider_args, **provider_kwargs  # type: ignore
-        )
 
     async def get_authorize_url(self, state: str, redirect_uri: str) -> str:
         return await self.provider.get_code_url(
@@ -71,16 +104,18 @@ class Client:
 
     async def handle_callback(
         self, code: str, redirect_uri: str
-    ) -> tuple[data.Identity, bool, str | None, str | None]:
+    ) -> tuple[data.Identity, bool, str | None, str | None, str | None]:
         response = await self.provider.exchange_code(code, redirect_uri)
         user_info = await self.provider.fetch_user_info(response)
         auth_token = response.access_token
         refresh_token = response.refresh_token
+        source_id_token = user_info.source_id_token
 
         return (
             *(await self._handle_identity(user_info)),
             auth_token,
             refresh_token,
+            source_id_token,
         )
 
     async def _handle_identity(
@@ -110,23 +145,33 @@ select {
                 "subject": user_info.sub,
             },
             cached_globally=True,
+            query_tag='gel/auth',
         )
         result_json = json.loads(r.decode())
         assert len(result_json) == 1
 
         return (
             data.Identity(**result_json[0]['identity']),
-            result_json[0]['new']
+            result_json[0]['new'],
         )
 
-    def _get_provider_config(self, provider_name: str):
+    def _get_provider_config(
+        self, provider_name: str
+    ) -> config.OAuthProviderConfig:
         provider_client_config = util.get_config(
             self.db, "ext::auth::AuthConfig::providers", frozenset
         )
         for cfg in provider_client_config:
             if cfg.name == provider_name:
-                return data.ProviderConfig(
-                    cfg.client_id, cfg.secret, cfg.additional_scope
+                cfg = cast(config.OAuthProviderConfig, cfg)
+                return config.OAuthProviderConfig(
+                    name=cfg.name,
+                    display_name=cfg.display_name,
+                    client_id=cfg.client_id,
+                    secret=cfg.secret,
+                    additional_scope=cfg.additional_scope,
+                    issuer_url=getattr(cfg, 'issuer_url', None),
+                    logo_url=getattr(cfg, 'logo_url', None),
                 )
 
         raise errors.MissingConfiguration(
