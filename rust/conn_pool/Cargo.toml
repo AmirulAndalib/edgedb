@@ -30,8 +30,8 @@ serde-pickle = "1"
 
 # For the optimizer
 genetic_algorithm = { version = "0.9.0", optional = true }
-lru = { version = "0.12.4", optional = true }
-rand = { version = "0.8.5", optional = true }
+lru = { version = "0.16.0", optional = true }
+rand = { version = "0.9.0", optional = true }
 statrs = { version = "0.17.1", optional = true }
 anyhow = { version = "1", optional = true }
 
@@ -46,7 +46,7 @@ anyhow = "1"
 rstest = "0"
 
 statrs = "0.17.1"
-rand = "0.8.5"
+rand = "0.9.0"
 
 [lib]
 
